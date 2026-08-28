@@ -3,7 +3,12 @@ import type { DeviceSummary } from "./DeviceSummary";
 import type { IceCandidate } from "./IceCandidate";
 import type { IceServer } from "./IceServer";
 import type { SessionDescription } from "./SessionDescription";
+import type { SessionEvent } from "./SessionEvent";
 import type { SessionSummary } from "./SessionSummary";
 import type { VideoCodec } from "./VideoCodec";
 
-export type ConsoleToUi = { "type": "snapshot", devices: Array<DeviceSummary>, sessions: Array<SessionSummary>, } | { "type": "device_update", device: DeviceSummary, } | { "type": "device_removed", device_id: string, } | { "type": "session_created", session_id: string, device_id: string, ice_servers: Array<IceServer>, } | { "type": "session_answer", session_id: string, answer: SessionDescription, codec: VideoCodec, } | { "type": "ice_candidate", session_id: string, candidate: IceCandidate, } | { "type": "session_update", session: SessionSummary, } | { "type": "error", session_id?: string, code: string, message: string, } | { "type": "pong", nonce: bigint, };
+export type ConsoleToUi = { "type": "snapshot", devices: Array<DeviceSummary>, sessions: Array<SessionSummary>, } | { "type": "device_update", device: DeviceSummary, } | { "type": "device_removed", device_id: string, } | { "type": "session_created", session_id: string, device_id: string, ice_servers: Array<IceServer>, } | { "type": "session_answer", session_id: string, answer: SessionDescription, codec: VideoCodec, } | { "type": "ice_candidate", session_id: string, candidate: IceCandidate, } | { "type": "session_update", session: SessionSummary, } | { "type": "session_event", session_id: string, event: SessionEvent, 
+/**
+ * ISO-8601 timestamp assigned by the console.
+ */
+ts: string, } | { "type": "error", session_id?: string, code: string, message: string, } | { "type": "pong", nonce: bigint, };

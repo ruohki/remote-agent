@@ -48,4 +48,16 @@ approval_timeout_s: number,
 /**
  * Show an on-screen indicator while a session is active.
  */
-show_session_indicator: boolean, };
+show_session_indicator: boolean, 
+/**
+ * Whether operators may send/receive files and browse the device file system.
+ */
+allow_file_transfer: boolean, 
+/**
+ * Directory that receives uploads (default: `<home>/Downloads/RemoteAgent`).
+ */
+transfer_dir?: string, 
+/**
+ * Whether system audio may be streamed to the operator.
+ */
+allow_audio: boolean, };

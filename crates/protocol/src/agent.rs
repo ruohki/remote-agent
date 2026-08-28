@@ -6,11 +6,58 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+use crate::channel::ChatParty;
 use crate::common::{
     Arch, DeviceMode, DisplayInfo, EndReason, IceCandidate, IceServer, OperatorInfo, Os,
     SessionDescription, VideoCodec,
 };
 use crate::config::AgentConfig;
+use crate::files::{TransferDirection, TransferKind};
+
+/// Something noteworthy that happened inside a session; persisted by the console
+/// (`GET /api/sessions/:id/events`) and pushed to UIs as `ConsoleToUi::SessionEvent`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[ts(export)]
+pub enum SessionEvent {
+    Chat {
+        from: ChatParty,
+        text: String,
+    },
+    TransferStarted {
+        token: String,
+        name: String,
+        size: u64,
+        kind: TransferKind,
+        direction: TransferDirection,
+        /// Resume offset (0 for a fresh transfer).
+        offset: u64,
+    },
+    TransferCompleted {
+        token: String,
+        name: String,
+        size: u64,
+        direction: TransferDirection,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        path: Option<String>,
+    },
+    TransferFailed {
+        token: String,
+        name: String,
+        reason: String,
+    },
+    ClipboardSync {
+        direction: TransferDirection,
+        summary: String,
+    },
+    DisplaysChanged {
+        active: Vec<u32>,
+    },
+    AudioChanged {
+        enabled: bool,
+    },
+}
 
 /// What an agent can do, reported in `hello` and whenever it changes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -78,6 +125,13 @@ pub enum AgentToConsole {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         reason: Option<EndReason>,
+    },
+    /// In-session activity for the audit trail / session detail page.
+    SessionEvent {
+        session_id: String,
+        event: SessionEvent,
+        /// Unix epoch milliseconds (agent clock).
+        ts_ms: u64,
     },
     /// Reply to [`ConsoleToAgent::Ping`].
     Pong { nonce: u64 },

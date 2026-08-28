@@ -30,6 +30,20 @@ pub struct AgentConfig {
     pub approval_timeout_s: u32,
     /// Show an on-screen indicator while a session is active.
     pub show_session_indicator: bool,
+    /// Whether operators may send/receive files and browse the device file system.
+    #[serde(default = "default_true")]
+    pub allow_file_transfer: bool,
+    /// Directory that receives uploads (default: `<home>/Downloads/RemoteAgent`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub transfer_dir: Option<String>,
+    /// Whether system audio may be streamed to the operator.
+    #[serde(default = "default_true")]
+    pub allow_audio: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for AgentConfig {
@@ -50,6 +64,9 @@ impl Default for AgentConfig {
             allow_clipboard: true,
             approval_timeout_s: 60,
             show_session_indicator: true,
+            allow_file_transfer: true,
+            transfer_dir: None,
+            allow_audio: true,
         }
     }
 }

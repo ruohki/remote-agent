@@ -7,6 +7,7 @@ import type { EndReason } from "./EndReason";
 import type { IceCandidate } from "./IceCandidate";
 import type { Os } from "./Os";
 import type { SessionDescription } from "./SessionDescription";
+import type { SessionEvent } from "./SessionEvent";
 import type { SessionState } from "./SessionState";
 import type { VideoCodec } from "./VideoCodec";
 
@@ -26,4 +27,8 @@ displays?: Array<DisplayInfo>, } | { "type": "approval_result", session_id: stri
 /**
  * Codec the agent will encode with after negotiation.
  */
-codec: VideoCodec, } | { "type": "ice_candidate", session_id: string, candidate: IceCandidate, } | { "type": "session_state", session_id: string, state: SessionState, reason?: EndReason, } | { "type": "pong", nonce: bigint, } | { "type": "log", level: string, message: string, };
+codec: VideoCodec, } | { "type": "ice_candidate", session_id: string, candidate: IceCandidate, } | { "type": "session_state", session_id: string, state: SessionState, reason?: EndReason, } | { "type": "session_event", session_id: string, event: SessionEvent, 
+/**
+ * Unix epoch milliseconds (agent clock).
+ */
+ts_ms: bigint, } | { "type": "pong", nonce: bigint, } | { "type": "log", level: string, message: string, };

@@ -124,6 +124,13 @@ pub enum ConsoleToUi {
     SessionUpdate {
         session: SessionSummary,
     },
+    /// Chat / transfer / display activity reported by the agent (see `SessionEvent`).
+    SessionEvent {
+        session_id: String,
+        event: crate::agent::SessionEvent,
+        /// ISO-8601 timestamp assigned by the console.
+        ts: String,
+    },
     Error {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]

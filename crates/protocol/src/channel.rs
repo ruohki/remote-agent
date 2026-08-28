@@ -10,6 +10,24 @@ use ts_rs::TS;
 
 use crate::common::{DisplayInfo, VideoCodec};
 
+/// Who wrote a chat message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum ChatParty {
+    Operator,
+    Device,
+}
+
+/// What kind of rich content the device clipboard holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum ClipboardKind {
+    Image,
+    Files,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
@@ -54,8 +72,21 @@ pub enum InputEvent {
 #[ts(export)]
 pub enum ControlMessage {
     // ── browser → agent ────────────────────────────────────────────────────────
-    /// Switch the video track to another display.
+    /// Switch the *primary* video track to another display (kept for single-tile viewers).
     SelectDisplay { index: u32 },
+    /// Multi-display: which displays should stream. The browser adds one `recvonly` video
+    /// transceiver per display (in `DisplayInfo` index order); the agent binds the i-th video
+    /// m-line to display i and only encodes the displays listed here.
+    SetActiveDisplays { indices: Vec<u32> },
+    /// Enable / disable the system-audio track (requires `AgentConfig.allow_audio`).
+    SetAudio { enabled: bool },
+    /// Chat line; sent by either side, echoed to the console as a session event by the agent.
+    Chat {
+        from: ChatParty,
+        text: String,
+        /// Unix epoch milliseconds.
+        ts_ms: u64,
+    },
     /// Runtime quality knobs; `None` keeps the current value.
     SetQuality {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -76,12 +107,29 @@ pub enum ControlMessage {
     /// Sent once after the control channel opens and whenever displays change.
     DisplayInfo {
         displays: Vec<DisplayInfo>,
+        /// Primary display (the one `select_display` targets).
         current: u32,
+        /// Displays currently being streamed (see `set_active_displays`).
+        #[serde(default)]
+        active: Vec<u32>,
+        /// Whether an audio track is available on this session.
+        #[serde(default)]
+        audio: bool,
+    },
+    /// The device clipboard holds an image or files the operator may pull with
+    /// `FileMessage::RequestClipboard`.
+    ClipboardAvailable {
+        kind: ClipboardKind,
+        /// File names (or a single generated name for images).
+        names: Vec<String>,
+        total_bytes: u64,
     },
     /// Device clipboard changed.
     ClipboardChanged { text: String },
-    /// Periodic encoder/capture statistics.
+    /// Periodic encoder/capture statistics (one per active display).
     Stats {
+        #[serde(default)]
+        display: u32,
         codec: VideoCodec,
         fps: f32,
         bitrate_kbps: u32,

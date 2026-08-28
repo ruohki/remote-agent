@@ -17,6 +17,7 @@ pub mod agent;
 pub mod channel;
 pub mod common;
 pub mod config;
+pub mod files;
 pub mod ui;
 
 /// Bumped on incompatible wire changes. Sent in `hello` by both agent and console.
@@ -30,3 +31,5 @@ pub const UI_WS_PATH: &str = "/ws/ui";
 pub const INPUT_CHANNEL_LABEL: &str = "input";
 /// Label of the WebRTC data channel carrying [`channel::ControlMessage`]s.
 pub const CONTROL_CHANNEL_LABEL: &str = "control";
+/// Label of the WebRTC data channel carrying [`files::FileMessage`]s and binary file chunks.
+pub const FILES_CHANNEL_LABEL: &str = "files";
