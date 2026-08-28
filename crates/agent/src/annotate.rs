@@ -35,6 +35,66 @@ pub enum AnnotateEvent {
     Clear,
 }
 
+impl AnnotateEvent {
+    /// The display an event addresses, if any.
+    pub fn display(&self) -> Option<u32> {
+        match self {
+            AnnotateEvent::Stroke { display, .. } | AnnotateEvent::Pointer { display, .. } => {
+                Some(*display)
+            }
+            AnnotateEvent::End { .. } | AnnotateEvent::Clear => None,
+        }
+    }
+
+    /// Map points from **encoded-picture pixels** (what the browser draws against, i.e. the
+    /// video's `videoWidth × videoHeight`) to the display's physical pixels the overlay uses.
+    /// The picture is smaller than the display when viewport-size encoding is active; the
+    /// stroke width scales with the horizontal factor. A zero/unknown `encoded` size means
+    /// "no scaling".
+    pub fn scaled_to_display(self, display_px: (u32, u32), encoded: (u32, u32)) -> Self {
+        let (fx, fy) = scale_factors(display_px, encoded);
+        if (fx - 1.0).abs() < f32::EPSILON && (fy - 1.0).abs() < f32::EPSILON {
+            return self;
+        }
+        match self {
+            AnnotateEvent::Stroke {
+                id,
+                display,
+                color,
+                width,
+                points,
+            } => AnnotateEvent::Stroke {
+                id,
+                display,
+                color,
+                width: width * fx,
+                points: points.into_iter().map(|(x, y)| (x * fx, y * fy)).collect(),
+            },
+            AnnotateEvent::Pointer {
+                display,
+                point,
+                color,
+            } => AnnotateEvent::Pointer {
+                display,
+                point: point.map(|(x, y)| (x * fx, y * fy)),
+                color,
+            },
+            other => other,
+        }
+    }
+}
+
+/// `display / encoded` per axis; 1.0 when either size is unknown.
+pub fn scale_factors(display_px: (u32, u32), encoded: (u32, u32)) -> (f32, f32) {
+    if display_px.0 == 0 || display_px.1 == 0 || encoded.0 == 0 || encoded.1 == 0 {
+        return (1.0, 1.0);
+    }
+    (
+        display_px.0 as f32 / encoded.0 as f32,
+        display_px.1 as f32 / encoded.1 as f32,
+    )
+}
+
 /// Where the session sends annotation instructions.
 pub trait AnnotationSink: Send + Sync {
     /// Whether annotations can be shown at all (false without a UI loop).
@@ -96,5 +156,55 @@ mod tests {
     #[test]
     fn no_annotations_is_unavailable() {
         assert!(!NoAnnotations.available());
+    }
+}
+
+#[cfg(test)]
+mod scale_tests {
+    use super::*;
+
+    #[test]
+    fn encoded_points_map_to_display_pixels() {
+        // 1920×1080 display encoded at 960×540: (480, 270) → (960, 540).
+        let ev = AnnotateEvent::Stroke {
+            id: 1,
+            display: 0,
+            color: "#f00".into(),
+            width: 3.0,
+            points: vec![(480.0, 270.0)],
+        };
+        let AnnotateEvent::Stroke { points, width, .. } =
+            ev.scaled_to_display((1920, 1080), (960, 540))
+        else {
+            unreachable!()
+        };
+        assert_eq!(points, vec![(960.0, 540.0)]);
+        assert_eq!(width, 6.0);
+
+        // 2× Retina: 5120×2160 physical, encoded 2560×1080: (1280, 540) → (2560, 1080) physical,
+        // which the overlay's physical-pixel canvas draws at CSS (1280, 540) in a 2560×1080-point window.
+        let ev = AnnotateEvent::Pointer {
+            display: 0,
+            point: Some((1280.0, 540.0)),
+            color: "#0f0".into(),
+        };
+        let AnnotateEvent::Pointer { point, .. } = ev.scaled_to_display((5120, 2160), (2560, 1080))
+        else {
+            unreachable!()
+        };
+        assert_eq!(point, Some((2560.0, 1080.0)));
+        let scale = 2.0f32;
+        assert_eq!((2560.0 / scale, 1080.0 / scale), (1280.0, 540.0));
+
+        // Full-resolution encoding or unknown size: unchanged.
+        let ev = AnnotateEvent::Pointer {
+            display: 0,
+            point: Some((10.0, 20.0)),
+            color: "#00f".into(),
+        };
+        let same = ev.clone().scaled_to_display((1920, 1080), (1920, 1080));
+        assert_eq!(same, ev);
+        let same = ev.clone().scaled_to_display((1920, 1080), (0, 0));
+        assert_eq!(same, ev);
     }
 }

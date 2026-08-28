@@ -8,13 +8,15 @@
 //! transfer resumes from the last byte stored (see [`sidecar`]).
 
 pub mod browse;
+pub mod codec;
 pub mod sidecar;
 
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::{Bytes, BytesMut};
 use protocol::files::{
-    decode_chunk, encode_chunk_header, FileMessage, TransferDirection, TransferKind,
-    ACK_INTERVAL_BYTES, CHUNK_HEADER_LEN, MAX_CHUNK_BYTES,
+    decode_chunk_any, encode_chunk_header, encode_chunk_header_v2, ChunkCodec, FileMessage,
+    TransferDirection, TransferKind, ACK_INTERVAL_BYTES, CHUNK_HEADER_LEN, CHUNK_HEADER_V2_LEN,
+    MAX_CHUNK_BYTES,
 };
 use sha2::{Digest, Sha256};
 use sidecar::Sidecar;
@@ -95,6 +97,8 @@ pub enum OutSource {
 struct OutShared {
     acked: AtomicU64,
     sent: AtomicU64,
+    /// Bytes handed to the channel (headers + possibly compressed payloads) since the last accept.
+    wire: AtomicU64,
     last_ack: parking_lot::Mutex<Instant>,
     rewind: AtomicBool,
     cancel: AtomicBool,
@@ -112,6 +116,8 @@ struct Outgoing {
     task: Option<JoinHandle<()>>,
     started_at: Instant,
     accepted: bool,
+    /// The receiver advertised DEFLATE chunks in its accept.
+    deflate: bool,
 }
 
 struct Incoming {
@@ -127,6 +133,8 @@ struct Incoming {
     received: u64,
     last_ack: u64,
     last_sidecar: u64,
+    /// Bytes received on the wire (headers + possibly compressed payloads) this session.
+    wire_bytes: u64,
 }
 
 pub struct TransferManager {
@@ -262,6 +270,7 @@ impl TransferManager {
         let shared = Arc::new(OutShared {
             acked: AtomicU64::new(0),
             sent: AtomicU64::new(0),
+            wire: AtomicU64::new(0),
             last_ack: parking_lot::Mutex::new(Instant::now()),
             rewind: AtomicBool::new(false),
             cancel: AtomicBool::new(false),
@@ -279,6 +288,7 @@ impl TransferManager {
                 task: None,
                 started_at: Instant::now(),
                 accepted: false,
+                deflate: false,
             },
         );
         self.send(FileMessage::Offer {
@@ -300,9 +310,11 @@ impl TransferManager {
         let Some(out) = self.outgoing.get_mut(&id) else {
             return;
         };
+        let deflate = out.deflate;
         out.accepted = true;
         out.shared.acked.store(offset, Ordering::Relaxed);
         out.shared.sent.store(offset, Ordering::Relaxed);
+        out.shared.wire.store(0, Ordering::Relaxed);
         *out.shared.last_ack.lock() = Instant::now();
         out.shared.finished.store(false, Ordering::Relaxed);
         out.shared.rewind.store(false, Ordering::Relaxed);
@@ -320,10 +332,12 @@ impl TransferManager {
         let shared = Arc::clone(&out.shared);
         let source = out.source.clone();
         let size = out.size;
+        let name = out.name.clone();
         self.notify(notice);
         let sink = Arc::clone(&self.sink);
         let task = tokio::spawn(async move {
-            if let Err(e) = run_sender(id, source, size, offset, sink.clone(), shared).await {
+            let opts = SendOptions { deflate, name };
+            if let Err(e) = run_sender(id, source, size, offset, sink.clone(), shared, opts).await {
                 tracing::warn!(transfer = id, "sending: {e:#}");
                 let _ = sink
                     .send_message(&FileMessage::Cancel {
@@ -366,7 +380,7 @@ impl TransferManager {
                         self.send(FileMessage::Accept {
                             transfer_id,
                             offset,
-                            codecs: None,
+                            codecs: Some(vec![ChunkCodec::Deflate]),
                         })
                         .await;
                     }
@@ -382,9 +396,15 @@ impl TransferManager {
             FileMessage::Accept {
                 transfer_id,
                 offset,
-                ..
+                codecs,
             } => {
-                let size = self.outgoing.get(&transfer_id).map(|o| o.size);
+                let deflate = codecs
+                    .as_deref()
+                    .is_some_and(|c| c.contains(&ChunkCodec::Deflate));
+                let size = self.outgoing.get_mut(&transfer_id).map(|o| {
+                    o.deflate = deflate;
+                    o.size
+                });
                 match size {
                     Some(size) if offset <= size => self.start_sender(transfer_id, offset),
                     Some(_) => {
@@ -682,6 +702,7 @@ impl TransferManager {
             received,
             last_ack: received,
             last_sidecar: received,
+            wire_bytes: 0,
         };
         self.persist_sidecar(&inc);
         self.notify(TransferNotice::Started {
@@ -709,16 +730,48 @@ impl TransferManager {
     }
 
     pub async fn handle_chunk(&mut self, frame: &[u8]) {
-        let Some((id, offset, payload)) = decode_chunk(frame) else {
+        let Some(chunk) = decode_chunk_any(frame) else {
             tracing::debug!("malformed chunk frame ({} bytes)", frame.len());
             return;
         };
+        let (id, offset) = (chunk.transfer_id, chunk.offset);
         let Some(inc) = self.incoming.get_mut(&id) else {
             return;
         };
         if offset < inc.received {
             return; // duplicate
         }
+        inc.wire_bytes += frame.len() as u64;
+        // Inflate DEFLATE payloads; the size cap bounds what a hostile frame can make us allocate.
+        let inflated;
+        let payload: &[u8] = match chunk.codec {
+            ChunkCodec::Raw => chunk.payload,
+            ChunkCodec::Deflate => {
+                let limit = (inc.size - inc.received).min(MAX_CHUNK_BYTES as u64) as usize;
+                match codec::inflate_chunk(chunk.payload, limit) {
+                    Ok(b) => {
+                        inflated = b;
+                        &inflated
+                    }
+                    Err(e) => {
+                        let reason = format!("bad compressed chunk: {e:#}");
+                        let inc = self.incoming.remove(&id).expect("present");
+                        self.persist_sidecar(&inc);
+                        self.send(FileMessage::Cancel {
+                            transfer_id: id,
+                            reason: reason.clone(),
+                        })
+                        .await;
+                        self.notify(TransferNotice::Failed {
+                            token: inc.token,
+                            name: inc.name,
+                            reason,
+                        });
+                        return;
+                    }
+                }
+            }
+        };
         if offset > inc.received {
             // Gap: tell the sender where we are; it rewinds when acks stall.
             let received = inc.received;
@@ -848,6 +901,15 @@ impl TransferManager {
         }
         Sidecar::remove(&inc.part);
         tracing::info!(transfer = id, path = %final_path.display(), size = inc.size, "upload completed");
+        tracing::info!(
+            target: "perf",
+            transfer = id,
+            direction = "to_device",
+            payload_bytes = inc.size,
+            wire_bytes = inc.wire_bytes,
+            ratio = format_args!("{:.2}", ratio(inc.size, inc.wire_bytes)),
+            "transfer bytes"
+        );
         self.send(FileMessage::Done {
             transfer_id: id,
             ok: true,
@@ -966,6 +1028,23 @@ pub fn hash_file(path: &Path) -> Result<String> {
     Ok(hex::encode(h.finalize()))
 }
 
+/// Options negotiated for one sender run.
+struct SendOptions {
+    /// The receiver advertised DEFLATE: use version-2 frames and compress when it pays off.
+    deflate: bool,
+    /// File name, for the incompressibility hint.
+    name: String,
+}
+
+/// `wire / payload` as a fraction (1.0 = no saving); `0.0` when nothing was sent.
+fn ratio(payload: u64, wire: u64) -> f64 {
+    if payload == 0 {
+        0.0
+    } else {
+        wire as f64 / payload as f64
+    }
+}
+
 /// Stream `source` from `offset`, then send `complete`.
 async fn run_sender(
     id: u32,
@@ -974,6 +1053,7 @@ async fn run_sender(
     offset: u64,
     sink: Arc<dyn FilesSink>,
     shared: Arc<OutShared>,
+    opts: SendOptions,
 ) -> Result<()> {
     let mut pos = offset;
     let mut file = match &source {
@@ -984,10 +1064,39 @@ async fn run_sender(
         ),
         OutSource::Bytes(_) => None,
     };
+    // Incompressibility hint from the name and the first bytes (seek back afterwards).
+    let hint = {
+        let mut head = [0u8; 16];
+        let n = match (&source, file.as_mut()) {
+            (OutSource::Bytes(b), _) => {
+                let n = b.len().min(16);
+                head[..n].copy_from_slice(&b[..n]);
+                n
+            }
+            (OutSource::File(_), Some(f)) => f.read(&mut head).await.unwrap_or(0),
+            _ => 0,
+        };
+        codec::likely_incompressible(&opts.name, &head[..n])
+    };
     if let Some(f) = file.as_mut() {
         f.seek(SeekFrom::Start(pos)).await?;
     }
-    let mut buf = vec![0u8; CHUNK_HEADER_LEN + MAX_CHUNK_BYTES];
+    let v2 = opts.deflate;
+    let header_len = if v2 {
+        CHUNK_HEADER_V2_LEN
+    } else {
+        CHUNK_HEADER_LEN
+    };
+    // Whole frame (header + payload) stays ≤ 64 KiB: SCTP rejects larger messages.
+    let max_payload = if v2 {
+        codec::MAX_PAYLOAD_V2
+    } else {
+        MAX_CHUNK_BYTES - CHUNK_HEADER_LEN
+    };
+    let mut buf = vec![0u8; header_len + max_payload];
+    let mut gate = codec::CompressionGate::new(hint);
+    let mut payload_total = 0u64;
+    let mut compressed_chunks = 0u32;
     while pos < size {
         if shared.cancel.load(Ordering::Relaxed) {
             return Ok(());
@@ -998,19 +1107,16 @@ async fn run_sender(
                 f.seek(SeekFrom::Start(pos)).await?;
             }
         }
-        // Whole frame (header + payload) stays ≤ MAX_CHUNK_BYTES: SCTP rejects larger messages.
-        let want = ((size - pos) as usize).min(MAX_CHUNK_BYTES - CHUNK_HEADER_LEN);
+        let want = ((size - pos) as usize).min(max_payload);
         let n = match (&source, file.as_mut()) {
             (OutSource::Bytes(b), _) => {
                 let end = (pos as usize + want).min(b.len());
                 let n = end - pos as usize;
-                buf[CHUNK_HEADER_LEN..CHUNK_HEADER_LEN + n].copy_from_slice(&b[pos as usize..end]);
+                buf[header_len..header_len + n].copy_from_slice(&b[pos as usize..end]);
                 n
             }
             (OutSource::File(_), Some(f)) => {
-                let n = f
-                    .read(&mut buf[CHUNK_HEADER_LEN..CHUNK_HEADER_LEN + want])
-                    .await?;
+                let n = f.read(&mut buf[header_len..header_len + want]).await?;
                 if n == 0 {
                     bail!("file shrank while sending");
                 }
@@ -1018,8 +1124,35 @@ async fn run_sender(
             }
             _ => unreachable!(),
         };
-        encode_chunk_header(id, pos, &mut buf[..CHUNK_HEADER_LEN]);
-        let frame = BytesMut::from(&buf[..CHUNK_HEADER_LEN + n]);
+        let frame = if v2 {
+            let raw = &buf[header_len..header_len + n];
+            let packed = if gate.should_try() {
+                let packed = codec::deflate_chunk(raw);
+                gate.record(packed.is_some());
+                packed
+            } else {
+                None
+            };
+            match packed {
+                Some(p) => {
+                    compressed_chunks += 1;
+                    let mut f = BytesMut::with_capacity(CHUNK_HEADER_V2_LEN + p.len());
+                    f.resize(CHUNK_HEADER_V2_LEN, 0);
+                    encode_chunk_header_v2(id, pos, ChunkCodec::Deflate, &mut f[..]);
+                    f.extend_from_slice(&p);
+                    f
+                }
+                None => {
+                    encode_chunk_header_v2(id, pos, ChunkCodec::Raw, &mut buf[..header_len]);
+                    BytesMut::from(&buf[..header_len + n])
+                }
+            }
+        } else {
+            encode_chunk_header(id, pos, &mut buf[..header_len]);
+            BytesMut::from(&buf[..header_len + n])
+        };
+        shared.wire.fetch_add(frame.len() as u64, Ordering::Relaxed);
+        payload_total += n as u64;
         sink.send_chunk(frame).await.context("sending chunk")?;
         pos += n as u64;
         shared.sent.store(pos, Ordering::Relaxed);
@@ -1033,6 +1166,18 @@ async fn run_sender(
         }
         OutSource::Bytes(b) => hex::encode(Sha256::digest(b)),
     };
+    let wire = shared.wire.load(Ordering::Relaxed);
+    tracing::info!(
+        target: "perf",
+        transfer = id,
+        direction = "to_operator",
+        payload_bytes = payload_total,
+        wire_bytes = wire,
+        ratio = format_args!("{:.2}", ratio(payload_total, wire)),
+        compressed_chunks,
+        deflate = v2,
+        "transfer bytes"
+    );
     shared.finished.store(true, Ordering::Relaxed);
     sink.send_message(&FileMessage::Complete {
         transfer_id: id,
@@ -1052,6 +1197,7 @@ pub fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use parking_lot::Mutex;
+    use protocol::files::decode_chunk;
 
     /// Sink that records messages and loops chunks back for inspection.
     struct RecSink {
@@ -1127,7 +1273,7 @@ mod tests {
             Some(FileMessage::Accept {
                 transfer_id: 1,
                 offset: 0,
-                codecs: None,
+                codecs: Some(_),
             })
         ));
         let mut off = 0u64;

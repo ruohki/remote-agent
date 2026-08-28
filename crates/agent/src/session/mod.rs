@@ -291,6 +291,8 @@ enum PendingPoll {
 
 /// How long a connected session waits for the Screen Recording permission before giving up.
 const PERMISSION_WAIT: Duration = Duration::from_secs(60);
+/// Time given to the `session_ended_by_user` notice to leave the data channel before teardown.
+const END_NOTICE_FLUSH: Duration = Duration::from_millis(150);
 
 struct Session {
     deps: SessionDeps,
@@ -627,21 +629,26 @@ async fn run_session(
         }
     };
 
-    if session.user_ended.load(Ordering::Relaxed) {
-        session
-            .send_control(ControlMessage::SessionEndedByUser)
-            .await;
-    }
     let reason =
         if session.user_ended.load(Ordering::Relaxed) && reason == EndReason::OperatorClosed {
             EndReason::DeviceUserClosed
         } else {
             reason
         };
+    // Tell the console first: it ends the session row and pushes the update to every UI
+    // right away instead of waiting for the ICE disconnect timeout. Then notify the operator
+    // over the control channel and give the frame a moment to leave before teardown closes
+    // the channel (webrtc-rs exposes no buffered-amount getter, so this is a bounded wait).
+    report(SessionState::Ended, Some(reason));
+    if session.user_ended.load(Ordering::Relaxed) {
+        session
+            .send_control(ControlMessage::SessionEndedByUser)
+            .await;
+        tokio::time::sleep(END_NOTICE_FLUSH).await;
+    }
     session.teardown().await;
     let (total, visible) = crate::platform::window_counts();
     tracing::info!(session = %session_id, ?reason, total, visible, "session ended");
-    report(SessionState::Ended, Some(reason));
 }
 
 /// While waiting for approval: buffer ICE candidates, resolve on `End`.
@@ -712,6 +719,25 @@ impl Session {
             return;
         }
         self.annotations_used = true;
+        // The browser draws against the encoded picture (its videoWidth/videoHeight), which is
+        // smaller than the display when viewport-size encoding is active: map to physical pixels.
+        let ev = match (ev.display(), self.media.as_ref()) {
+            (Some(index), Some(media)) => {
+                let display_px = media
+                    .displays
+                    .iter()
+                    .find(|d| d.index == index)
+                    .map(|d| (d.width, d.height))
+                    .unwrap_or((0, 0));
+                let encoded = media
+                    .streams
+                    .get(&index)
+                    .map(|s| s.video_size)
+                    .unwrap_or((0, 0));
+                ev.scaled_to_display(display_px, encoded)
+            }
+            _ => ev,
+        };
         self.deps.annotations.apply(ev);
     }
 

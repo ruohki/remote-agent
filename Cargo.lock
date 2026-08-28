@@ -3606,6 +3606,7 @@ dependencies = [
  "dispatch2",
  "ed25519-dalek",
  "enigo",
+ "flate2",
  "futures-util",
  "hex",
  "hostname",

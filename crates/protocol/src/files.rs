@@ -269,14 +269,14 @@ pub struct ChunkFrame<'a> {
 
 /// Decode a version-1 or version-2 chunk frame.
 pub fn decode_chunk_any(frame: &[u8]) -> Option<ChunkFrame<'_>> {
-    match frame.first()? {
-        &CHUNK_VERSION => decode_chunk(frame).map(|(transfer_id, offset, payload)| ChunkFrame {
+    match *frame.first()? {
+        CHUNK_VERSION => decode_chunk(frame).map(|(transfer_id, offset, payload)| ChunkFrame {
             transfer_id,
             offset,
             codec: ChunkCodec::Raw,
             payload,
         }),
-        &CHUNK_VERSION_V2 => {
+        CHUNK_VERSION_V2 => {
             if frame.len() < CHUNK_HEADER_V2_LEN {
                 return None;
             }

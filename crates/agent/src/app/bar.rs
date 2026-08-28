@@ -54,7 +54,7 @@ impl SessionBar {
     ) -> Result<Self> {
         let position =
             load_position(state_dir.as_deref()).unwrap_or_else(|| default_position(target));
-        let window = WindowBuilder::new()
+        let builder = WindowBuilder::new()
             .with_title(format!("{} — session", branding::product_name()))
             .with_decorations(false)
             .with_always_on_top(true)
@@ -63,11 +63,20 @@ impl SessionBar {
             .with_visible(false)
             .with_focused(false)
             .with_inner_size(LogicalSize::new(EXPANDED.0, EXPANDED.1))
-            .with_position(position)
+            .with_position(position);
+        // The page draws its own rounded card; a system shadow would outline the whole
+        // (transparent) window as a dark rectangle behind it.
+        #[cfg(target_os = "macos")]
+        let builder = {
+            use tao::platform::macos::WindowBuilderExtMacOS;
+            builder.with_has_shadow(false)
+        };
+        let window = builder
             .build(target)
             .context("creating session bar window")?;
         window.set_visible_on_all_workspaces(true);
         super::controller::exclude_from_capture(&window);
+        configure_bar(&window);
 
         let ipc = |req: wry::http::Request<String>| match serde_json::from_str::<BarIpc>(req.body())
         {
@@ -205,6 +214,25 @@ impl SessionBar {
 
     pub(super) fn window_id(&self) -> tao::window::WindowId {
         self.window.id()
+    }
+}
+
+/// Platform tweaks for a transparent, shadowless bar (macOS) and a layered tool window
+/// (Windows), applied once the native window exists.
+fn configure_bar(window: &Window) {
+    #[cfg(target_os = "macos")]
+    {
+        use tao::platform::macos::WindowExtMacOS;
+        crate::platform::macos::configure_bar_ns_window(window.ns_window());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use tao::platform::windows::WindowExtWindows;
+        crate::platform::windows::configure_bar_hwnd(window.hwnd());
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = window;
     }
 }
 

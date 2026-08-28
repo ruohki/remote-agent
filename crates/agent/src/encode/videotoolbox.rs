@@ -702,6 +702,10 @@ impl Encoder for VtEncoder {
     fn is_hardware(&self) -> bool {
         true
     }
+
+    fn output_size(&self) -> Option<(u32, u32)> {
+        Some(self.output)
+    }
 }
 
 impl Drop for VtEncoder {

@@ -638,6 +638,11 @@ mod tests {
     #[test]
     fn macos_list_displays_primary_first() {
         let displays = list_displays().expect("list_displays");
+        if displays.is_empty() && !CGPreflightScreenCaptureAccess() {
+            // Unsigned rebuilds lose the Screen Recording grant; nothing to assert then.
+            eprintln!("skipping: no displays visible without Screen Recording permission");
+            return;
+        }
         assert!(!displays.is_empty(), "at least one display");
         assert!(displays[0].primary, "primary display first");
         for (i, d) in displays.iter().enumerate() {

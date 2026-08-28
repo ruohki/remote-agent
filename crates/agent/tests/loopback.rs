@@ -17,8 +17,9 @@ use protocol::common::{
 };
 use protocol::config::AgentConfig;
 use protocol::files::{
-    decode_chunk, encode_chunk_header, FileMessage, TransferDirection, TransferKind,
-    CHUNK_HEADER_LEN, MAX_CHUNK_BYTES,
+    decode_chunk, decode_chunk_any, encode_chunk_header, encode_chunk_header_v2, ChunkCodec,
+    FileMessage, TransferDirection, TransferKind, CHUNK_HEADER_LEN, CHUNK_HEADER_V2_LEN,
+    MAX_CHUNK_BYTES,
 };
 use remote_agent::approval::AutoApprover;
 use remote_agent::clipboard::ClipboardContent;
@@ -162,6 +163,8 @@ struct Harness {
     browser: Arc<dyn PeerConnection>,
     session_id: String,
     hub_events: mpsc::UnboundedReceiver<AgentToConsole>,
+    /// Browser-side peer connection state changes (after `Connected`).
+    states: mpsc::UnboundedReceiver<RTCPeerConnectionState>,
     tracks: mpsc::UnboundedReceiver<Arc<dyn TrackRemote>>,
     control_dc: Arc<dyn DataChannel>,
     control_rx: ControlRx,
@@ -399,6 +402,7 @@ impl Harness {
             browser,
             session_id,
             hub_events,
+            states: state_rx,
             tracks,
             control_dc,
             control_rx,
@@ -720,7 +724,7 @@ async fn file_upload_resumes_across_sessions() {
         FileMessage::Accept {
             transfer_id: 1,
             offset: 0,
-            codecs: None,
+            codecs: Some(_),
         }
     ));
     assert!(matches!(
@@ -1507,23 +1511,36 @@ async fn device_end_button_ends_session() {
 
     h.chat.press_disconnect();
 
-    let ended = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match h.hub_events.recv().await {
-                Some(AgentToConsole::SessionState {
-                    state: SessionState::Ended,
-                    reason,
-                    ..
-                }) => return reason,
-                Some(_) => continue,
-                None => return None,
+    // The console must learn about the end *before* the peer connection goes away, and the
+    // operator must get the `session_ended_by_user` notice over the still-open control channel.
+    let mut ended: Option<EndReason> = None;
+    let mut closed_first = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while ended.is_none() {
+        tokio::select! {
+            msg = h.hub_events.recv() => match msg {
+                Some(AgentToConsole::SessionState { state: SessionState::Ended, reason, .. }) => ended = reason,
+                Some(_) => {}
+                None => break,
+            },
+            st = h.states.recv() => {
+                if matches!(st, Some(RTCPeerConnectionState::Closed | RTCPeerConnectionState::Disconnected | RTCPeerConnectionState::Failed)) {
+                    closed_first = true;
+                    break;
+                }
             }
+            _ = tokio::time::sleep_until(deadline) => break,
         }
-    })
-    .await
-    .ok()
-    .flatten();
+    }
+    assert!(
+        !closed_first,
+        "peer connection closed before the console was told"
+    );
     assert_eq!(ended, Some(EndReason::DeviceUserClosed));
+    next_control(&mut h.control_rx, |m| {
+        matches!(m, ControlMessage::SessionEndedByUser)
+    })
+    .await;
     // The session loop exits on its own (UserEnd), without waiting for the console or peer.
     let started = std::time::Instant::now();
     h.sessions.wait_idle(Duration::from_secs(10)).await;
@@ -1930,6 +1947,387 @@ async fn fast_input_channel_moves_are_applied_and_flushed_before_clicks() {
             "click never applied: {ev:?}"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    h.end().await;
+}
+
+// ── chunk compression ─────────────────────────────────────────────────────────────────────
+
+/// Repetitive text: compresses ~20×.
+fn compressible(len: usize) -> Vec<u8> {
+    let line =
+        b"{\"id\": 12345, \"name\": \"remote agent\", \"ok\": true, \"tags\": [\"a\", \"b\"]}\n";
+    line.iter().copied().cycle().take(len).collect()
+}
+
+fn deflate_raw(data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+    enc.write_all(data).unwrap();
+    enc.finish().unwrap()
+}
+
+fn inflate_raw(data: &[u8]) -> Vec<u8> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    flate2::read::DeflateDecoder::new(data)
+        .read_to_end(&mut out)
+        .unwrap();
+    out
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upload_with_deflate_v2_frames_is_inflated_and_verified() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let mut h = Harness::connect(Options {
+        config: AgentConfig {
+            max_fps: 30,
+            transfer_dir: Some(dir.display().to_string()),
+            ..AgentConfig::default()
+        },
+        ..Default::default()
+    })
+    .await;
+    let data = compressible(4 * 1024 * 1024);
+    h.files(&FileMessage::Offer {
+        transfer_id: 11,
+        token: "deflate-up".into(),
+        name: "log.jsonl".into(),
+        size: data.len() as u64,
+        kind: TransferKind::File,
+        direction: TransferDirection::ToDevice,
+        dest_dir: None,
+        group: None,
+        sha256: None,
+    })
+    .await;
+    let mut chunks = Vec::new();
+    let accept = next_files_msg(&mut h.files_rx, &mut chunks, |m| {
+        matches!(
+            m,
+            FileMessage::Accept {
+                transfer_id: 11,
+                ..
+            }
+        )
+    })
+    .await;
+    let FileMessage::Accept { codecs, .. } = accept else {
+        unreachable!()
+    };
+    assert_eq!(
+        codecs,
+        Some(vec![ChunkCodec::Deflate]),
+        "the agent advertises DEFLATE"
+    );
+    // Send version-2 frames: compressed where it pays off, raw otherwise (every 5th chunk raw
+    // to exercise both paths).
+    let max_payload = 64 * 1024 - CHUNK_HEADER_V2_LEN;
+    let mut offset = 0usize;
+    let mut wire = 0usize;
+    let mut n = 0;
+    while offset < data.len() {
+        let end = (offset + max_payload).min(data.len());
+        let raw = &data[offset..end];
+        let (codec, payload) = if n % 5 == 4 {
+            (ChunkCodec::Raw, raw.to_vec())
+        } else {
+            (ChunkCodec::Deflate, deflate_raw(raw))
+        };
+        let mut f = vec![0u8; CHUNK_HEADER_V2_LEN];
+        encode_chunk_header_v2(11, offset as u64, codec, &mut f);
+        f.extend_from_slice(&payload);
+        assert!(f.len() <= 64 * 1024);
+        wire += f.len();
+        send_bytes(&h.files_dc, &f).await;
+        offset = end;
+        n += 1;
+    }
+    h.files(&FileMessage::Complete {
+        transfer_id: 11,
+        sha256: sha(&data),
+    })
+    .await;
+    let done = next_files_msg(&mut h.files_rx, &mut chunks, |m| {
+        matches!(
+            m,
+            FileMessage::Done {
+                transfer_id: 11,
+                ..
+            }
+        )
+    })
+    .await;
+    let FileMessage::Done {
+        ok, error, path, ..
+    } = done
+    else {
+        unreachable!()
+    };
+    assert!(ok, "upload failed: {error:?}");
+    let stored = std::fs::read(path.unwrap()).unwrap();
+    assert_eq!(stored, data, "inflated bytes land on disk");
+    assert!(
+        wire * 4 < data.len(),
+        "wire bytes {wire} vs payload {}",
+        data.len()
+    );
+    h.end().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn download_uses_deflate_v2_frames_only_when_advertised() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = compressible(2 * 1024 * 1024 + 777);
+    let src = tmp.path().join("export.jsonl");
+    std::fs::write(&src, &data).unwrap();
+    let noise = synthetic(300 * 1024, 3);
+    let packed = tmp.path().join("photos.zip");
+    std::fs::write(&packed, &noise).unwrap();
+
+    let mut h = Harness::connect(Options::default()).await;
+    let mut chunks = Vec::new();
+
+    // ── compressible file, receiver advertises DEFLATE → v2 frames, mostly compressed ──
+    h.files(&FileMessage::Request {
+        transfer_id: 21,
+        path: src.display().to_string(),
+    })
+    .await;
+    next_files_msg(&mut h.files_rx, &mut chunks, |m| {
+        matches!(
+            m,
+            FileMessage::Offer {
+                transfer_id: 21,
+                ..
+            }
+        )
+    })
+    .await;
+    h.files(&FileMessage::Accept {
+        transfer_id: 21,
+        offset: 0,
+        codecs: Some(vec![ChunkCodec::Deflate]),
+    })
+    .await;
+    let complete = next_files_msg(&mut h.files_rx, &mut chunks, |m| {
+        matches!(
+            m,
+            FileMessage::Complete {
+                transfer_id: 21,
+                ..
+            }
+        )
+    })
+    .await;
+    let FileMessage::Complete { sha256, .. } = complete else {
+        unreachable!()
+    };
+    let mut out = vec![0u8; data.len()];
+    let (mut deflated, mut raw, mut wire) = (0, 0, 0usize);
+    for c in chunks.drain(..) {
+        assert!(c.len() <= 64 * 1024, "frame within the SCTP limit");
+        let f = decode_chunk_any(&c).expect("valid frame");
+        assert_eq!(f.transfer_id, 21);
+        assert_eq!(c[0], 2, "version-2 frames once DEFLATE was negotiated");
+        wire += c.len();
+        let bytes = match f.codec {
+            ChunkCodec::Deflate => {
+                deflated += 1;
+                inflate_raw(f.payload)
+            }
+            ChunkCodec::Raw => {
+                raw += 1;
+                f.payload.to_vec()
+            }
+        };
+        out[f.offset as usize..f.offset as usize + bytes.len()].copy_from_slice(&bytes);
+    }
+    assert_eq!(sha(&out), sha256);
+    assert_eq!(out, data);
+    assert!(
+        deflated > 0,
+        "compressible data was deflated ({deflated} deflated / {raw} raw)"
+    );
+    assert!(
+        wire * 4 < data.len(),
+        "wire {wire} bytes for {} payload",
+        data.len()
+    );
+    h.files(&FileMessage::Done {
+        transfer_id: 21,
+        ok: true,
+        error: None,
+        path: None,
+    })
+    .await;
+
+    // ── incompressible name/magic: v2 frames, all raw ──────────────────────────────
+    h.files(&FileMessage::Request {
+        transfer_id: 23,
+        path: packed.display().to_string(),
+    })
+    .await;
+    next_files_msg(&mut h.files_rx, &mut chunks, |m| {
+        matches!(
+            m,
+            FileMessage::Offer {
+                transfer_id: 23,
+                ..
+            }
+        )
+    })
+    .await;
+    h.files(&FileMessage::Accept {
+        transfer_id: 23,
+        offset: 0,
+        codecs: Some(vec![ChunkCodec::Deflate]),
+    })
+    .await;
+    next_files_msg(&mut h.files_rx, &mut chunks, |m| {
+        matches!(
+            m,
+            FileMessage::Complete {
+                transfer_id: 23,
+                ..
+            }
+        )
+    })
+    .await;
+    let mut out = vec![0u8; noise.len()];
+    for c in chunks.drain(..) {
+        let f = decode_chunk_any(&c).unwrap();
+        assert_eq!(f.codec, ChunkCodec::Raw, "noise is never sent deflated");
+        assert_eq!(c[0], 2);
+        out[f.offset as usize..f.offset as usize + f.payload.len()].copy_from_slice(f.payload);
+    }
+    assert_eq!(out, noise);
+    h.files(&FileMessage::Done {
+        transfer_id: 23,
+        ok: true,
+        error: None,
+        path: None,
+    })
+    .await;
+
+    // ── old receiver (no codecs): version-1 frames only ────────────────────────────
+    h.files(&FileMessage::Request {
+        transfer_id: 25,
+        path: src.display().to_string(),
+    })
+    .await;
+    next_files_msg(&mut h.files_rx, &mut chunks, |m| {
+        matches!(
+            m,
+            FileMessage::Offer {
+                transfer_id: 25,
+                ..
+            }
+        )
+    })
+    .await;
+    h.files(&FileMessage::Accept {
+        transfer_id: 25,
+        offset: 0,
+        codecs: None,
+    })
+    .await;
+    next_files_msg(&mut h.files_rx, &mut chunks, |m| {
+        matches!(
+            m,
+            FileMessage::Complete {
+                transfer_id: 25,
+                ..
+            }
+        )
+    })
+    .await;
+    assert!(!chunks.is_empty());
+    for c in chunks.drain(..) {
+        assert_eq!(c[0], 1, "version-1 frame for receivers without codecs");
+        let (id, _, payload) = decode_chunk(&c).unwrap();
+        assert_eq!(id, 25);
+        assert!(payload.len() <= MAX_CHUNK_BYTES);
+    }
+    h.end().await;
+}
+
+// ── annotation coordinates ────────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn annotation_points_scale_from_encoded_picture_to_display() {
+    use remote_agent::annotate::AnnotateEvent;
+
+    let mut h = Harness::connect(Options::default()).await;
+    next_control(&mut h.control_rx, |m| {
+        matches!(m, ControlMessage::DisplayInfo { .. })
+    })
+    .await;
+    // Shrink the encoded picture to half the 320×240 test display.
+    h.control(&ControlMessage::SetViewport {
+        display: 0,
+        width: Some(160),
+        height: Some(160),
+    })
+    .await;
+    tokio::time::timeout(Duration::from_secs(6), async {
+        next_control(&mut h.control_rx, |m| {
+            matches!(
+                m,
+                ControlMessage::Stats {
+                    display: 0,
+                    encoded_width: 160,
+                    ..
+                }
+            )
+        })
+        .await
+    })
+    .await
+    .expect("viewport-scaled stats");
+    // The browser draws against the 160×120 picture: (80, 60) is the centre.
+    send_json(
+        &h.control_dc,
+        &ControlMessage::AnnotateStroke {
+            id: 1,
+            display: 0,
+            color: "#ff0000".into(),
+            width: 3.0,
+            points: vec![(80.0, 60.0), (160.0, 120.0)],
+        },
+    )
+    .await;
+    send_json(
+        &h.control_dc,
+        &ControlMessage::AnnotatePointer {
+            display: 0,
+            point: Some((40.0, 30.0)),
+            color: "#00ff00".into(),
+        },
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if h.annotations.events.lock().unwrap().len() >= 2 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("annotation events");
+    let events = h.annotations.events.lock().unwrap().clone();
+    match &events[0] {
+        AnnotateEvent::Stroke { points, width, .. } => {
+            assert_eq!(points, &vec![(160.0, 120.0), (320.0, 240.0)]);
+            assert_eq!(*width, 6.0);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    match &events[1] {
+        AnnotateEvent::Pointer { point, .. } => assert_eq!(*point, Some((80.0, 60.0))),
+        other => panic!("unexpected {other:?}"),
     }
     h.end().await;
 }

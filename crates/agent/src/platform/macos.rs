@@ -60,6 +60,28 @@ pub fn configure_overlay_ns_window(ns_window: *mut c_void) {
     });
 }
 
+/// Make the session bar's `NSWindow` a true transparent panel: no opaque backing, clear
+/// background and no system shadow. The shadow matters most: AppKit derives it from the
+/// window's opaque region, which is computed before the web content has painted, so a
+/// transparent window with a rounded page ends up with a dark rectangular halo behind it.
+pub fn configure_bar_ns_window(ns_window: *mut c_void) {
+    if ns_window.is_null() {
+        return;
+    }
+    let addr = ns_window as usize;
+    let _ = run_on_main(move || {
+        // SAFETY: `addr` is a live `NSWindow` created by tao for the process lifetime; main thread.
+        let window: &NSWindow = unsafe { &*(addr as *const NSWindow) };
+        window.setOpaque(false);
+        window.setBackgroundColor(Some(&objc2_app_kit::NSColor::clearColor()));
+        window.setHasShadow(false);
+        window.setCollectionBehavior(
+            NSWindowCollectionBehavior::CanJoinAllSpaces
+                | NSWindowCollectionBehavior::FullScreenAuxiliary,
+        );
+    });
+}
+
 /// Run `f` on the main thread. Runs inline when already there; otherwise dispatches to the
 /// main queue, which requires [`run_app_loop`] to be pumping events.
 pub fn run_on_main<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T> {

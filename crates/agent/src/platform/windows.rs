@@ -160,6 +160,26 @@ pub fn configure_overlay_hwnd(hwnd: isize) {
     }
 }
 
+/// Make the session bar a layered, topmost tool window (per-pixel alpha from the transparent
+/// WebView2 surface, no taskbar entry). Unlike the overlay it keeps receiving input.
+pub fn configure_bar_hwnd(hwnd: isize) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
+        WS_EX_TOPMOST,
+    };
+    if hwnd == 0 {
+        return;
+    }
+    // SAFETY: plain style bit twiddling on a window we own.
+    unsafe {
+        let h = HWND(hwnd as *mut core::ffi::c_void);
+        let ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+        let add = (WS_EX_LAYERED.0 | WS_EX_TOPMOST.0 | WS_EX_TOOLWINDOW.0) as isize;
+        SetWindowLongPtrW(h, GWL_EXSTYLE, ex | add);
+    }
+}
+
 pub fn exclude_hwnd_from_capture(hwnd: isize) {
     use windows::Win32::UI::WindowsAndMessaging::{
         SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE,
