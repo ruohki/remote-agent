@@ -9,6 +9,7 @@ use crate::approval::{
     ApprovalOutcome, Approver, AutoApprover, Indicator, NativeApprover, NativeIndicator,
     NoIndicator,
 };
+use crate::chat::{ChatUi, NativeChatUi, NoChatUi};
 use crate::config::{LocalConfig, Paths};
 use crate::input::{Injector, InputHandler};
 use crate::session::media::{MediaFactory, SystemMedia};
@@ -91,6 +92,11 @@ pub async fn run_agent(paths: Paths) -> Result<()> {
     } else {
         Arc::new(NoIndicator)
     };
+    let chat: Arc<dyn ChatUi> = if interactive {
+        Arc::new(NativeChatUi)
+    } else {
+        Arc::new(NoChatUi)
+    };
     let input_factory: crate::session::InputFactory =
         Arc::new(|| Ok(Box::new(Injector::new()?) as Box<dyn InputHandler>));
 
@@ -99,6 +105,8 @@ pub async fn run_agent(paths: Paths) -> Result<()> {
         input: input_factory,
         approver,
         indicator,
+        chat,
+        clipboard: Arc::new(crate::clipboard::SystemClipboard),
         hub: hub_sink.clone(),
         config: Arc::clone(&config),
     };
@@ -277,12 +285,19 @@ where
             operator,
             offer,
             ice_servers,
+            role,
+            shadow_of,
+            notify_operator,
+            ..
         } => {
             sessions.start(SessionRequest {
                 session_id,
                 operator,
                 offer,
                 ice_servers,
+                role,
+                shadow_of,
+                notify_operator,
             });
         }
         ConsoleToAgent::IceCandidate {

@@ -4,11 +4,14 @@
 //!   indicator) must run on the main thread, so `remote-agent run` pumps an `NSApplication`
 //!   run loop there and drives tokio from a worker thread. Other platforms run the worker
 //!   inline.
-//! * [`logged_in_user`], [`approval_dialog`], [`show_indicator`], [`secure_attention`] and
-//!   permission checks are implemented per platform in the submodules.
+//! * [`logged_in_user`], [`approval_dialog`], [`show_indicator`], [`open_chat`],
+//!   [`secure_attention`], clipboard helpers and permission checks are implemented per
+//!   platform in the submodules.
 
 use crate::approval::{ApprovalOutcome, IndicatorHandle};
+use crate::chat::ChatHandle;
 use anyhow::Result;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -107,6 +110,76 @@ pub fn show_indicator(
     {
         let _ = (operator, on_disconnect);
         anyhow::bail!("session indicator is not supported on this platform")
+    }
+}
+
+/// Open the native chat window (transcript, input, Send, Disconnect).
+pub fn open_chat(
+    operator: &str,
+    on_send: Arc<dyn Fn(String) + Send + Sync>,
+    on_disconnect: Arc<dyn Fn() + Send + Sync>,
+) -> Result<Box<dyn ChatHandle>> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::open_chat(operator, on_send, on_disconnect)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows::open_chat(operator, on_send, on_disconnect)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (operator, on_send, on_disconnect);
+        anyhow::bail!("chat window is not supported on this platform")
+    }
+}
+
+/// Cheap clipboard change counter (`None` when the platform has none — poll contents then).
+pub fn clipboard_sequence() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::clipboard_sequence()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows::clipboard_sequence()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        None
+    }
+}
+
+/// File paths currently on the clipboard (copied in Finder / Explorer), if any.
+pub fn clipboard_files() -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::clipboard_files().unwrap_or_default()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows::clipboard_files().unwrap_or_default()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Vec::new()
+    }
+}
+
+/// Place file references on the clipboard (paste in Finder / Explorer copies them).
+pub fn set_clipboard_files(paths: &[PathBuf]) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::set_clipboard_files(paths)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows::set_clipboard_files(paths)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = paths;
+        anyhow::bail!("file clipboard is not supported on this platform")
     }
 }
 
@@ -214,6 +287,29 @@ pub fn doctor(paths: &crate::config::Paths) -> Result<()> {
         Err(e) => println!("displays        : error: {e:#}"),
     }
     println!("encoders        : {:?}", crate::encode::available_codecs());
+    println!(
+        "system audio    : {}",
+        if crate::audio::available() {
+            "available (Opus 48 kHz stereo)"
+        } else {
+            "not supported on this platform"
+        }
+    );
+    let transfer_dir = crate::config::LocalConfig::load(paths)
+        .ok()
+        .flatten()
+        .and_then(|c| c.effective().transfer_dir)
+        .map(PathBuf::from)
+        .unwrap_or_else(crate::transfer::TransferConfig::default_dir);
+    println!(
+        "transfer dir    : {}{}",
+        transfer_dir.display(),
+        if transfer_dir.is_dir() {
+            ""
+        } else {
+            " (created on first transfer)"
+        }
+    );
 
     if let Ok(Some(cfg)) = crate::config::LocalConfig::load(paths) {
         if cfg.is_enrolled() {

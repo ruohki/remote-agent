@@ -14,12 +14,19 @@
 //! * [`encode`]   — H265/H264 encoders (VideoToolbox / Media Foundation / OpenH264 fallback)
 //! * [`input`]    — mouse & keyboard injection
 //! * [`approval`] — help-me mode prompt and on-screen session indicator
+//! * [`chat`]     — session chat model + native chat window trait
+//! * [`transfer`] — resumable file transfers, remote file browser, clipboard transports
+//! * [`clipboard`]— clipboard change detection (text/image/files) and placement
+//! * [`audio`]    — system audio capture + Opus encoding
 //! * [`service`]  — launchd / Windows service integration
 //! * [`platform`] — misc OS helpers (logged-in user, permissions, main-thread dispatch)
 
 pub mod approval;
+pub mod audio;
 pub mod capture;
+pub mod chat;
 pub mod cli;
+pub mod clipboard;
 pub mod config;
 pub mod encode;
 pub mod enroll;
@@ -28,6 +35,7 @@ pub mod input;
 pub mod platform;
 pub mod service;
 pub mod session;
+pub mod transfer;
 pub mod updater;
 
 /// Version baked in at build time (`CARGO_PKG_VERSION`).

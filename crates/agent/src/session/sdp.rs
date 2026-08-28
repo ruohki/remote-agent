@@ -4,6 +4,16 @@
 use protocol::common::VideoCodec;
 use std::collections::HashMap;
 
+/// Number of `m=<kind>` sections in an SDP (e.g. how many video transceivers the browser
+/// created — one per display).
+pub fn count_media(sdp: &str, kind: &str) -> usize {
+    let prefix = format!("m={kind} ");
+    sdp.lines()
+        .map(|l| l.trim_end_matches('\r'))
+        .filter(|l| l.starts_with(&prefix))
+        .count()
+}
+
 /// Video codecs the offer can receive, ordered by the offerer's preference (payload type
 /// order on the `m=video` line). H.264 entries without `packetization-mode=1` are skipped
 /// because the RTP payloader only produces non-interleaved mode 1 packets.
@@ -106,5 +116,13 @@ a=rtpmap:96 VP8/90000\r\n";
     fn packetization_mode_0_only_is_rejected() {
         let sdp = OFFER.replace("packetization-mode=1", "packetization-mode=0");
         assert_eq!(offered_video_codecs(&sdp), vec![VideoCodec::H265]);
+    }
+
+    #[test]
+    fn counts_media_sections() {
+        let sdp = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n";
+        assert_eq!(count_media(sdp, "video"), 2);
+        assert_eq!(count_media(sdp, "audio"), 1);
+        assert_eq!(count_media(sdp, "text"), 0);
     }
 }

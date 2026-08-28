@@ -27,7 +27,9 @@
 //!    later offer with the same `token` resumes.
 //!
 //! Downloads (device → operator) start with `request { transfer_id, path }` from the browser;
-//! the agent answers with an `offer` (even id) and the flow above applies with roles swapped.
+//! the agent answers with an `offer` that **reuses the request's `transfer_id`** and the flow
+//! above applies with roles swapped. Offers the agent initiates on its own (clipboard content)
+//! use even ids.
 //!
 //! ## Clipboard
 //!
@@ -42,8 +44,9 @@ use ts_rs::TS;
 pub const CHUNK_HEADER_LEN: usize = 13;
 /// Header version currently emitted.
 pub const CHUNK_VERSION: u8 = 1;
-/// Maximum payload bytes per binary frame (keeps every SCTP message well below 256 KiB).
-pub const MAX_CHUNK_BYTES: usize = 64 * 1024;
+/// Maximum *payload* bytes per binary frame. Header + payload never exceeds 64 KiB (65,536
+/// bytes): that is the largest SCTP message every WebRTC stack involved accepts.
+pub const MAX_CHUNK_BYTES: usize = 64 * 1024 - CHUNK_HEADER_LEN;
 /// Receiver acknowledges progress at least every this many bytes.
 pub const ACK_INTERVAL_BYTES: u64 = 1024 * 1024;
 /// Sender pauses when the data channel's buffered amount exceeds this many bytes.

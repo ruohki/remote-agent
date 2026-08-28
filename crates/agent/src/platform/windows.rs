@@ -272,3 +272,403 @@ impl Drop for ActiveProcess {
 
 #[allow(dead_code)]
 fn _unused(_h: HANDLE, _e: anyhow::Error) {}
+
+// ─── chat window ────────────────────────────────────────────────────────────────────────
+
+use crate::chat::{ChatHandle, ChatLine};
+use protocol::channel::ChatParty;
+use std::path::PathBuf;
+use std::sync::Mutex;
+use windows::Win32::Foundation::{HGLOBAL, LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber,
+    IsClipboardFormatAvailable, OpenClipboard, SetClipboardData,
+};
+use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows::Win32::System::Ole::CF_HDROP;
+use windows::Win32::UI::Controls::EM_SETSEL;
+use windows::Win32::UI::Shell::{DragQueryFileW, DROPFILES, HDROP};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
+    GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, PostMessageW, RegisterClassW,
+    SendMessageW, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage,
+    CW_USEDEFAULT, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, GWLP_USERDATA, HMENU, HWND_TOPMOST,
+    MSG, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WM_CLOSE, WM_COMMAND,
+    WM_DESTROY, WM_USER, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE, WS_VSCROLL,
+};
+
+const ID_SEND: usize = 1001;
+const ID_DISCONNECT: usize = 1002;
+const ID_INPUT: usize = 1003;
+const ID_TRANSCRIPT: usize = 1004;
+/// Posted to the chat window to refresh the transcript from the shared text.
+const WM_APP_REFRESH: u32 = WM_USER + 1;
+const EN_RETURN_HACK: u32 = 0;
+
+struct ChatShared {
+    on_send: Arc<dyn Fn(String) + Send + Sync>,
+    on_disconnect: Arc<dyn Fn() + Send + Sync>,
+    text: Mutex<String>,
+    hwnd: Mutex<Option<isize>>,
+    transcript: Mutex<Option<isize>>,
+    input: Mutex<Option<isize>>,
+}
+
+unsafe extern "system" fn chat_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    // SAFETY: GWLP_USERDATA holds an `Arc<ChatShared>` pointer set at creation.
+    let shared_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const ChatShared;
+    match msg {
+        WM_COMMAND => {
+            let id = (wparam.0 & 0xffff) as usize;
+            if !shared_ptr.is_null() {
+                let shared = &*shared_ptr;
+                match id {
+                    ID_SEND => {
+                        if let Some(input) = *shared.input.lock().unwrap_or_else(|e| e.into_inner())
+                        {
+                            let input = HWND(input as *mut _);
+                            let len = GetWindowTextLengthW(input) as usize;
+                            let mut buf = vec![0u16; len + 1];
+                            let n = GetWindowTextW(input, &mut buf) as usize;
+                            let text = String::from_utf16_lossy(&buf[..n]);
+                            if !text.trim().is_empty() {
+                                let _ = SetWindowTextW(input, windows::core::w!(""));
+                                (shared.on_send)(text);
+                            }
+                        }
+                    }
+                    ID_DISCONNECT => (shared.on_disconnect)(),
+                    _ => {}
+                }
+            }
+            LRESULT(0)
+        }
+        WM_APP_REFRESH => {
+            if !shared_ptr.is_null() {
+                let shared = &*shared_ptr;
+                if let Some(t) = *shared.transcript.lock().unwrap_or_else(|e| e.into_inner()) {
+                    let t = HWND(t as *mut _);
+                    let text = shared
+                        .text
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+                    let _ = SetWindowTextW(t, PCWSTR(wide.as_ptr()));
+                    let len = text.encode_utf16().count();
+                    SendMessageW(t, EM_SETSEL, Some(WPARAM(len)), Some(LPARAM(len as isize)));
+                }
+                let _ = SetWindowPos(
+                    hwnd,
+                    Some(HWND_TOPMOST),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE,
+                );
+                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            }
+            LRESULT(0)
+        }
+        WM_CLOSE => {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0);
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+struct ChatWindowHandle {
+    shared: Arc<ChatShared>,
+}
+
+impl ChatHandle for ChatWindowHandle {
+    fn push_line(&self, line: &ChatLine) {
+        let who = match line.from {
+            ChatParty::Operator => "Operator",
+            ChatParty::Device => "You",
+        };
+        {
+            let mut t = self.shared.text.lock().unwrap_or_else(|e| e.into_inner());
+            if !t.is_empty() {
+                t.push_str("\r\n");
+            }
+            t.push_str(&format!("{who}: {}", line.text));
+        }
+        if let Some(h) = *self.shared.hwnd.lock().unwrap_or_else(|e| e.into_inner()) {
+            // SAFETY: posting to our own window.
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(h as *mut _)),
+                    WM_APP_REFRESH,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        }
+    }
+
+    fn set_visible(&self, visible: bool) {
+        if let Some(h) = *self.shared.hwnd.lock().unwrap_or_else(|e| e.into_inner()) {
+            // SAFETY: valid window handle owned by our thread.
+            unsafe {
+                let _ = ShowWindow(
+                    HWND(h as *mut _),
+                    if visible { SW_SHOWNOACTIVATE } else { SW_HIDE },
+                );
+            }
+        }
+    }
+}
+
+impl Drop for ChatWindowHandle {
+    fn drop(&mut self) {
+        if let Some(h) = *self.shared.hwnd.lock().unwrap_or_else(|e| e.into_inner()) {
+            // SAFETY: WM_CLOSE-equivalent teardown through DestroyWindow on the UI thread.
+            unsafe {
+                let _ = PostMessageW(Some(HWND(h as *mut _)), WM_USER + 2, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+}
+
+/// Create the chat window on its own UI thread.
+pub fn open_chat(
+    operator: &str,
+    on_send: Arc<dyn Fn(String) + Send + Sync>,
+    on_disconnect: Arc<dyn Fn() + Send + Sync>,
+) -> Result<Box<dyn ChatHandle>> {
+    let shared = Arc::new(ChatShared {
+        on_send,
+        on_disconnect,
+        text: Mutex::new(String::new()),
+        hwnd: Mutex::new(None),
+        transcript: Mutex::new(None),
+        input: Mutex::new(None),
+    });
+    let title = HSTRING::from(format!("Chat with {operator}"));
+    let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
+    let thread_shared = Arc::clone(&shared);
+    std::thread::Builder::new()
+        .name("chat-window".into())
+        .spawn(move || {
+            // SAFETY: classic Win32 window creation on a dedicated thread with its own loop.
+            let result: Result<()> = unsafe {
+                (|| {
+                    let class_name = windows::core::w!("RemoteAgentChat");
+                    let wc = WNDCLASSW {
+                        lpfnWndProc: Some(chat_wndproc),
+                        lpszClassName: class_name,
+                        ..Default::default()
+                    };
+                    RegisterClassW(&wc); // may already be registered
+                    let width = 380;
+                    let height = 320;
+                    let hwnd = CreateWindowExW(
+                        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                        class_name,
+                        &title,
+                        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+                        CW_USEDEFAULT,
+                        CW_USEDEFAULT,
+                        width,
+                        height,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .context("CreateWindowExW")?;
+                    let arc_ptr = Arc::as_ptr(&thread_shared);
+                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, arc_ptr as isize);
+                    let edit_class = windows::core::w!("EDIT");
+                    let button_class = windows::core::w!("BUTTON");
+                    let transcript = CreateWindowExW(
+                        WINDOW_EX_STYLE(0),
+                        edit_class,
+                        None,
+                        WS_CHILD
+                            | WS_VISIBLE
+                            | WS_BORDER
+                            | WS_VSCROLL
+                            | windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(
+                                (ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL) as u32,
+                            ),
+                        8,
+                        8,
+                        width - 32,
+                        height - 92,
+                        Some(hwnd),
+                        Some(HMENU(ID_TRANSCRIPT as *mut _)),
+                        None,
+                        None,
+                    )
+                    .context("transcript")?;
+                    let input = CreateWindowExW(
+                        WINDOW_EX_STYLE(0),
+                        edit_class,
+                        None,
+                        WS_CHILD | WS_VISIBLE | WS_BORDER,
+                        8,
+                        height - 76,
+                        width - 32 - 70 - 100 - 12,
+                        26,
+                        Some(hwnd),
+                        Some(HMENU(ID_INPUT as *mut _)),
+                        None,
+                        None,
+                    )
+                    .context("input")?;
+                    let _send = CreateWindowExW(
+                        WINDOW_EX_STYLE(0),
+                        button_class,
+                        windows::core::w!("Send"),
+                        WS_CHILD | WS_VISIBLE,
+                        width - 32 - 100 - 6 - 70,
+                        height - 76,
+                        70,
+                        26,
+                        Some(hwnd),
+                        Some(HMENU(ID_SEND as *mut _)),
+                        None,
+                        None,
+                    )
+                    .context("send button")?;
+                    let _disc = CreateWindowExW(
+                        WINDOW_EX_STYLE(0),
+                        button_class,
+                        windows::core::w!("Disconnect"),
+                        WS_CHILD | WS_VISIBLE,
+                        width - 32 - 100,
+                        height - 76,
+                        100,
+                        26,
+                        Some(hwnd),
+                        Some(HMENU(ID_DISCONNECT as *mut _)),
+                        None,
+                        None,
+                    )
+                    .context("disconnect button")?;
+                    *thread_shared.hwnd.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(hwnd.0 as isize);
+                    *thread_shared
+                        .transcript
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(transcript.0 as isize);
+                    *thread_shared
+                        .input
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(input.0 as isize);
+                    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                    Ok(())
+                })()
+            };
+            let ok = result.is_ok();
+            let _ = ready_tx.send(result);
+            if !ok {
+                return;
+            }
+            // SAFETY: standard message loop; WM_USER+2 destroys the window and ends the loop.
+            unsafe {
+                let mut msg = MSG::default();
+                while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                    if msg.message == WM_USER + 2 {
+                        let _ = DestroyWindow(msg.hwnd);
+                        continue;
+                    }
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            let _ = EN_RETURN_HACK;
+        })
+        .context("spawning chat window thread")?;
+    ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .context("chat window did not start")??;
+    Ok(Box::new(ChatWindowHandle { shared }))
+}
+
+// ─── clipboard (CF_HDROP) ───────────────────────────────────────────────────────────────
+
+pub fn clipboard_sequence() -> Option<u64> {
+    // SAFETY: plain Win32 call.
+    Some(unsafe { GetClipboardSequenceNumber() } as u64)
+}
+
+pub fn clipboard_files() -> Result<Vec<PathBuf>> {
+    // SAFETY: standard clipboard access sequence.
+    unsafe {
+        if !IsClipboardFormatAvailable(CF_HDROP.0 as u32).is_ok() {
+            return Ok(Vec::new());
+        }
+        OpenClipboard(None).context("OpenClipboard")?;
+        let result = (|| -> Result<Vec<PathBuf>> {
+            let handle = GetClipboardData(CF_HDROP.0 as u32).context("GetClipboardData")?;
+            let hdrop = HDROP(handle.0);
+            let count = DragQueryFileW(hdrop, 0xFFFF_FFFF, None);
+            let mut out = Vec::with_capacity(count as usize);
+            for i in 0..count {
+                let len = DragQueryFileW(hdrop, i, None) as usize;
+                let mut buf = vec![0u16; len + 1];
+                let n = DragQueryFileW(hdrop, i, Some(&mut buf)) as usize;
+                out.push(PathBuf::from(String::from_utf16_lossy(&buf[..n])));
+            }
+            Ok(out)
+        })();
+        let _ = CloseClipboard();
+        result
+    }
+}
+
+pub fn set_clipboard_files(paths: &[PathBuf]) -> Result<()> {
+    // DROPFILES header followed by a double-NUL terminated list of wide strings.
+    let mut list: Vec<u16> = Vec::new();
+    for p in paths {
+        list.extend(p.as_os_str().encode_wide());
+        list.push(0);
+    }
+    list.push(0);
+    let header = std::mem::size_of::<DROPFILES>();
+    let total = header + list.len() * 2;
+    // SAFETY: standard HGLOBAL + clipboard sequence; ownership of the HGLOBAL passes to the
+    // clipboard on success.
+    unsafe {
+        let hglobal: HGLOBAL = GlobalAlloc(GMEM_MOVEABLE, total).context("GlobalAlloc")?;
+        let ptr = GlobalLock(hglobal) as *mut u8;
+        if ptr.is_null() {
+            bail!("GlobalLock failed");
+        }
+        let df = DROPFILES {
+            pFiles: header as u32,
+            pt: Default::default(),
+            fNC: false.into(),
+            fWide: true.into(),
+        };
+        std::ptr::write_unaligned(ptr as *mut DROPFILES, df);
+        std::ptr::copy_nonoverlapping(list.as_ptr() as *const u8, ptr.add(header), list.len() * 2);
+        let _ = GlobalUnlock(hglobal);
+        OpenClipboard(None).context("OpenClipboard")?;
+        let result = (|| -> Result<()> {
+            EmptyClipboard().context("EmptyClipboard")?;
+            SetClipboardData(CF_HDROP.0 as u32, Some(HANDLE(hglobal.0)))
+                .context("SetClipboardData")?;
+            Ok(())
+        })();
+        let _ = CloseClipboard();
+        result
+    }
+}
+
+use std::os::windows::ffi::OsStrExt;

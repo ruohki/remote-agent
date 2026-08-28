@@ -1,6 +1,7 @@
 //! Abstraction over the platform capture/encode modules so the session code can be driven
 //! with fakes in tests.
 
+use crate::audio::AudioSource;
 use crate::capture::{CaptureConfig, Capturer};
 use crate::encode::{Encoder, EncoderConfig};
 use anyhow::Result;
@@ -13,6 +14,14 @@ pub trait MediaFactory: Send + Sync + 'static {
     fn available_codecs(&self) -> Vec<VideoCodec>;
     fn create_capturer(&self, cfg: &CaptureConfig) -> Result<Box<dyn Capturer>>;
     fn create_encoder(&self, cfg: &EncoderConfig) -> Result<Box<dyn Encoder>>;
+    /// Whether system audio capture exists on this platform.
+    fn audio_available(&self) -> bool {
+        false
+    }
+    /// Start a system-audio loopback capture.
+    fn create_audio_source(&self) -> Result<Box<dyn AudioSource>> {
+        anyhow::bail!("system audio capture is not available")
+    }
 }
 
 /// The real thing: delegates to [`crate::capture`] and [`crate::encode`].
@@ -34,6 +43,14 @@ impl MediaFactory for SystemMedia {
 
     fn create_encoder(&self, cfg: &EncoderConfig) -> Result<Box<dyn Encoder>> {
         crate::encode::create_encoder(cfg)
+    }
+
+    fn audio_available(&self) -> bool {
+        crate::audio::available()
+    }
+
+    fn create_audio_source(&self) -> Result<Box<dyn AudioSource>> {
+        crate::audio::create_source()
     }
 }
 

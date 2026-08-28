@@ -6,34 +6,47 @@
 //!
 //! 1. in help-me mode asks the local user for approval (auto-deny on timeout);
 //! 2. picks the codec (browser preference ∩ what we can encode), builds the peer
-//!    connection with only that codec, answers the offer and reports `session_answer`;
+//!    connection, applies the offer, binds one video track per display the browser asked
+//!    for (m-line order = display order, see [`peer`]) plus an Opus track when offered,
+//!    answers and reports `session_answer`;
 //! 3. relays trickle ICE in both directions;
-//! 4. once connected starts the capture→encode [`video::VideoPipeline`] and feeds the video
-//!    track, honours PLI/FIR keyframe requests, and serves the `input` / `control` data
-//!    channels;
+//! 4. once connected starts a capture→encode [`video::VideoPipeline`] per *active* display
+//!    (default: the primary one), honours PLI/FIR keyframe requests, serves the `input`,
+//!    `control` and `files` data channels (file transfer, remote browser, clipboard, chat,
+//!    display selection, audio on/off), and reports [`SessionEvent`]s to the console;
 //! 5. tears everything down (including releasing pressed keys) on any end condition.
 
+pub mod audio;
+pub mod files;
 pub mod media;
 pub mod peer;
 pub mod sdp;
 pub mod video;
 
 use crate::approval::{ApprovalOutcome, Approver, Indicator, IndicatorHandle};
+use crate::chat::{ChatHandle, ChatModel, ChatUi};
+use crate::clipboard::{ClipboardBackend, ClipboardContent, ClipboardWatch};
 use crate::hub::HubSink;
 use crate::input::InputHandler;
-use anyhow::Result;
-use bytes::BytesMut;
+use crate::transfer::{TransferConfig, TransferManager, TransferNotice};
+use anyhow::{anyhow, Context, Result};
+use audio::{AudioPacket, AudioPipeline};
+use bytes::{Bytes, BytesMut};
 use media::{choose_codec, MediaFactory};
 use parking_lot::{Mutex, RwLock};
 use peer::{is_keyframe_request, Peer, PeerEvent};
-use protocol::agent::AgentToConsole;
-use protocol::channel::{ControlMessage, InputEvent};
+use protocol::agent::{AgentToConsole, SessionEvent};
+use protocol::channel::{ChatParty, ClipboardKind, ControlMessage, InputEvent};
 use protocol::common::{
     DeviceMode, DisplayInfo, EndReason, IceCandidate, IceServer, OperatorInfo, SessionDescription,
-    SessionState,
+    SessionRole, SessionState,
 };
 use protocol::config::AgentConfig;
-use protocol::{CONTROL_CHANNEL_LABEL, INPUT_CHANNEL_LABEL};
+use protocol::files::{FileMessage, TransferDirection, TransferKind};
+use protocol::{CONTROL_CHANNEL_LABEL, FILES_CHANNEL_LABEL, INPUT_CHANNEL_LABEL};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -52,6 +65,8 @@ pub struct SessionDeps {
     pub input: InputFactory,
     pub approver: Arc<dyn Approver>,
     pub indicator: Arc<dyn Indicator>,
+    pub chat: Arc<dyn ChatUi>,
+    pub clipboard: Arc<dyn ClipboardBackend>,
     pub hub: HubSink,
     pub config: Arc<RwLock<AgentConfig>>,
 }
@@ -63,6 +78,9 @@ pub struct SessionRequest {
     pub operator: OperatorInfo,
     pub offer: SessionDescription,
     pub ice_servers: Vec<IceServer>,
+    pub role: SessionRole,
+    pub shadow_of: Option<String>,
+    pub notify_operator: bool,
 }
 
 enum SessionCommand {
@@ -183,22 +201,45 @@ impl SessionManager {
 
 // ─── the session task ───────────────────────────────────────────────────────────────────
 
-/// Events from the data channel reader tasks.
+/// Events from the data channel reader tasks and the native UI.
 enum ChannelEvent {
     ControlOpen(Arc<dyn DataChannel>),
     Control(ControlMessage),
     ControlClosed,
+    FilesOpen(Arc<dyn DataChannel>),
+    FilesText(FileMessage),
+    FilesBinary(Bytes),
+    FilesClosed,
+    /// The local user typed a chat line.
+    ChatFromDevice(String),
+}
+
+/// One streaming display: its pipeline and the tasks feeding its video track.
+struct DisplayStream {
+    pipeline: Arc<VideoPipeline>,
+    writer: JoinHandle<()>,
+    rtcp: JoinHandle<()>,
+    forwarder: JoinHandle<()>,
+    /// Encoded picture size (browser mouse coordinates are in this space).
+    video_size: (u32, u32),
+}
+
+struct AudioStream {
+    pipeline: AudioPipeline,
+    writer: JoinHandle<()>,
 }
 
 struct Media {
-    pipeline: Arc<VideoPipeline>,
-    events: mpsc::UnboundedReceiver<PipelineEvent>,
-    writer: JoinHandle<()>,
-    rtcp: JoinHandle<()>,
     displays: Vec<DisplayInfo>,
+    streams: BTreeMap<u32, DisplayStream>,
+    /// Merged pipeline events: `(display index, event)`.
+    events_tx: mpsc::UnboundedSender<(u32, PipelineEvent)>,
+    events_rx: mpsc::UnboundedReceiver<(u32, PipelineEvent)>,
+    /// Display the operator's pointer is on (input coordinates refer to it).
     current_display: u32,
-    /// Encoded picture size (browser mouse coordinates are in this space).
-    video_size: (u32, u32),
+    /// Video tracks bound in the answer (display `i` ↔ track `i`).
+    video_tracks: usize,
+    audio: Option<AudioStream>,
 }
 
 struct Session {
@@ -213,14 +254,16 @@ struct Session {
     channel_tx: mpsc::UnboundedSender<ChannelEvent>,
     readers: Vec<JoinHandle<()>>,
     clipboard: Option<ClipboardWatch>,
+    /// Rich clipboard content (image / files) announced to the operator but not yet pulled.
+    pending_clipboard: Option<ClipboardContent>,
+    transfers: Option<TransferManager>,
+    transfer_notices_tx: mpsc::UnboundedSender<TransferNotice>,
+    transfer_notices_rx: mpsc::UnboundedReceiver<TransferNotice>,
+    chat: ChatModel,
+    chat_ui: Option<Box<dyn ChatHandle>>,
     indicator: Option<Box<dyn IndicatorHandle>>,
-    /// Set when the local user pressed "Disconnect" on the indicator.
-    user_ended: Arc<std::sync::atomic::AtomicBool>,
-}
-
-struct ClipboardWatch {
-    rx: mpsc::UnboundedReceiver<String>,
-    stop: Arc<std::sync::atomic::AtomicBool>,
+    /// Set when the local user pressed "Disconnect" on the indicator / chat window.
+    user_ended: Arc<AtomicBool>,
 }
 
 /// How long a `disconnected` connection state may last before the session is ended.
@@ -241,7 +284,14 @@ async fn run_session(
             reason,
         });
     };
-    tracing::info!(session = %session_id, operator = %req.operator.name, mode = ?cfg.mode, "session requested");
+    tracing::info!(session = %session_id, operator = %req.operator.name, mode = ?cfg.mode, role = ?req.role, "session requested");
+
+    if req.role == SessionRole::Observer {
+        // Observer fan-out is not implemented yet: decline cleanly.
+        tracing::warn!(session = %session_id, shadow_of = ?req.shadow_of, "observer sessions are not supported yet");
+        report(SessionState::Ended, Some(EndReason::Error));
+        return;
+    }
 
     // Candidates that arrive before the peer connection exists.
     let mut pending: Vec<IceCandidate> = Vec::new();
@@ -289,17 +339,27 @@ async fn run_session(
         report(SessionState::Ended, Some(EndReason::Error));
         return;
     };
+    let display_count = deps
+        .media
+        .list_displays()
+        .map(|d| d.len())
+        .unwrap_or(1)
+        .max(1);
     let (peer_tx, mut peer_rx) = mpsc::unbounded_channel();
-    let peer = match Peer::new(codec, &req.ice_servers, peer_tx).await {
-        Ok(p) => Arc::new(p),
+    let mut peer = match Peer::new(codec, &req.ice_servers, peer_tx).await {
+        Ok(p) => p,
         Err(e) => {
             tracing::error!(session = %session_id, "creating peer connection: {e:#}");
             report(SessionState::Ended, Some(EndReason::Error));
             return;
         }
     };
-    let answer_sdp = match peer.answer(req.offer.sdp.clone()).await {
-        Ok(sdp) => sdp,
+    let want_audio = cfg.allow_audio && deps.media.audio_available();
+    let answer = match peer
+        .answer(req.offer.sdp.clone(), display_count, want_audio)
+        .await
+    {
+        Ok(a) => a,
         Err(e) => {
             tracing::error!(session = %session_id, "answering offer: {e:#}");
             peer.close().await;
@@ -307,18 +367,26 @@ async fn run_session(
             return;
         }
     };
+    let peer = Arc::new(peer);
     hub.send(AgentToConsole::SessionAnswer {
         session_id: session_id.clone(),
         answer: SessionDescription {
             kind: "answer".into(),
-            sdp: answer_sdp,
+            sdp: answer.sdp,
         },
         codec,
     });
     report(SessionState::Connecting, None);
-    tracing::info!(session = %session_id, ?codec, "answer sent");
+    tracing::info!(
+        session = %session_id,
+        ?codec,
+        video_tracks = answer.video_tracks,
+        audio = answer.audio,
+        "answer sent"
+    );
 
     let (channel_tx, mut channel_rx) = mpsc::unbounded_channel();
+    let (notices_tx, notices_rx) = mpsc::unbounded_channel();
     let mut session = Session {
         deps: deps.clone(),
         id: session_id.clone(),
@@ -331,8 +399,14 @@ async fn run_session(
         channel_tx,
         readers: Vec::new(),
         clipboard: None,
+        pending_clipboard: None,
+        transfers: None,
+        transfer_notices_tx: notices_tx,
+        transfer_notices_rx: notices_rx,
+        chat: ChatModel::new(req.operator.clone()),
+        chat_ui: None,
         indicator: None,
-        user_ended: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        user_ended: Arc::new(AtomicBool::new(false)),
     };
     for c in pending.drain(..) {
         session.add_candidate(&c).await;
@@ -341,6 +415,8 @@ async fn run_session(
     // ── main loop ─────────────────────────────────────────────────────────────────
     let mut stats_tick = tokio::time::interval(Duration::from_secs(1));
     stats_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut transfer_tick = tokio::time::interval(Duration::from_secs(5));
+    transfer_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut disconnect_deadline: Option<tokio::time::Instant> = None;
     let mut connected_once = false;
 
@@ -353,7 +429,7 @@ async fn run_session(
         };
         let pipeline_event = async {
             match session.media.as_mut() {
-                Some(m) => m.events.recv().await,
+                Some(m) => m.events_rx.recv().await,
                 None => std::future::pending().await,
             }
         };
@@ -381,7 +457,7 @@ async fn run_session(
                             disconnect_deadline = None;
                             if !connected_once {
                                 connected_once = true;
-                                if let Err(e) = session.on_connected().await {
+                                if let Err(e) = session.on_connected(answer.video_tracks).await {
                                     tracing::error!(session = %session.id, "starting media: {e:#}");
                                     break EndReason::Error;
                                 }
@@ -392,7 +468,7 @@ async fn run_session(
                             disconnect_deadline = Some(tokio::time::Instant::now() + DISCONNECT_GRACE);
                         }
                         RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => {
-                            break if session.user_ended.load(std::sync::atomic::Ordering::Relaxed) {
+                            break if session.user_ended.load(Ordering::Relaxed) {
                                 EndReason::DeviceUserClosed
                             } else {
                                 EndReason::ConnectionFailed
@@ -411,23 +487,45 @@ async fn run_session(
                 }
                 Some(ChannelEvent::Control(msg)) => session.on_control(msg).await,
                 Some(ChannelEvent::ControlClosed) => session.control = None,
+                Some(ChannelEvent::FilesOpen(dc)) => session.on_files_open(dc),
+                Some(ChannelEvent::FilesText(msg)) => session.on_files_message(msg).await,
+                Some(ChannelEvent::FilesBinary(bytes)) => {
+                    if let Some(t) = session.transfers.as_mut() {
+                        t.handle_chunk(&bytes).await;
+                    }
+                }
+                Some(ChannelEvent::FilesClosed) => {
+                    if let Some(mut t) = session.transfers.take() {
+                        t.cancel_all().await;
+                    }
+                }
+                Some(ChannelEvent::ChatFromDevice(text)) => session.on_chat_from_device(text).await,
                 None => {}
             },
-            Some(ev) = pipeline_event => match ev {
+            Some(notice) = session.transfer_notices_rx.recv() => session.on_transfer_notice(notice).await,
+            Some((display_idx, ev)) = pipeline_event => match ev {
                 PipelineEvent::Failed(msg) => {
-                    tracing::error!(session = %session.id, "video pipeline failed: {msg}");
+                    tracing::error!(session = %session.id, display = display_idx, "video pipeline failed: {msg}");
                     break EndReason::Error;
                 }
                 PipelineEvent::Started { display_index, width, height, encoded_width, encoded_height, codec, hardware } => {
                     tracing::info!(session = %session.id, display_index, width, height, encoded_width, encoded_height, ?codec, hardware, "pipeline started");
-                    session.update_input_display(display_index, Some((encoded_width, encoded_height)));
+                    if let Some(m) = session.media.as_mut() {
+                        if let Some(s) = m.streams.get_mut(&display_idx) {
+                            s.video_size = (encoded_width, encoded_height);
+                        }
+                    }
+                    session.update_input_display();
                     session.send_display_info().await;
                 }
             },
-            Some(text) = clipboard_event => {
-                session.send_control(ControlMessage::ClipboardChanged { text }).await;
-            }
+            Some(content) = clipboard_event => session.on_clipboard_change(content).await,
             _ = stats_tick.tick() => session.send_stats().await,
+            _ = transfer_tick.tick() => {
+                if let Some(t) = session.transfers.as_mut() {
+                    t.tick();
+                }
+            }
             _ = disconnect_sleep => {
                 tracing::warn!(session = %session.id, "connection stayed disconnected; ending");
                 break EndReason::ConnectionFailed;
@@ -435,23 +533,17 @@ async fn run_session(
         }
     };
 
-    if session
-        .user_ended
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
+    if session.user_ended.load(Ordering::Relaxed) {
         session
             .send_control(ControlMessage::SessionEndedByUser)
             .await;
     }
-    let reason = if session
-        .user_ended
-        .load(std::sync::atomic::Ordering::Relaxed)
-        && reason == EndReason::OperatorClosed
-    {
-        EndReason::DeviceUserClosed
-    } else {
-        reason
-    };
+    let reason =
+        if session.user_ended.load(Ordering::Relaxed) && reason == EndReason::OperatorClosed {
+            EndReason::DeviceUserClosed
+        } else {
+            reason
+        };
     session.teardown().await;
     tracing::info!(session = %session_id, ?reason, "session ended");
     report(SessionState::Ended, Some(reason));
@@ -478,41 +570,153 @@ impl Session {
         }
     }
 
-    /// Connection established: start capture/encode and the writer/RTCP tasks.
-    async fn on_connected(&mut self) -> Result<()> {
+    /// Report an in-session event to the console.
+    fn event(&self, event: SessionEvent) {
+        self.deps.hub.send(AgentToConsole::SessionEvent {
+            session_id: self.id.clone(),
+            event,
+            ts_ms: crate::chat::now_ms(),
+        });
+    }
+
+    fn disconnect_callback(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let user_ended = Arc::clone(&self.user_ended);
+        let hub = self.deps.hub.clone();
+        let sid = self.id.clone();
+        Arc::new(move || {
+            user_ended.store(true, Ordering::Relaxed);
+            // Route through the console so its bookkeeping (and the browser) see the end;
+            // the session loop also exits when the peer connection closes.
+            hub.send(AgentToConsole::SessionState {
+                session_id: sid.clone(),
+                state: SessionState::Ended,
+                reason: Some(EndReason::DeviceUserClosed),
+            });
+        })
+    }
+
+    /// Connection established: start the primary display's pipeline, the clipboard watcher,
+    /// the indicator and the (hidden) chat window.
+    async fn on_connected(&mut self, video_tracks: usize) -> Result<()> {
         let media = Arc::clone(&self.deps.media);
         let displays = tokio::task::spawn_blocking({
             let media = Arc::clone(&media);
             move || media.list_displays()
         })
         .await??;
-        let current_display = displays
+        let primary = displays
             .iter()
             .find(|d| d.primary)
             .or_else(|| displays.first())
             .map(|d| d.index)
             .unwrap_or(0);
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        self.media = Some(Media {
+            displays,
+            streams: BTreeMap::new(),
+            events_tx,
+            events_rx,
+            current_display: primary,
+            video_tracks,
+            audio: None,
+        });
+        let first = if (primary as usize) < video_tracks {
+            primary
+        } else {
+            0
+        };
+        self.start_display(first).await?;
+        self.update_input_display();
 
+        if self.cfg.allow_clipboard {
+            self.clipboard = Some(
+                self.deps
+                    .clipboard
+                    .start_watch(self.cfg.allow_file_transfer),
+            );
+        }
+        if self.cfg.show_session_indicator {
+            match self
+                .deps
+                .indicator
+                .show(&self.operator, self.disconnect_callback())
+            {
+                Ok(handle) => self.indicator = Some(handle),
+                Err(e) => tracing::warn!("session indicator unavailable: {e:#}"),
+            }
+        }
+        // Chat window: created now, shown on the first message.
+        let on_send: Arc<dyn Fn(String) + Send + Sync> = {
+            let tx = self.channel_tx.clone();
+            Arc::new(move |text| {
+                let _ = tx.send(ChannelEvent::ChatFromDevice(text));
+            })
+        };
+        match self
+            .deps
+            .chat
+            .open(&self.operator, on_send, self.disconnect_callback())
+        {
+            Ok(handle) => {
+                handle.set_visible(false);
+                self.chat_ui = Some(handle);
+            }
+            Err(e) => tracing::warn!("chat window unavailable: {e:#}"),
+        }
+        Ok(())
+    }
+
+    // ── displays ─────────────────────────────────────────────────────────────────
+
+    async fn start_display(&mut self, index: u32) -> Result<()> {
+        let media = self.media.as_mut().context("media not started")?;
+        if media.streams.contains_key(&index) {
+            return Ok(());
+        }
+        if !media.displays.iter().any(|d| d.index == index) {
+            anyhow::bail!("unknown display {index}");
+        }
+        if index as usize >= media.video_tracks {
+            anyhow::bail!(
+                "display {index} has no video track (browser offered {} video m-lines)",
+                media.video_tracks
+            );
+        }
+        let track_index = index as usize;
+        let factory = Arc::clone(&self.deps.media);
         let (frame_tx, mut frame_rx) = mpsc::channel(2);
-        let (pev_tx, pev_rx) = mpsc::unbounded_channel();
+        let (pev_tx, mut pev_rx) = mpsc::unbounded_channel();
         let pipeline_cfg = PipelineConfig {
-            display_index: current_display,
+            display_index: index,
             codec: self.peer.codec(),
             max_fps: self.cfg.max_fps.clamp(1, 240),
             max_bitrate_kbps: self.cfg.max_bitrate_kbps.max(100),
             show_cursor: true,
         };
         let pipeline = tokio::task::spawn_blocking({
-            let media = Arc::clone(&media);
-            move || VideoPipeline::start(media, pipeline_cfg, frame_tx, pev_tx)
+            let factory = Arc::clone(&factory);
+            move || VideoPipeline::start(factory, pipeline_cfg, frame_tx, pev_tx)
         })
         .await??;
         let pipeline = Arc::new(pipeline);
 
-        let payload_type = self.peer.negotiated_payload_type().await;
-        let ssrc = self.peer.ssrc().await;
+        let merged = media.events_tx.clone();
+        let forwarder = tokio::spawn(async move {
+            while let Some(ev) = pev_rx.recv().await {
+                if merged.send((index, ev)).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let track = self
+            .peer
+            .video(track_index)
+            .context("video track missing")?;
+        let payload_type = track.payload_type().await;
+        let ssrc = track.ssrc().await;
         let fps = self.cfg.max_fps.clamp(1, 240) as f64;
-        tracing::info!(session = %self.id, payload_type, ssrc, "video track ready");
+        tracing::info!(session = %self.id, display = index, track = track_index, payload_type, ssrc, "video track ready");
 
         let writer = tokio::spawn({
             let peer = Arc::clone(&self.peer);
@@ -527,11 +731,11 @@ impl Session {
                         _ => default_duration,
                     };
                     last_pts = Some(frame.pts);
-                    if let Err(e) = peer
-                        .write_frame(payload_type, ssrc, frame.data, duration)
-                        .await
-                    {
-                        tracing::debug!(session = %sid, "write_frame: {e:#}");
+                    let Some(track) = peer.video(track_index) else {
+                        break;
+                    };
+                    if let Err(e) = track.write(payload_type, ssrc, frame.data, duration).await {
+                        tracing::debug!(session = %sid, display = index, "write_frame: {e:#}");
                     }
                 }
             }
@@ -542,13 +746,15 @@ impl Session {
             let keyframe = pipeline.keyframe_requester();
             async move {
                 loop {
-                    match peer.poll_rtcp().await {
+                    let Some(track) = peer.video(track_index) else {
+                        break;
+                    };
+                    match track.poll_rtcp().await {
                         Some(ev) => {
                             if is_keyframe_request(&ev) {
                                 keyframe.request();
                             }
                         }
-                        // Not bound yet (or unbound): back off and retry until aborted.
                         None => tokio::time::sleep(Duration::from_millis(200)).await,
                     }
                 }
@@ -559,58 +765,159 @@ impl Session {
             let s = pipeline.stats().borrow().clone();
             (s.encoded_width, s.encoded_height)
         };
-        self.media = Some(Media {
-            pipeline,
-            events: pev_rx,
-            writer,
-            rtcp,
-            displays,
-            current_display,
-            video_size,
-        });
-        self.update_input_display(current_display, None);
-
-        if self.cfg.allow_clipboard {
-            self.clipboard = Some(start_clipboard_watch());
-        }
-        if self.cfg.show_session_indicator {
-            let user_ended = Arc::clone(&self.user_ended);
-            let hub = self.deps.hub.clone();
-            let sid = self.id.clone();
-            let on_disconnect: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-                user_ended.store(true, std::sync::atomic::Ordering::Relaxed);
-                // Route through the console so its bookkeeping (and the browser) see the end;
-                // the session loop also exits when the peer connection closes.
-                hub.send(AgentToConsole::SessionState {
-                    session_id: sid.clone(),
-                    state: SessionState::Ended,
-                    reason: Some(EndReason::DeviceUserClosed),
-                });
-            });
-            match self.deps.indicator.show(&self.operator, on_disconnect) {
-                Ok(handle) => self.indicator = Some(handle),
-                Err(e) => tracing::warn!("session indicator unavailable: {e:#}"),
-            }
-        }
+        let media = self.media.as_mut().context("media not started")?;
+        media.streams.insert(
+            index,
+            DisplayStream {
+                pipeline,
+                writer,
+                rtcp,
+                forwarder,
+                video_size,
+            },
+        );
         Ok(())
     }
 
-    /// Point the input handler at `index`; `video_size` is the encoded picture size the
-    /// browser's mouse coordinates refer to (`None` = same as the display).
-    fn update_input_display(&mut self, index: u32, video_size: Option<(u32, u32)>) {
+    async fn stop_display(&mut self, index: u32) {
         let Some(media) = self.media.as_mut() else {
             return;
         };
-        media.current_display = index;
-        if let Some(size) = video_size {
-            media.video_size = size;
-        }
-        if let Some(d) = media.displays.iter().find(|d| d.index == index).cloned() {
-            if let Some(handler) = self.input.lock().as_mut() {
-                handler.set_display(&d, media.video_size);
-            }
+        if let Some(s) = media.streams.remove(&index) {
+            s.writer.abort();
+            s.rtcp.abort();
+            s.forwarder.abort();
+            let pipeline = s.pipeline;
+            let _ = tokio::task::spawn_blocking(move || drop(pipeline)).await;
         }
     }
+
+    /// Stream exactly the given displays (unknown / unbindable ones are skipped).
+    async fn set_active_displays(&mut self, indices: &[u32]) {
+        let Some(media) = self.media.as_ref() else {
+            return;
+        };
+        let wanted: Vec<u32> = indices
+            .iter()
+            .copied()
+            .filter(|i| media.displays.iter().any(|d| d.index == *i))
+            .filter(|i| (*i as usize) < media.video_tracks)
+            .collect();
+        if wanted.is_empty() {
+            tracing::warn!(session = %self.id, ?indices, "no valid display in set_active_displays");
+            return;
+        }
+        let current: Vec<u32> = media.streams.keys().copied().collect();
+        for idx in current {
+            if !wanted.contains(&idx) {
+                self.stop_display(idx).await;
+            }
+        }
+        for idx in &wanted {
+            if let Err(e) = self.start_display(*idx).await {
+                tracing::warn!(session = %self.id, display = idx, "starting display: {e:#}");
+            }
+        }
+        let active = self.active_displays();
+        self.event(SessionEvent::DisplaysChanged {
+            active: active.clone(),
+        });
+        self.send_display_info().await;
+    }
+
+    fn active_displays(&self) -> Vec<u32> {
+        self.media
+            .as_ref()
+            .map(|m| m.streams.keys().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Point the input handler at the current display and its encoded picture size.
+    fn update_input_display(&mut self) {
+        let Some(media) = self.media.as_ref() else {
+            return;
+        };
+        let index = media.current_display;
+        let Some(d) = media.displays.iter().find(|d| d.index == index).cloned() else {
+            return;
+        };
+        let video_size = media
+            .streams
+            .get(&index)
+            .map(|s| s.video_size)
+            .filter(|(w, h)| *w > 0 && *h > 0)
+            .unwrap_or((d.width, d.height));
+        if let Some(handler) = self.input.lock().as_mut() {
+            handler.set_display(&d, video_size);
+        }
+    }
+
+    // ── audio ────────────────────────────────────────────────────────────────────
+
+    async fn set_audio(&mut self, enabled: bool) {
+        let Some(media) = self.media.as_mut() else {
+            return;
+        };
+        if !enabled {
+            if let Some(a) = media.audio.take() {
+                a.writer.abort();
+                let _ = tokio::task::spawn_blocking(move || a.pipeline.stop()).await;
+                self.event(SessionEvent::AudioChanged { enabled: false });
+                self.send_display_info().await;
+            }
+            return;
+        }
+        if media.audio.is_some() {
+            return;
+        }
+        if !self.cfg.allow_audio {
+            tracing::info!(session = %self.id, "audio requested but disabled by configuration");
+            return;
+        }
+        let Some(track) = self.peer.audio() else {
+            tracing::info!(session = %self.id, "audio requested but no audio track was negotiated");
+            return;
+        };
+        let payload_type = track.payload_type().await;
+        let ssrc = track.ssrc().await;
+        let factory = Arc::clone(&self.deps.media);
+        let (tx, mut rx) = mpsc::channel::<AudioPacket>(8);
+        let started = tokio::task::spawn_blocking(move || -> Result<AudioPipeline> {
+            let source = factory.create_audio_source()?;
+            AudioPipeline::start(source, tx)
+        })
+        .await;
+        let pipeline = match started {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => {
+                tracing::warn!(session = %self.id, "audio capture unavailable: {e:#}");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(session = %self.id, "audio task: {e}");
+                return;
+            }
+        };
+        let writer = tokio::spawn({
+            let peer = Arc::clone(&self.peer);
+            async move {
+                while let Some(p) = rx.recv().await {
+                    let Some(track) = peer.audio() else { break };
+                    if let Err(e) = track.write(payload_type, ssrc, p.data, p.duration).await {
+                        tracing::debug!("write audio: {e:#}");
+                    }
+                }
+            }
+        });
+        if let Some(media) = self.media.as_mut() {
+            media.audio = Some(AudioStream { pipeline, writer });
+        }
+        tracing::info!(session = %self.id, payload_type, ssrc, "audio streaming");
+        self.event(SessionEvent::AudioChanged { enabled: true });
+        self.send_display_info().await;
+    }
+
+    // ── data channels ────────────────────────────────────────────────────────────
 
     async fn on_data_channel(&mut self, dc: Arc<dyn DataChannel>) {
         let label = match dc.label().await {
@@ -625,15 +932,9 @@ impl Session {
             INPUT_CHANNEL_LABEL => {
                 if self.input.lock().is_none() {
                     match (self.deps.input)() {
-                        Ok(mut h) => {
-                            if let Some(m) = self.media.as_ref() {
-                                if let Some(d) =
-                                    m.displays.iter().find(|d| d.index == m.current_display)
-                                {
-                                    h.set_display(d, m.video_size);
-                                }
-                            }
+                        Ok(h) => {
                             *self.input.lock() = Some(h);
+                            self.update_input_display();
                         }
                         Err(e) => tracing::error!("input injection unavailable: {e:#}"),
                     }
@@ -698,19 +999,329 @@ impl Session {
                     }
                 }));
             }
+            FILES_CHANNEL_LABEL => {
+                let tx = self.channel_tx.clone();
+                let sid = self.id.clone();
+                self.readers.push(tokio::spawn(async move {
+                    while let Some(ev) = dc.poll().await {
+                        match ev {
+                            DataChannelEvent::OnOpen => {
+                                let _ = tx.send(ChannelEvent::FilesOpen(Arc::clone(&dc)));
+                            }
+                            DataChannelEvent::OnMessage(msg) => {
+                                // Text frames are JSON control messages; binary frames are
+                                // chunks (version byte 1 first). A JSON frame always starts
+                                // with `{`, so the first byte disambiguates when the
+                                // transport does not flag string-ness.
+                                let data = msg.data;
+                                if data.first() == Some(&b'{') {
+                                    match serde_json::from_slice::<FileMessage>(&data) {
+                                        Ok(m) => {
+                                            let _ = tx.send(ChannelEvent::FilesText(m));
+                                        }
+                                        Err(e) => {
+                                            tracing::debug!(session = %sid, "bad files message: {e}")
+                                        }
+                                    }
+                                } else {
+                                    let _ = tx.send(ChannelEvent::FilesBinary(data.freeze()));
+                                }
+                            }
+                            DataChannelEvent::OnClose => {
+                                let _ = tx.send(ChannelEvent::FilesClosed);
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                }));
+            }
             other => tracing::warn!(session = %self.id, "ignoring unknown data channel {other}"),
         }
     }
 
+    fn on_files_open(&mut self, dc: Arc<dyn DataChannel>) {
+        let dir = self
+            .cfg
+            .transfer_dir
+            .as_deref()
+            .filter(|d| !d.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(TransferConfig::default_dir);
+        let cfg = TransferConfig {
+            allow_files: self.cfg.allow_file_transfer,
+            allow_clipboard: self.cfg.allow_clipboard,
+            dir,
+        };
+        let sink = files::DataChannelSink::shared(dc);
+        self.transfers = Some(TransferManager::new(
+            cfg,
+            sink,
+            self.transfer_notices_tx.clone(),
+        ));
+    }
+
+    async fn on_files_message(&mut self, msg: FileMessage) {
+        if matches!(msg, FileMessage::RequestClipboard) {
+            self.offer_clipboard().await;
+            return;
+        }
+        if let Some(t) = self.transfers.as_mut() {
+            t.handle_message(msg).await;
+        }
+    }
+
+    async fn on_transfer_notice(&mut self, notice: TransferNotice) {
+        match notice {
+            TransferNotice::Started {
+                token,
+                name,
+                size,
+                kind,
+                direction,
+                offset,
+            } => self.event(SessionEvent::TransferStarted {
+                token,
+                name,
+                size,
+                kind,
+                direction,
+                offset,
+            }),
+            TransferNotice::Completed {
+                token,
+                name,
+                size,
+                direction,
+                path,
+                ..
+            } => self.event(SessionEvent::TransferCompleted {
+                token,
+                name,
+                size,
+                direction,
+                path: path.map(|p| p.display().to_string()),
+            }),
+            TransferNotice::Failed {
+                token,
+                name,
+                reason,
+            } => self.event(SessionEvent::TransferFailed {
+                token,
+                name,
+                reason,
+            }),
+            TransferNotice::ClipboardImage(path) => {
+                let p = path.clone();
+                let backend = Arc::clone(&self.deps.clipboard);
+                let res = tokio::task::spawn_blocking(move || backend.set_image_from_png(&p)).await;
+                match res {
+                    Ok(Ok((w, h))) => {
+                        if let (Some(watch), Ok(png)) =
+                            (self.clipboard.as_ref(), std::fs::read(&path))
+                        {
+                            watch.mark_own(&ClipboardContent::Image {
+                                png,
+                                width: w,
+                                height: h,
+                            });
+                        }
+                        self.event(SessionEvent::ClipboardSync {
+                            direction: TransferDirection::ToDevice,
+                            summary: format!("image {w}×{h}"),
+                        });
+                    }
+                    Ok(Err(e)) => tracing::warn!("placing clipboard image: {e:#}"),
+                    Err(e) => tracing::warn!("clipboard task: {e}"),
+                }
+            }
+            TransferNotice::ClipboardFiles(paths) => {
+                let count = paths.len();
+                let p = paths.clone();
+                let backend = Arc::clone(&self.deps.clipboard);
+                let res = tokio::task::spawn_blocking(move || backend.set_files(&p)).await;
+                match res {
+                    Ok(Ok(())) => {
+                        if let Some(watch) = self.clipboard.as_ref() {
+                            watch.mark_own(&ClipboardContent::Files(paths));
+                        }
+                        self.event(SessionEvent::ClipboardSync {
+                            direction: TransferDirection::ToDevice,
+                            summary: format!("{count} file(s)"),
+                        });
+                    }
+                    Ok(Err(e)) => tracing::warn!("placing clipboard files: {e:#}"),
+                    Err(e) => tracing::warn!("clipboard task: {e}"),
+                }
+            }
+        }
+    }
+
+    // ── clipboard ────────────────────────────────────────────────────────────────
+
+    async fn on_clipboard_change(&mut self, content: ClipboardContent) {
+        match content {
+            ClipboardContent::Text(text) => {
+                self.send_control(ControlMessage::ClipboardChanged { text })
+                    .await;
+            }
+            ClipboardContent::Image { width, height, .. } => {
+                let total = content.total_bytes();
+                let name = format!("clipboard-{}.png", crate::chat::now_ms());
+                self.pending_clipboard = Some(content);
+                self.send_control(ControlMessage::ClipboardAvailable {
+                    kind: ClipboardKind::Image,
+                    names: vec![name],
+                    total_bytes: total,
+                })
+                .await;
+                tracing::debug!(session = %self.id, width, height, "clipboard image available");
+            }
+            ClipboardContent::Files(ref paths) => {
+                if !self.cfg.allow_file_transfer {
+                    return;
+                }
+                let names: Vec<String> = paths
+                    .iter()
+                    .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .collect();
+                if names.is_empty() {
+                    return;
+                }
+                let total = content.total_bytes();
+                self.pending_clipboard = Some(content);
+                self.send_control(ControlMessage::ClipboardAvailable {
+                    kind: ClipboardKind::Files,
+                    names,
+                    total_bytes: total,
+                })
+                .await;
+            }
+        }
+    }
+
+    /// Operator asked for the announced clipboard image / files.
+    async fn offer_clipboard(&mut self) {
+        let Some(content) = self.pending_clipboard.clone() else {
+            return;
+        };
+        let Some(transfers) = self.transfers.as_mut() else {
+            return;
+        };
+        match content {
+            ClipboardContent::Image { png, width, height } => {
+                let name = format!("clipboard-{}.png", crate::chat::now_ms());
+                match transfers
+                    .offer_bytes(name, Bytes::from(png), TransferKind::ClipboardImage, None)
+                    .await
+                {
+                    Ok(_) => self.event(SessionEvent::ClipboardSync {
+                        direction: TransferDirection::ToOperator,
+                        summary: format!("image {width}×{height}"),
+                    }),
+                    Err(e) => tracing::warn!("offering clipboard image: {e:#}"),
+                }
+            }
+            ClipboardContent::Files(paths) => {
+                let group = uuid::Uuid::new_v4().simple().to_string();
+                let mut offered = 0usize;
+                for p in paths.iter().filter(|p| p.is_file()) {
+                    match transfers
+                        .offer_file(p, TransferKind::ClipboardFiles, Some(group.clone()), None)
+                        .await
+                    {
+                        Ok(_) => offered += 1,
+                        Err(e) => tracing::warn!("offering {}: {e:#}", p.display()),
+                    }
+                }
+                if offered > 0 {
+                    self.event(SessionEvent::ClipboardSync {
+                        direction: TransferDirection::ToOperator,
+                        summary: format!("{offered} file(s)"),
+                    });
+                }
+            }
+            ClipboardContent::Text(_) => {}
+        }
+    }
+
+    // ── chat ─────────────────────────────────────────────────────────────────────
+
+    async fn on_chat_from_operator(&mut self, text: String, ts_ms: u64) {
+        let Some(line) = self.chat.push(ChatParty::Operator, &text, Some(ts_ms)) else {
+            return;
+        };
+        if let Some(ui) = self.chat_ui.as_ref() {
+            ui.push_line(&line);
+            ui.set_visible(true);
+        }
+        self.event(SessionEvent::Chat {
+            from: ChatParty::Operator,
+            text: line.text,
+        });
+    }
+
+    async fn on_chat_from_device(&mut self, text: String) {
+        let Some(line) = self.chat.push(ChatParty::Device, &text, None) else {
+            return;
+        };
+        if let Some(ui) = self.chat_ui.as_ref() {
+            ui.push_line(&line);
+        }
+        self.send_control(ControlMessage::Chat {
+            from: ChatParty::Device,
+            text: line.text.clone(),
+            ts_ms: line.ts_ms,
+        })
+        .await;
+        self.event(SessionEvent::Chat {
+            from: ChatParty::Device,
+            text: line.text,
+        });
+    }
+
+    // ── control channel ──────────────────────────────────────────────────────────
+
     async fn on_control(&mut self, msg: ControlMessage) {
         match msg {
             ControlMessage::SelectDisplay { index } => {
-                if let Some(m) = self.media.as_ref() {
-                    if m.displays.iter().any(|d| d.index == index) {
-                        m.pipeline.select_display(index);
-                    } else {
-                        tracing::warn!(session = %self.id, index, "unknown display");
+                let known = self
+                    .media
+                    .as_ref()
+                    .map(|m| m.displays.iter().any(|d| d.index == index))
+                    .unwrap_or(false);
+                if !known {
+                    tracing::warn!(session = %self.id, index, "unknown display");
+                    return;
+                }
+                if let Some(m) = self.media.as_mut() {
+                    m.current_display = index;
+                }
+                let streaming = self.active_displays().contains(&index);
+                if !streaming {
+                    // Single-tile viewer semantics: switch the stream to this display.
+                    self.set_active_displays(&[index]).await;
+                } else {
+                    // Multi-tile: the pointer moved to another streaming tile.
+                    self.send_display_info().await;
+                }
+                self.update_input_display();
+            }
+            ControlMessage::SetActiveDisplays { indices } => {
+                self.set_active_displays(&indices).await;
+                if let Some(m) = self.media.as_mut() {
+                    if !m.streams.contains_key(&m.current_display) {
+                        if let Some(first) = m.streams.keys().next().copied() {
+                            m.current_display = first;
+                        }
                     }
+                }
+                self.update_input_display();
+            }
+            ControlMessage::SetAudio { enabled } => self.set_audio(enabled).await,
+            ControlMessage::Chat { from, text, ts_ms } => {
+                if from == ChatParty::Operator {
+                    self.on_chat_from_operator(text, ts_ms).await;
                 }
             }
             ControlMessage::SetQuality {
@@ -721,12 +1332,16 @@ impl Session {
                     let fps = max_fps.map(|f| f.clamp(1, self.cfg.max_fps.max(1)));
                     let kbps =
                         max_bitrate_kbps.map(|b| b.clamp(100, self.cfg.max_bitrate_kbps.max(100)));
-                    m.pipeline.set_quality(fps, kbps);
+                    for s in m.streams.values() {
+                        s.pipeline.set_quality(fps, kbps);
+                    }
                 }
             }
             ControlMessage::RequestKeyframe => {
                 if let Some(m) = self.media.as_ref() {
-                    m.pipeline.request_keyframe();
+                    for s in m.streams.values() {
+                        s.pipeline.request_keyframe();
+                    }
                 }
             }
             ControlMessage::SecureAttention => {
@@ -742,12 +1357,11 @@ impl Session {
                 if !self.cfg.allow_clipboard {
                     return;
                 }
-                let res = tokio::task::spawn_blocking(move || -> Result<()> {
-                    let mut cb = arboard::Clipboard::new()?;
-                    cb.set_text(text)?;
-                    Ok(())
-                })
-                .await;
+                if let Some(watch) = self.clipboard.as_ref() {
+                    watch.mark_own(&ClipboardContent::Text(text.clone()));
+                }
+                let backend = Arc::clone(&self.deps.clipboard);
+                let res = tokio::task::spawn_blocking(move || backend.set_text(&text)).await;
                 match res {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => tracing::warn!("setting clipboard: {e:#}"),
@@ -757,8 +1371,11 @@ impl Session {
             // agent → browser messages are never expected inbound
             ControlMessage::DisplayInfo { .. }
             | ControlMessage::ClipboardChanged { .. }
+            | ControlMessage::ClipboardAvailable { .. }
             | ControlMessage::Stats { .. }
             | ControlMessage::SessionEndedByUser => {}
+            // observer notifications are console → browser only; ignore anything else
+            other => tracing::debug!(session = %self.id, ?other, "ignoring control message"),
         }
     }
 
@@ -781,6 +1398,8 @@ impl Session {
         self.send_control(ControlMessage::DisplayInfo {
             displays: m.displays.clone(),
             current: m.current_display,
+            active: m.streams.keys().copied().collect(),
+            audio: m.audio.is_some(),
         })
         .await;
     }
@@ -790,17 +1409,20 @@ impl Session {
         if self.control.is_none() {
             return;
         }
-        let s = m.pipeline.stats().borrow().clone();
-        self.send_control(ControlMessage::Stats {
-            codec: s.codec,
-            fps: s.fps,
-            bitrate_kbps: s.bitrate_kbps,
-            width: s.encoded_width,
-            height: s.encoded_height,
-            pipeline_ms: s.pipeline_ms,
-            hardware: s.hardware,
-        })
-        .await;
+        for (idx, s) in &m.streams {
+            let st = s.pipeline.stats().borrow().clone();
+            self.send_control(ControlMessage::Stats {
+                display: *idx,
+                codec: st.codec,
+                fps: st.fps,
+                bitrate_kbps: st.bitrate_kbps,
+                width: st.encoded_width,
+                height: st.encoded_height,
+                pipeline_ms: st.pipeline_ms,
+                hardware: st.hardware,
+            })
+            .await;
+        }
     }
 
     async fn teardown(&mut self) {
@@ -808,14 +1430,25 @@ impl Session {
             h.release_all();
         }
         self.indicator = None;
+        self.chat_ui = None;
         if let Some(c) = self.clipboard.take() {
-            c.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            c.stop();
         }
-        if let Some(m) = self.media.take() {
-            m.rtcp.abort();
-            m.writer.abort();
-            let pipeline = m.pipeline;
-            let _ = tokio::task::spawn_blocking(move || drop(pipeline)).await;
+        if let Some(mut t) = self.transfers.take() {
+            t.cancel_all().await;
+        }
+        if let Some(mut m) = self.media.take() {
+            if let Some(a) = m.audio.take() {
+                a.writer.abort();
+                let _ = tokio::task::spawn_blocking(move || a.pipeline.stop()).await;
+            }
+            for (_, s) in std::mem::take(&mut m.streams) {
+                s.writer.abort();
+                s.rtcp.abort();
+                s.forwarder.abort();
+                let pipeline = s.pipeline;
+                let _ = tokio::task::spawn_blocking(move || drop(pipeline)).await;
+            }
         }
         for r in self.readers.drain(..) {
             r.abort();
@@ -824,37 +1457,7 @@ impl Session {
     }
 }
 
-/// Poll the system clipboard on a background thread; changes are sent as text.
-fn start_clipboard_watch() -> ClipboardWatch {
-    let (tx, rx) = mpsc::unbounded_channel();
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_flag = Arc::clone(&stop);
-    let spawned = std::thread::Builder::new()
-        .name("clipboard-watch".into())
-        .spawn(move || {
-            let mut clipboard = match arboard::Clipboard::new() {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!("clipboard unavailable: {e}");
-                    return;
-                }
-            };
-            // Don't replay whatever is on the clipboard when the session starts.
-            let mut last = clipboard.get_text().ok();
-            while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(500));
-                if let Ok(text) = clipboard.get_text() {
-                    if last.as_deref() != Some(text.as_str()) {
-                        last = Some(text.clone());
-                        if tx.send(text).is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-    if let Err(e) = spawned {
-        tracing::warn!("clipboard watcher thread: {e}");
-    }
-    ClipboardWatch { rx, stop }
+#[allow(dead_code)]
+fn _unused(e: anyhow::Error) -> anyhow::Error {
+    anyhow!("{e}")
 }

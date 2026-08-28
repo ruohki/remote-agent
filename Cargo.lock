@@ -2224,6 +2224,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
+name = "opus"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33718946cc77d4032911d4efe03a66dbcbfbd2bb16c3da06aaeadcc637c32216"
+dependencies = [
+ "opusic-sys",
+]
+
+[[package]]
+name = "opusic-sys"
+version = "0.7.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9d1ecdf206421bc74343ab3bb2f30ad2abbfee41fa341f7181fecbaf957769a"
+dependencies = [
+ "cmake",
+]
+
+[[package]]
 name = "p256"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2641,6 +2659,7 @@ dependencies = [
  "log",
  "objc2",
  "objc2-app-kit",
+ "objc2-core-audio-types",
  "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-core-media",
@@ -2649,7 +2668,9 @@ dependencies = [
  "objc2-screen-capture-kit",
  "objc2-video-toolbox",
  "openh264",
+ "opus",
  "parking_lot",
+ "png",
  "protocol",
  "rand",
  "reqwest",

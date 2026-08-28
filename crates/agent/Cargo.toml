@@ -70,6 +70,11 @@ arboard = "3.6"
 # help-me approval dialog + session indicator
 rfd = { version = "0.17", default-features = false }
 
+# file transfer / clipboard images
+png = "0.18"
+# system audio → Opus (libopus built from source via audiopus_sys/cmake)
+opus = "0.4"
+
 # software H264 fallback (Cisco OpenH264, built from source; BSD-2)
 openh264 = { version = "0.9", features = ["source"] }
 
@@ -79,6 +84,7 @@ objc2-foundation = "0.3"
 objc2-core-foundation = "0.3"
 objc2-core-graphics = "0.3"
 objc2-core-media = "0.3"
+objc2-core-audio-types = "0.3"
 objc2-core-video = "0.3"
 objc2-video-toolbox = "0.3"
 objc2-screen-capture-kit = "0.3"
@@ -99,12 +105,18 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
     "Win32_Media_MediaFoundation",
+    "Win32_Media_Audio",
+    "Win32_Media_Multimedia",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_UI_Controls",
     "Win32_Media_KernelStreaming",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",
     "Win32_System_Ole",
     "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
     "Win32_System_RemoteDesktop",
     "Win32_System_Services",
     "Win32_System_Environment",
