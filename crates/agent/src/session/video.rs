@@ -102,7 +102,21 @@ impl VideoPipeline {
         frame_tx: mpsc::Sender<EncodedFrame>,
         event_tx: mpsc::UnboundedSender<PipelineEvent>,
     ) -> Result<Self> {
-        let worker = Worker::open(media, cfg.clone()).context("opening capture pipeline")?;
+        // The first ScreenCaptureKit start after a (re)install can fail transiently while the
+        // OS evaluates the capture permission (error -3805 / start timeout); retry before
+        // giving up on the whole session.
+        let mut attempt = 0;
+        let worker = loop {
+            attempt += 1;
+            match Worker::open(Arc::clone(&media), cfg.clone()) {
+                Ok(w) => break w,
+                Err(e) if attempt < OPEN_ATTEMPTS => {
+                    tracing::warn!("opening capture pipeline failed (attempt {attempt}/{OPEN_ATTEMPTS}): {e:#}");
+                    std::thread::sleep(Duration::from_millis(750 * attempt as u64));
+                }
+                Err(e) => return Err(e.context("opening capture pipeline")),
+            }
+        };
         let _ = event_tx.send(worker.started_event());
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
         let keyframe = Arc::new(AtomicBool::new(true));
@@ -190,6 +204,8 @@ struct Worker {
 /// After this many consecutive capture/encode failures the pipeline is recreated; after
 /// that many recreation failures it gives up.
 const MAX_CONSECUTIVE_ERRORS: u32 = 5;
+/// Attempts to open capturer + encoder when a session starts.
+const OPEN_ATTEMPTS: u32 = 3;
 const MAX_REOPEN_ATTEMPTS: u32 = 3;
 
 /// `(capturer, encoder, width, height)` returned by [`Worker::open_devices`].
