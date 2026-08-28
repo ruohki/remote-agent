@@ -1,0 +1,113 @@
+[package]
+name = "remote-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Remote desktop agent: captures the screen, encodes H265/H264 and streams it over WebRTC to the management console's web viewer"
+default-run = "remote-agent"
+
+[[bin]]
+name = "remote-agent"
+path = "src/main.rs"
+
+[dependencies]
+protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender = "0.2"
+
+# CLI / config / paths
+clap = { version = "4.6", features = ["derive", "env"] }
+directories = "6.0"
+toml = "0.9"
+
+# networking
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
+futures-util = "0.3"
+url = "2.5"
+bytes = "1.12"
+
+# WebRTC (sans-io core `rtc` re-exported by `webrtc`)
+webrtc = { version = "0.20.3", default-features = false, features = ["runtime-tokio"] }
+async-trait = "0.1"
+
+# misc
+uuid = { version = "1.26", features = ["v4"] }
+rand = "0.10"
+sha2 = "0.10"
+hex = "0.4"
+hostname = "0.4"
+sysinfo = { version = "0.37", default-features = false, features = ["system"] }
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+log = "0.4"
+
+# input injection
+enigo = "0.6"
+
+# clipboard
+arboard = "3.6"
+
+# help-me approval dialog + session indicator
+rfd = { version = "0.17", default-features = false }
+
+# software H264 fallback (Cisco OpenH264, built from source; BSD-2)
+openh264 = { version = "0.9", features = ["source"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-core-foundation = "0.3"
+objc2-core-graphics = "0.3"
+objc2-core-media = "0.3"
+objc2-core-video = "0.3"
+objc2-video-toolbox = "0.3"
+objc2-screen-capture-kit = "0.3"
+objc2-app-kit = "0.3"
+block2 = "0.6"
+dispatch2 = "0.3"
+core-foundation = "0.10"
+libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-service = "0.8"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_MediaFoundation",
+    "Win32_Media_KernelStreaming",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_System_Ole",
+    "Win32_System_Threading",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Services",
+    "Win32_System_Environment",
+    "Win32_System_SystemServices",
+    "Win32_System_Registry",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_Security",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_Storage_FileSystem",
+] }
+windows-core = "0.62"
+
+
+[dev-dependencies]
+tempfile = "3.24"
