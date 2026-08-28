@@ -257,6 +257,15 @@ pub fn raise_thread_priority() {
 /// Idle refresh: after this long without a changed frame the last frame is encoded again
 /// (as a P-frame) so the receiver's jitter buffer keeps moving.
 pub const IDLE_REFRESH: Duration = Duration::from_secs(1);
+/// After a change frame, if no further frame arrives within this time, the last picture is
+/// encoded once more: browsers release a decoded frame only when the next one starts, so a
+/// lone change frame would otherwise sit in the decoder until the 1 s idle refresh.
+pub const FOLLOW_UP: Duration = Duration::from_millis(50);
+
+/// Whether the post-change follow-up frame is due.
+pub fn follow_up_due(now: Instant, last_sent: Option<Instant>, pending: bool) -> bool {
+    pending && last_sent.is_some_and(|t| now.duration_since(t) >= FOLLOW_UP)
+}
 /// Viewport changes are coalesced for this long before the encoder is rebuilt.
 pub const VIEWPORT_DEBOUNCE: Duration = Duration::from_millis(250);
 
@@ -304,6 +313,8 @@ struct Worker {
     window_encode_ms: f32,
     window_keyframes: u32,
     window_idle_refreshes: u32,
+    /// A change frame was sent and its follow-up frame has not been produced yet.
+    follow_up_pending: bool,
     encoded_total: u64,
     dropped_total: u64,
     last_stats: PipelineStats,
@@ -368,6 +379,7 @@ impl Worker {
             window_encode_ms: 0.0,
             window_keyframes: 0,
             window_idle_refreshes: 0,
+            follow_up_pending: false,
             encoded_total: 0,
             dropped_total: 0,
             last_stats,
@@ -601,7 +613,12 @@ impl Worker {
 
             // ── capture ─────────────────────────────────────────────────────────────
             let frame_interval = Duration::from_secs_f64(1.0 / self.pace_fps.max(1) as f64);
-            let frame = match self.capturer.next_frame(Duration::from_millis(100)) {
+            let wait = if self.follow_up_pending {
+                FOLLOW_UP
+            } else {
+                Duration::from_millis(100)
+            };
+            let frame = match self.capturer.next_frame(wait) {
                 Ok(f) => {
                     self.consecutive_errors = 0;
                     f
@@ -658,6 +675,11 @@ impl Worker {
                             self.encode_and_send(last, true, false, &frame_tx, &keyframe);
                         } else {
                             keyframe.store(true, Ordering::Relaxed);
+                        }
+                    } else if follow_up_due(now, self.last_sent_at, self.follow_up_pending) {
+                        self.follow_up_pending = false;
+                        if let Some(last) = self.last_frame.take() {
+                            self.encode_and_send(last, false, true, &frame_tx, &keyframe);
                         }
                     } else if idle_refresh_due(now, self.last_sent_at) {
                         if let Some(last) = self.last_frame.take() {
@@ -722,6 +744,9 @@ impl Worker {
         self.last_encode_at = Some(encoded_at);
         if idle_refresh {
             self.window_idle_refreshes += 1;
+        } else {
+            // A real change went out: schedule the 50 ms follow-up frame.
+            self.follow_up_pending = true;
         }
         for f in encoded {
             let is_key = f.keyframe;
@@ -821,6 +846,20 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn follow_up_timer() {
+        let t0 = Instant::now();
+        assert!(!follow_up_due(t0, None, true), "no frame sent yet");
+        assert!(!follow_up_due(t0, Some(t0), false), "nothing pending");
+        assert!(!follow_up_due(
+            t0 + Duration::from_millis(20),
+            Some(t0),
+            true
+        ));
+        assert!(follow_up_due(t0 + FOLLOW_UP, Some(t0), true));
+        assert!(FOLLOW_UP < IDLE_REFRESH);
+    }
 
     #[test]
     fn idle_refresh_timer() {

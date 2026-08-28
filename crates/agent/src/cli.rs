@@ -12,6 +12,11 @@ pub struct Cli {
     #[arg(long, global = true, env = "REMOTE_AGENT_LOG", default_value = "info")]
     pub log: String,
 
+    /// Allow plain http:// / ws:// console URLs outside localhost and private networks
+    /// (credentials travel unencrypted — development only).
+    #[arg(long, global = true, env = "REMOTE_AGENT_INSECURE")]
+    pub insecure: bool,
+
     /// No subcommand launches the branded application window (double-click).
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -67,6 +72,7 @@ pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let paths = crate::config::Paths::resolve(cli.config_dir.clone())?;
     init_logging(&cli.log, &paths);
+    crate::transport::set_insecure(cli.insecure);
     crate::branding::init(&paths);
 
     match cli.command {

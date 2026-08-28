@@ -17,6 +17,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub mod chat_assets;
+#[cfg(target_os = "windows")]
+pub mod dpapi;
 #[cfg(target_os = "macos")]
 pub mod macos;
 #[cfg(target_os = "windows")]
@@ -458,10 +460,12 @@ pub fn doctor(paths: &crate::config::Paths) -> Result<()> {
         if cfg.is_enrolled() {
             let rt = tokio::runtime::Runtime::new()?;
             let reachable = rt.block_on(async {
-                let client = reqwest::Client::builder()
-                    .timeout(Duration::from_secs(5))
-                    .build()
-                    .ok()?;
+                let _ = crate::transport::set_console_pin(
+                    cfg.console_tls_spki_sha256.as_deref(),
+                    &cfg.server_url,
+                );
+                let client =
+                    crate::transport::http_client(&cfg.server_url, Duration::from_secs(5)).ok()?;
                 let url = format!("{}/api/info", cfg.server_url.trim_end_matches('/'));
                 client.get(url).send().await.ok().map(|r| r.status())
             });
@@ -469,6 +473,18 @@ pub fn doctor(paths: &crate::config::Paths) -> Result<()> {
                 Some(status) => println!("console         : reachable (HTTP {status})"),
                 None => println!("console         : NOT reachable"),
             }
+            println!(
+                "tls pin         : {}",
+                cfg.console_tls_spki_sha256
+                    .as_deref()
+                    .unwrap_or("none (not baked with a pin)")
+            );
+            println!(
+                "secret storage  : {}",
+                cfg.secret_backend
+                    .as_deref()
+                    .unwrap_or("file (not yet migrated)")
+            );
         }
     }
     Ok(())

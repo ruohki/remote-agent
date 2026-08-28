@@ -122,6 +122,16 @@ pub struct LocalConfig {
     /// trailer. Pinned so a later re-baked binary presenting a different key is refused.
     #[serde(default)]
     pub console_public_key: Option<String>,
+    /// SHA-256 (base64) of the console TLS certificate's SubjectPublicKeyInfo, from the bakery
+    /// trailer; every TLS connection to the console must present this key.
+    #[serde(default)]
+    pub console_tls_spki_sha256: Option<String>,
+    /// Where the device secret lives: `keychain`, `dpapi` or `file` (see `secrets`).
+    #[serde(default)]
+    pub secret_backend: Option<String>,
+    /// DPAPI-protected device secret (base64), Windows only.
+    #[serde(default)]
+    pub device_secret_dpapi: Option<String>,
 }
 
 impl LocalConfig {
@@ -153,7 +163,10 @@ impl LocalConfig {
     }
 
     pub fn is_enrolled(&self) -> bool {
-        !self.server_url.is_empty() && !self.device_id.is_empty() && !self.device_secret.is_empty()
+        let has_secret = !self.device_secret.is_empty()
+            || self.device_secret_dpapi.is_some()
+            || matches!(self.secret_backend.as_deref(), Some("keychain"));
+        !self.server_url.is_empty() && !self.device_id.is_empty() && has_secret
     }
 
     /// The console's config (cached), with a hostname display-name default. This is the policy
@@ -223,6 +236,16 @@ pub fn print_status(paths: &Paths) -> Result<()> {
             let eff = cfg.effective();
             println!("name       : {}", eff.display_name);
             println!("mode       : {:?}", eff.mode);
+            println!(
+                "secret     : {}",
+                cfg.secret_backend
+                    .as_deref()
+                    .unwrap_or("file (not yet migrated)")
+            );
+            println!(
+                "tls pin    : {}",
+                cfg.console_tls_spki_sha256.as_deref().unwrap_or("none")
+            );
         }
     }
     println!("version    : {}", crate::AGENT_VERSION);
@@ -230,6 +253,7 @@ pub fn print_status(paths: &Paths) -> Result<()> {
 }
 
 pub fn reset(paths: &Paths) -> Result<()> {
+    crate::secrets::forget(paths);
     let file = paths.config_file();
     if file.exists() {
         std::fs::remove_file(&file)?;
@@ -257,6 +281,9 @@ mod tests {
             cached: Some(AgentConfig::default()),
             overrides: LocalOverrides::default(),
             console_public_key: None,
+            console_tls_spki_sha256: None,
+            secret_backend: None,
+            device_secret_dpapi: None,
         };
         cfg.save(&paths).unwrap();
         let back = LocalConfig::load(&paths).unwrap().unwrap();
@@ -291,6 +318,9 @@ mod tests {
                 ..Default::default()
             },
             console_public_key: None,
+            console_tls_spki_sha256: None,
+            secret_backend: None,
+            device_secret_dpapi: None,
         };
         cfg.save(&paths).unwrap();
         let back = LocalConfig::load(&paths).unwrap().unwrap();

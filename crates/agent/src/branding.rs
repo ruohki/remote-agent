@@ -246,10 +246,7 @@ pub fn request_refresh() {
 /// Fetch `GET {server_url}/api/branding` once and apply it.
 pub async fn fetch_once(server_url: &str, paths: &Paths) -> Result<bool> {
     let url = format!("{}/api/branding", server_url.trim_end_matches('/'));
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .user_agent(format!("remote-agent/{}", crate::AGENT_VERSION))
-        .build()?;
+    let client = crate::transport::http_client(server_url, Duration::from_secs(15))?;
     let resp = client
         .get(&url)
         .send()

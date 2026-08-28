@@ -3629,9 +3629,13 @@ dependencies = [
  "png",
  "protocol",
  "rand",
+ "rcgen",
  "reqwest",
  "rfd",
  "rtc",
+ "rustls",
+ "rustls-pki-types",
+ "security-framework",
  "serde",
  "serde_json",
  "sha2",
@@ -3640,6 +3644,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "toml 0.9.12+spec-1.1.0",
  "tracing",
@@ -3648,11 +3653,13 @@ dependencies = [
  "tray-icon",
  "url",
  "uuid",
+ "webpki-roots 0.26.11",
  "webrtc",
  "windows 0.62.2",
  "windows-core 0.62.2",
  "windows-service",
  "wry",
+ "x509-parser 0.16.0",
 ]
 
 [[package]]
@@ -4101,6 +4108,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",

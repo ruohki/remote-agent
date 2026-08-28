@@ -104,7 +104,19 @@ impl AgentState {
 }
 
 pub async fn run_agent(paths: Paths) -> Result<()> {
-    let local = LocalConfig::load_required(&paths)?;
+    let mut local = LocalConfig::load_required(&paths)?;
+    crate::transport::check_console_url(&local.server_url)?;
+    crate::transport::set_console_pin(local.console_tls_spki_sha256.as_deref(), &local.server_url)
+        .context("console TLS pin in agent.toml")?;
+    // Resolve the device secret (keychain / DPAPI / file) into this in-memory copy only.
+    let backend = crate::secrets::migrate_if_needed(&paths, &mut local)?;
+    let (secret, _) = crate::secrets::load(&paths, &local)?;
+    local.device_secret = secret;
+    tracing::info!(
+        secret_backend = backend.as_str(),
+        tls_pin = crate::transport::console_pin_active(),
+        "console credentials loaded"
+    );
     let console_config = local.console_config();
     let overrides = local.overrides.clone();
     let config = Arc::new(RwLock::new(overrides.apply(console_config.clone())));
@@ -270,9 +282,7 @@ async fn connect_once(
 ) -> Result<()> {
     let ws_url = ws_url(&local.server_url)?;
     tracing::info!(%ws_url, "connecting to console");
-    let (ws, _resp) = tokio_tungstenite::connect_async(&ws_url)
-        .await
-        .with_context(|| format!("connecting to {ws_url}"))?;
+    let (ws, _resp) = crate::transport::ws_connect(&ws_url).await?;
     let (mut write, mut read) = ws.split();
 
     // ── hello ──────────────────────────────────────────────────────────────────────

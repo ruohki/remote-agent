@@ -15,11 +15,13 @@
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use protocol::common::{IceCandidate, IceServer, VideoCodec};
+use rtc::ice::mdns::MulticastDnsMode;
 use rtc::media::Sample;
 use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::configuration::media_engine::{
     MIME_TYPE_H264, MIME_TYPE_HEVC, MIME_TYPE_OPUS,
 };
+use rtc::peer_connection::configuration::setting_engine::SettingEngine;
 use rtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
 use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use rtc::rtp_transceiver::rtp_sender::{
@@ -276,9 +278,17 @@ impl Peer {
             .with_ice_servers(servers)
             .build();
 
+        // Without a SettingEngine the builder disables mDNS entirely: the ICE layer still
+        // queues queries for the browser's `.local` candidates but the driver has no multicast
+        // socket and drops them, so those candidates never resolve. Query-only mode resolves
+        // them (we advertise real host addresses ourselves).
+        let mut setting_engine = SettingEngine::default();
+        setting_engine.set_multicast_dns_mode(MulticastDnsMode::QueryOnly);
+        setting_engine.set_multicast_dns_timeout(Some(std::time::Duration::from_secs(5)));
         let pc = PeerConnectionBuilder::new()
             .with_configuration(config)
             .with_media_engine(media_engine)
+            .with_setting_engine(setting_engine)
             .with_interceptor_registry(registry)
             .with_handler(Arc::new(Handler { tx: events }))
             .with_udp_addrs(vec!["0.0.0.0:0".to_string()])

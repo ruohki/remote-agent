@@ -222,6 +222,7 @@ mod tests {
                 ..Default::default()
             },
             issued_at: 42,
+            console_tls_spki_sha256: None,
         };
         let baked = append_trailer(base, &sign_payload(cfg, &key));
         let p = dir.join("baked.bin");
@@ -272,6 +273,9 @@ mod tests {
             cached: None,
             overrides: Default::default(),
             console_public_key: None,
+            console_tls_spki_sha256: None,
+            secret_backend: None,
+            device_secret_dpapi: None,
         };
         assert!(!should_auto_enroll(Some(&enrolled)));
     }
@@ -296,6 +300,7 @@ mod tests {
                 ..Default::default()
             },
             issued_at: 1,
+            console_tls_spki_sha256: None,
         };
         let payload = sign_payload(cfg, &key);
         std::fs::write(

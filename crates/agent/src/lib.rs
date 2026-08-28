@@ -39,9 +39,11 @@ pub mod enroll;
 pub mod hub;
 pub mod input;
 pub mod platform;
+pub mod secrets;
 pub mod service;
 pub mod session;
 pub mod transfer;
+pub mod transport;
 pub mod updater;
 
 /// Version baked in at build time (`CARGO_PKG_VERSION`).

@@ -258,8 +258,6 @@ mod macos {
 #[cfg(target_os = "windows")]
 mod windows {
     use super::*;
-    use std::collections::VecDeque;
-    use std::time::Instant;
     use ::windows::Win32::Foundation::POINT;
     use ::windows::Win32::Graphics::Gdi::{
         DeleteObject, GetDC, GetDIBits, ReleaseDC, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
@@ -268,6 +266,8 @@ mod windows {
     use ::windows::Win32::UI::WindowsAndMessaging::{
         GetCursorInfo, GetCursorPos, GetIconInfo, CURSORINFO, CURSOR_SHOWING, ICONINFO,
     };
+    use std::collections::VecDeque;
+    use std::time::Instant;
 
     pub struct WinCursor {
         pacer: Pacer,

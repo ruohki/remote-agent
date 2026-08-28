@@ -155,4 +155,3 @@ async fn synthetic_source_drives_the_hardware_encoder() {
         "expected ≥ 40 fps from the synthetic drag scenario, got {frames}/3s"
     );
 }
-

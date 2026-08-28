@@ -12,10 +12,7 @@ pub async fn apply_update(version: &str, url: &str, sha256_hex: &str) -> Result<
     let exe = std::env::current_exe().context("locating current executable")?;
     tracing::info!(%version, target = %exe.display(), "downloading update");
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(300))
-        .build()
-        .context("building HTTP client")?;
+    let client = crate::transport::http_client(url, Duration::from_secs(300))?;
     let bytes = client
         .get(url)
         .send()

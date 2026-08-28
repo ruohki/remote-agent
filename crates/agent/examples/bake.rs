@@ -74,6 +74,7 @@ fn main() {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0),
+        console_tls_spki_sha256: None,
     };
 
     let base = std::fs::read(require("in")).expect("reading input binary");

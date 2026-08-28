@@ -34,6 +34,10 @@ pub async fn auto_enroll_if_baked(paths: &Paths) -> Result<bool> {
     let Some(token) = baked.config.enroll_token.clone() else {
         return Ok(false);
     };
+    if let Err(e) = crate::transport::check_console_url(&baked.config.server_url) {
+        tracing::error!("not auto-enrolling: {e:#}");
+        return Ok(false);
+    }
     tracing::info!(server = %baked.config.server_url, "auto-enrolling from baked configuration");
     enroll(paths, &baked.config.server_url, &token, None).await?;
     Ok(true)
@@ -58,11 +62,12 @@ pub async fn enroll(paths: &Paths, server: &str, token: &str, name: Option<Strin
             .filter(|n| !n.is_empty()),
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .user_agent(format!("remote-agent/{}", crate::AGENT_VERSION))
-        .build()
-        .context("building HTTP client")?;
+    // A baked TLS pin applies from the very first request.
+    if let Some(b) = crate::baked::get() {
+        crate::transport::set_console_pin(b.config.console_tls_spki_sha256.as_deref(), server)
+            .context("baked console TLS pin")?;
+    }
+    let client = crate::transport::http_client(server, Duration::from_secs(20))?;
 
     tracing::info!(%url, %hostname, "enrolling");
     let resp = client
@@ -95,12 +100,18 @@ pub async fn enroll(paths: &Paths, server: &str, token: &str, name: Option<Strin
             enrolled.server_url.trim_end_matches('/').to_string()
         },
         device_id: enrolled.device_id.clone(),
-        device_secret: enrolled.device_secret,
+        device_secret: String::new(),
         cached: Some(enrolled.config),
         overrides: Default::default(),
         // Pin the console key from the bakery trailer (if this is a baked binary).
         console_public_key: crate::baked::get().map(|b| b.public_key.clone()),
+        console_tls_spki_sha256: crate::baked::get()
+            .and_then(|b| b.config.console_tls_spki_sha256.clone()),
+        secret_backend: None,
+        device_secret_dpapi: None,
     };
+    let backend = crate::secrets::store(paths, &mut cfg, &enrolled.device_secret);
+
     if let Some(name) = name {
         if let Some(c) = cfg.cached.as_mut() {
             c.display_name = name;
@@ -113,6 +124,10 @@ pub async fn enroll(paths: &Paths, server: &str, token: &str, name: Option<Strin
     println!("  server    : {}", cfg.server_url);
     println!("  name      : {}", cfg.effective().display_name);
     println!("  mode      : {:?}", cfg.effective().mode);
+    println!("  secret    : stored in {}", backend.as_str());
+    if cfg.console_tls_spki_sha256.is_some() {
+        println!("  tls pin   : active");
+    }
     println!("\nStart the agent with `remote-agent service install` (or `remote-agent run`).");
     Ok(())
 }
