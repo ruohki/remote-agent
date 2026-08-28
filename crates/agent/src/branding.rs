@@ -573,46 +573,23 @@ pub fn dock_icon(size: u32) -> Rgba {
     out
 }
 
-/// Monochrome "template" image (black glyph + alpha) for the macOS menu bar: the system tints it
-/// for light/dark appearance. Derived from the logo when there is one — its alpha channel when
-/// the logo has transparency, otherwise dark pixels count as ink — else the default mark.
+/// Monochrome "template" image (black glyph + alpha) for the macOS menu bar: always the
+/// console's monitor mark (the web console favicon) so every agent is recognisable in the
+/// menu bar regardless of branding; the system tints it for light/dark appearance. The
+/// branded logo is used for the dock icon instead.
 pub fn template_icon(size: u32) -> Rgba {
-    match logo() {
-        Some(l) => {
-            let fitted = fit_square(&l, size, 0);
-            let use_alpha = fitted.transparent_fraction() > 0.05;
-            let mut out = Rgba::new(size, size);
-            for y in 0..size {
-                for x in 0..size {
-                    let p = fitted.px(x, y);
-                    let a = p[3] as f32 / 255.0;
-                    let lum = (0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32)
-                        / 255.0;
-                    let cov = if use_alpha { a } else { 1.0 - lum };
-                    let cov = ((cov - 0.1) / 0.8).clamp(0.0, 1.0);
-                    out.set(x, y, [0, 0, 0, (cov * 255.0).round() as u8]);
-                }
-            }
-            out
-        }
-        None => default_glyph(size, None, (0, 0, 0), (0, 0, 0)),
-    }
+    default_glyph(size, None, (0, 0, 0), (0, 0, 0))
 }
 
 /// Tray icon for platforms without template images (Windows): the logo in colour, or the
 /// default mark drawn light-on-dark when the taskbar is dark and dark-on-light otherwise.
 pub fn tray_icon_colored(size: u32, dark_theme: bool) -> Rgba {
-    match logo() {
-        Some(l) => fit_square(&l, size, 0),
-        None => {
-            let fg = if dark_theme {
-                (255, 255, 255)
-            } else {
-                (17, 24, 39)
-            };
-            default_glyph(size, None, fg, (52, 211, 153))
-        }
-    }
+    let fg = if dark_theme {
+        (255, 255, 255)
+    } else {
+        (17, 24, 39)
+    };
+    default_glyph(size, None, fg, (52, 211, 153))
 }
 
 #[cfg(test)]
