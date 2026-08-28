@@ -1,10 +1,12 @@
 //! The main-thread event loop that owns the tao window, the wry webview and the tray icon.
 
+use super::bar::{BarIpc, SessionBar};
 use super::{
     branding_json, dispatch_disconnect, dispatch_send, key_fingerprint, set_proxy, AppEvent,
     AppOptions,
 };
 use crate::baked;
+use crate::branding;
 use anyhow::{Context, Result};
 use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use protocol::channel::ChatParty;
@@ -41,6 +43,7 @@ const ID_OPEN: &str = "open";
 const ID_CHAT: &str = "chat";
 const ID_END: &str = "end";
 const ID_QUIT: &str = "quit";
+const ID_STATUS: &str = "status";
 
 struct Controller {
     webview: wry::WebView,
@@ -57,7 +60,16 @@ struct Controller {
     /// Last policy JSON pushed from the hub (replayed to the page on ready).
     policy: String,
     opts: AppOptions,
+    /// Console this agent is enrolled with (set by the hub; the trailer is only a fallback).
+    console_url: String,
+    /// Last permission state pushed to the page (`(screen, accessibility)`).
+    permissions: Option<(bool, bool)>,
+    /// Branded session bar (created on the first session).
+    bar: Option<SessionBar>,
+    location: crate::platform::ExeLocation,
     end_item: MenuItem,
+    chat_item: MenuItem,
+    status_item: MenuItem,
     tray: tray_icon::TrayIcon,
 }
 
@@ -90,9 +102,7 @@ impl Controller {
         ));
         js.push_str(&format!(
             "window.__app.setConsole({},{});",
-            serde_json::json!(baked::get()
-                .map(|b| b.config.server_url.clone())
-                .unwrap_or_default()),
+            serde_json::json!(self.console_url),
             self.console_connected
         ));
         js.push_str(&format!(
@@ -114,6 +124,27 @@ impl Controller {
         if !self.policy.is_empty() {
             js.push_str(&format!("window.__app.setPolicy({});", self.policy));
         }
+        js.push_str(&format!(
+            "window.__app.setLocation({});",
+            serde_json::json!({
+                "movable": self.location.movable(),
+                "translocated": self.location.translocated,
+                "path": self.location.bundle.as_ref().map(|p| p.display().to_string()),
+            })
+        ));
+        if let Some((screen, accessibility)) = self.permissions {
+            js.push_str(&format!(
+                "window.__app.setPermissions({});",
+                serde_json::json!({ "supported": crate::platform::permissions_supported(), "screen": screen, "accessibility": accessibility })
+            ));
+        }
+        // Developer aid for screenshots: open a specific screen at start.
+        if let Ok(screen) = std::env::var("REMOTE_AGENT_START_SCREEN") {
+            js.push_str(&format!(
+                "window.__app.show({});",
+                serde_json::json!(screen)
+            ));
+        }
         // Flush anything buffered before ready.
         let pending = std::mem::take(&mut self.pending);
         let _ = self.webview.evaluate_script(&js);
@@ -129,11 +160,9 @@ impl Controller {
                 self.operator = operator.clone();
                 self.transcript.clear();
                 self.end_item.set_enabled(true);
-                let _ = self.tray.set_tooltip(Some(format!(
-                    "{} — {} connected",
-                    baked::product_name(),
-                    operator
-                )));
+                self.chat_item.set_enabled(true);
+                self.refresh_tooltip();
+                self.show_bar(target, &operator);
                 self.eval(format!(
                     "window.__app.startSession({});",
                     serde_json::json!(operator)
@@ -142,10 +171,11 @@ impl Controller {
             AppEvent::SessionEnded => {
                 self.session_active = false;
                 self.end_item.set_enabled(false);
-                let _ = self.tray.set_tooltip(Some(format!(
-                    "{} — no active session",
-                    baked::product_name()
-                )));
+                self.chat_item.set_enabled(false);
+                self.refresh_tooltip();
+                if let Some(bar) = self.bar.as_mut() {
+                    bar.hide();
+                }
                 self.eval("window.__app.endSession();".into());
             }
             AppEvent::Chat { from, text, ts_ms } => {
@@ -159,12 +189,51 @@ impl Controller {
             AppEvent::Hide => self.hide(target),
             AppEvent::ConsoleStatus { connected } => {
                 self.console_connected = connected;
+                self.update_status_item();
                 self.eval(format!(
                     "window.__app.setConsole({},{});",
-                    serde_json::json!(baked::get()
-                        .map(|b| b.config.server_url.clone())
-                        .unwrap_or_default()),
+                    serde_json::json!(self.console_url),
                     connected
+                ));
+            }
+            AppEvent::ConsoleInfo { url } => {
+                self.console_url = url;
+                self.update_status_item();
+                self.eval(format!(
+                    "window.__app.setConsole({},{});",
+                    serde_json::json!(self.console_url),
+                    self.console_connected
+                ));
+            }
+            AppEvent::Branding(json) => {
+                self.apply_branding(&json);
+            }
+            AppEvent::Permissions {
+                supported,
+                screen,
+                accessibility,
+            } => {
+                if self.permissions != Some((screen, accessibility)) {
+                    self.permissions = Some((screen, accessibility));
+                    self.eval(format!(
+                        "window.__app.setPermissions({});",
+                        serde_json::json!({ "supported": supported, "screen": screen, "accessibility": accessibility })
+                    ));
+                    self.refresh_tooltip();
+                }
+            }
+            AppEvent::PermissionNeeded => {
+                self.show(target, false);
+                let _ = self
+                    .webview
+                    .evaluate_script("window.__app&&window.__app.show('home');");
+            }
+            AppEvent::Bar(msg) => self.on_bar(target, msg),
+            AppEvent::MoveResult { ok, message } => {
+                self.eval(format!(
+                    "window.__app.moveResult({},{});",
+                    ok,
+                    serde_json::json!(message)
                 ));
             }
             AppEvent::DeviceInfo { name, id } => {
@@ -193,6 +262,93 @@ impl Controller {
             AppEvent::Quit => { /* handled by caller (control flow) */ }
             AppEvent::__Ready => self.on_ready(),
         }
+    }
+
+    /// Show the branded session bar (creating it on first use).
+    fn show_bar(
+        &mut self,
+        target: &tao::event_loop::EventLoopWindowTarget<AppEvent>,
+        operator: &str,
+    ) {
+        if self.bar.is_none() {
+            match SessionBar::new(target, super::state_dir()) {
+                Ok(b) => self.bar = Some(b),
+                Err(e) => {
+                    tracing::warn!("session bar unavailable: {e:#}");
+                    return;
+                }
+            }
+        }
+        if let Some(bar) = self.bar.as_mut() {
+            bar.show(operator);
+        }
+    }
+
+    fn on_bar(&mut self, target: &tao::event_loop::EventLoopWindowTarget<AppEvent>, msg: BarIpc) {
+        match msg {
+            BarIpc::Ready => {
+                if let Some(bar) = self.bar.as_mut() {
+                    bar.on_ready();
+                }
+            }
+            BarIpc::Open => self.show(target, false),
+            BarIpc::End => dispatch_disconnect(),
+            BarIpc::Collapse => {
+                if let Some(bar) = self.bar.as_mut() {
+                    bar.set_collapsed(true);
+                }
+            }
+            BarIpc::Expand => {
+                if let Some(bar) = self.bar.as_mut() {
+                    bar.set_collapsed(false);
+                }
+            }
+            BarIpc::Drag => {
+                if let Some(bar) = self.bar.as_ref() {
+                    bar.drag();
+                }
+            }
+        }
+    }
+
+    /// Tray tooltip: product, session state, and a warning while Screen Recording is missing.
+    fn refresh_tooltip(&self) {
+        let product = branding::product_name();
+        let mut text = if self.session_active {
+            format!("{product} — Session active: {} is connected", self.operator)
+        } else {
+            format!("{product} — No active session")
+        };
+        if matches!(self.permissions, Some((false, _))) {
+            text = format!("{product} — Screen Recording permission required");
+        }
+        let _ = self.tray.set_tooltip(Some(text));
+    }
+
+    /// Status line of the tray menu: connected / disconnected and to which console.
+    fn update_status_item(&self) {
+        let host = console_host(&self.console_url);
+        let text = if self.console_connected {
+            format!("Connected to {host}")
+        } else if host.is_empty() {
+            "Not connected".to_string()
+        } else {
+            format!("Disconnected from {host}")
+        };
+        self.status_item.set_text(text);
+    }
+
+    /// Re-brand everything the window owns: page, title, tray icon + tooltip, dock/window icon.
+    fn apply_branding(&mut self, page_json: &str) {
+        self.eval(format!("window.__app.setBranding({page_json});"));
+        let product = branding::product_name();
+        self.window.set_title(&product);
+        self.refresh_tooltip();
+        if let Some(bar) = self.bar.as_mut() {
+            bar.rebrand();
+        }
+        apply_tray_icon(&self.tray);
+        apply_app_icons(&self.window);
     }
 
     fn show(&self, target: &tao::event_loop::EventLoopWindowTarget<AppEvent>, chat: bool) {
@@ -251,7 +407,7 @@ fn build_and_run(work: impl FnOnce() -> i32 + Send + 'static, opts: AppOptions) 
     set_proxy(event_loop.create_proxy());
     crate::platform::mark_main_loop_running();
 
-    let product = baked::product_name();
+    let product = branding::product_name();
     let window = WindowBuilder::new()
         .with_title(&product)
         .with_inner_size(tao::dpi::LogicalSize::new(720.0, 520.0))
@@ -260,6 +416,9 @@ fn build_and_run(work: impl FnOnce() -> i32 + Send + 'static, opts: AppOptions) 
         .build(&event_loop)
         .context("creating app window")?;
     exclude_from_capture(&window);
+    apply_app_icons(&window);
+    #[cfg(target_os = "macos")]
+    crate::platform::macos::apply_debug_appearance();
 
     let ipc = move |req: wry::http::Request<String>| {
         let body = req.body();
@@ -272,6 +431,37 @@ fn build_and_run(work: impl FnOnce() -> i32 + Send + 'static, opts: AppOptions) 
                 super::dispatch_overrides(overrides.into_local());
             }
             Ok(IpcIn::Install) => spawn_install(),
+            Ok(IpcIn::RequestPermission { which }) => {
+                std::thread::spawn(move || {
+                    match which.as_str() {
+                        "screen" => {
+                            crate::platform::request_screen_capture();
+                        }
+                        "accessibility" => {
+                            crate::platform::request_accessibility();
+                        }
+                        _ => {}
+                    }
+                    post_permissions();
+                });
+            }
+            Ok(IpcIn::OpenSettings { which }) => {
+                let pane = if which == "accessibility" {
+                    crate::platform::PrivacyPane::Accessibility
+                } else {
+                    crate::platform::PrivacyPane::ScreenCapture
+                };
+                crate::platform::open_privacy_settings(pane);
+            }
+            Ok(IpcIn::MoveToApplications) => {
+                std::thread::spawn(|| {
+                    let (ok, message) = match crate::platform::move_to_applications() {
+                        Ok(m) => (true, m),
+                        Err(e) => (false, format!("Move failed: {e:#}")),
+                    };
+                    super::post(AppEvent::MoveResult { ok, message });
+                });
+            }
             Err(e) => tracing::debug!("app IPC parse error: {e}"),
         }
     };
@@ -285,11 +475,14 @@ fn build_and_run(work: impl FnOnce() -> i32 + Send + 'static, opts: AppOptions) 
 
     // Tray icon + menu.
     let menu = Menu::new();
+    let status_item = MenuItem::with_id(ID_STATUS, "Not connected", false, None);
     let open_item = MenuItem::with_id(ID_OPEN, "Open", true, None);
-    let chat_item = MenuItem::with_id(ID_CHAT, "Open chat", true, None);
+    let chat_item = MenuItem::with_id(ID_CHAT, "Open chat", false, None);
     let end_item = MenuItem::with_id(ID_END, "End session", false, None);
     let quit_item = MenuItem::with_id(ID_QUIT, "Quit", true, None);
     menu.append_items(&[
+        &status_item,
+        &PredefinedMenuItem::separator(),
         &open_item,
         &chat_item,
         &end_item,
@@ -297,13 +490,29 @@ fn build_and_run(work: impl FnOnce() -> i32 + Send + 'static, opts: AppOptions) 
         &quit_item,
     ])
     .ok();
+    let (tray_icon, tray_template) = tray_icon_for_platform();
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip(format!("{product} — no active session"))
-        .with_icon(tray_rgba_icon())
-        .with_icon_as_template(true)
+        .with_icon(tray_icon)
+        .with_icon_as_template(tray_template)
         .build()
         .context("creating tray icon")?;
+
+    // Live re-branding: whenever the console branding changes, refresh the window.
+    branding::on_change(|_| super::refresh_branding());
+
+    // OS permission state: re-checked every 2 s (cheap TCC queries); the controller only
+    // re-renders on change.
+    if crate::platform::permissions_supported() {
+        std::thread::Builder::new()
+            .name("permissions".into())
+            .spawn(|| loop {
+                post_permissions();
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            })
+            .ok();
+    }
 
     if !opts.show_on_start {
         set_dock_visible(&event_loop, false);
@@ -325,7 +534,15 @@ fn build_and_run(work: impl FnOnce() -> i32 + Send + 'static, opts: AppOptions) 
         device: (String::new(), String::new()),
         policy: String::new(),
         opts,
+        console_url: baked::get()
+            .map(|b| b.config.server_url.clone())
+            .unwrap_or_default(),
+        permissions: None,
+        bar: None,
+        location: crate::platform::exe_location(),
         end_item,
+        chat_item,
+        status_item,
         tray,
     };
 
@@ -373,10 +590,27 @@ fn build_and_run(work: impl FnOnce() -> i32 + Send + 'static, opts: AppOptions) 
             Event::UserEvent(ev) => controller.handle(ev, target),
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
+                window_id,
                 ..
             } => {
-                // Close hides the window; the session keeps running.
-                controller.hide(target);
+                let is_bar = controller.bar.as_ref().map(|b| b.window_id()) == Some(window_id);
+                if is_bar {
+                    // The bar has no close control; ignore.
+                } else {
+                    // Close hides the window; the session keeps running.
+                    controller.hide(target);
+                }
+            }
+            Event::WindowEvent {
+                event: WindowEvent::Moved(_),
+                window_id,
+                ..
+            } => {
+                if let Some(bar) = controller.bar.as_mut() {
+                    if bar.window_id() == window_id && bar.is_visible() {
+                        bar.moved();
+                    }
+                }
             }
             _ => {}
         }
@@ -400,6 +634,13 @@ enum IpcIn {
         overrides: UiOverrides,
     },
     Install,
+    RequestPermission {
+        which: String,
+    },
+    OpenSettings {
+        which: String,
+    },
+    MoveToApplications,
 }
 
 /// The Settings toggles as the page reports them: each value is the *effective local choice*.
@@ -432,6 +673,15 @@ impl UiOverrides {
     }
 }
 
+/// Query the OS permissions and post them to the UI thread.
+fn post_permissions() {
+    super::post(AppEvent::Permissions {
+        supported: crate::platform::permissions_supported(),
+        screen: crate::platform::screen_capture_allowed(),
+        accessibility: crate::platform::accessibility_allowed(),
+    });
+}
+
 /// Elevate and install the service on a worker thread, reporting the result back to the UI.
 fn spawn_install() {
     std::thread::spawn(|| {
@@ -443,48 +693,63 @@ fn spawn_install() {
     });
 }
 
-/// A tiny generated tray icon (rounded square in the brand accent). 22×22 RGBA.
-fn tray_rgba_icon() -> tray_icon::Icon {
-    let (w, h) = (22u32, 22u32);
-    let (r, g, b) = accent_rgb();
-    let mut rgba = vec![0u8; (w * h * 4) as usize];
-    for y in 0..h {
-        for x in 0..w {
-            let i = ((y * w + x) * 4) as usize;
-            // rounded-corner mask
-            let inset = 2.0;
-            let fx = x as f32;
-            let fy = y as f32;
-            let inside = fx >= inset
-                && fy >= inset
-                && fx <= (w as f32 - inset - 1.0)
-                && fy <= (h as f32 - inset - 1.0);
-            if inside {
-                rgba[i] = r;
-                rgba[i + 1] = g;
-                rgba[i + 2] = b;
-                rgba[i + 3] = 255;
-            }
-        }
+/// Tray / menu-bar icon: a template (alpha-only) image on macOS so the system tints it for
+/// light and dark menu bars; the coloured logo or a theme-aware glyph elsewhere.
+fn tray_icon_for_platform() -> (tray_icon::Icon, bool) {
+    #[cfg(target_os = "macos")]
+    {
+        // 36 px → rendered at 18 pt, crisp on Retina.
+        let img = branding::template_icon(36);
+        (
+            tray_icon::Icon::from_rgba(img.data, img.width, img.height).expect("valid tray icon"),
+            true,
+        )
     }
-    tray_icon::Icon::from_rgba(rgba, w, h).expect("valid tray icon")
+    #[cfg(not(target_os = "macos"))]
+    {
+        let dark = crate::platform::dark_theme();
+        let img = branding::tray_icon_colored(32, dark);
+        (
+            tray_icon::Icon::from_rgba(img.data, img.width, img.height).expect("valid tray icon"),
+            false,
+        )
+    }
 }
 
-fn accent_rgb() -> (u8, u8, u8) {
-    let accent = baked::get()
-        .map(|b| b.branding().accent.clone())
-        .filter(|s| s.len() == 7 && s.starts_with('#'))
-        .unwrap_or_else(|| "#3b82f6".to_string());
-    let parse = |s: &str| u8::from_str_radix(s, 16).unwrap_or(0);
-    (
-        parse(&accent[1..3]),
-        parse(&accent[3..5]),
-        parse(&accent[5..7]),
-    )
+fn apply_tray_icon(tray: &tray_icon::TrayIcon) {
+    let (icon, template) = tray_icon_for_platform();
+    if let Err(e) = tray.set_icon_with_as_template(Some(icon), template) {
+        tracing::debug!("tray icon update failed: {e}");
+    }
+}
+
+/// Dock icon (macOS) / window + taskbar icon (Windows) from the branding logo or the default mark.
+fn apply_app_icons(window: &tao::window::Window) {
+    let icon = branding::app_icon(256);
+    #[cfg(target_os = "macos")]
+    {
+        let png = branding::encode_png(&branding::app_icon(512));
+        crate::platform::set_dock_icon(&png);
+        let _ = (window, icon);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        match tao::window::Icon::from_rgba(icon.data, icon.width, icon.height) {
+            Ok(i) => window.set_window_icon(Some(i)),
+            Err(e) => tracing::debug!("window icon: {e}"),
+        }
+    }
+}
+
+/// `https://console.example.com:8443/` → `console.example.com:8443`.
+fn console_host(url: &str) -> String {
+    let s = url.trim();
+    let s = s.split("://").nth(1).unwrap_or(s);
+    s.split('/').next().unwrap_or("").to_string()
 }
 
 /// Exclude our window from the screen capture the operator sees.
-fn exclude_from_capture(window: &tao::window::Window) {
+pub(super) fn exclude_from_capture(window: &tao::window::Window) {
     if std::env::var_os("REMOTE_AGENT_SHOW_WINDOWS").is_some() {
         return;
     }

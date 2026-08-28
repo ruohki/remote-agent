@@ -252,9 +252,30 @@ struct Media {
     audio: Option<AudioStream>,
 }
 
+/// Media start deferred until the OS grants screen capture (macOS TCC).
+struct PendingMedia {
+    video_tracks: usize,
+    deadline: tokio::time::Instant,
+    /// Whether the browser was told over the control channel.
+    notified: bool,
+}
+
+/// Outcome of one `poll_pending_media` tick.
+enum PendingPoll {
+    Idle,
+    Started,
+    TimedOut,
+    Failed,
+}
+
+/// How long a connected session waits for the Screen Recording permission before giving up.
+const PERMISSION_WAIT: Duration = Duration::from_secs(60);
+
 struct Session {
     deps: SessionDeps,
     id: String,
+    /// Set while waiting for the screen-capture permission after the peer connected.
+    pending_media: Option<PendingMedia>,
     operator: OperatorInfo,
     cfg: AgentConfig,
     peer: Arc<Peer>,
@@ -403,6 +424,7 @@ async fn run_session(
     let mut session = Session {
         deps: deps.clone(),
         id: session_id.clone(),
+        pending_media: None,
         operator: req.operator.clone(),
         cfg,
         peer,
@@ -499,6 +521,7 @@ async fn run_session(
                 Some(ChannelEvent::ControlOpen(dc)) => {
                     session.control = Some(dc);
                     session.send_display_info().await;
+                    session.notify_pending_permission().await;
                 }
                 Some(ChannelEvent::Control(msg)) => session.on_control(msg).await,
                 Some(ChannelEvent::ControlClosed) => session.control = None,
@@ -535,7 +558,17 @@ async fn run_session(
                 }
             },
             Some(content) = clipboard_event => session.on_clipboard_change(content).await,
-            _ = stats_tick.tick() => session.send_stats().await,
+            _ = stats_tick.tick() => {
+                session.send_stats().await;
+                match session.poll_pending_media().await {
+                    PendingPoll::Idle | PendingPoll::Started => {}
+                    PendingPoll::TimedOut => {
+                        tracing::error!(session = %session.id, "screen recording permission not granted within {}s", PERMISSION_WAIT.as_secs());
+                        break EndReason::Error;
+                    }
+                    PendingPoll::Failed => break EndReason::Error,
+                }
+            }
             _ = transfer_tick.tick() => {
                 if let Some(t) = session.transfers.as_mut() {
                     t.tick();
@@ -643,6 +676,27 @@ impl Session {
     /// Connection established: start the primary display's pipeline, the clipboard watcher,
     /// the indicator and the (hidden) chat window.
     async fn on_connected(&mut self, video_tracks: usize) -> Result<()> {
+        // macOS: without the Screen Recording permission capture cannot start. Rather than
+        // failing the session, keep it connected, ask the OS / the person at the device, and
+        // start media as soon as the permission arrives (see `poll_pending_media`).
+        if !self.deps.media.capture_permission_granted() {
+            tracing::warn!(session = %self.id, "screen recording permission missing; waiting up to {}s", PERMISSION_WAIT.as_secs());
+            crate::platform::request_screen_capture();
+            crate::app::permission_needed();
+            self.deps.hub.send(AgentToConsole::Log {
+                level: "warn".into(),
+                message:
+                    "screen recording permission not granted on the device; waiting for the user"
+                        .into(),
+            });
+            self.pending_media = Some(PendingMedia {
+                video_tracks,
+                deadline: tokio::time::Instant::now() + PERMISSION_WAIT,
+                notified: false,
+            });
+            self.notify_pending_permission().await;
+            return Ok(());
+        }
         let media = Arc::clone(&self.deps.media);
         let displays = tokio::task::spawn_blocking({
             let media = Arc::clone(&media);
@@ -1423,6 +1477,71 @@ impl Session {
             | ControlMessage::SessionEndedByUser => {}
             // observer notifications are console → browser only; ignore anything else
             other => tracing::debug!(session = %self.id, ?other, "ignoring control message"),
+        }
+    }
+
+    /// Tell the browser (once, over the control channel) that media waits for a permission.
+    async fn notify_pending_permission(&mut self) {
+        let Some(p) = self.pending_media.as_mut() else {
+            return;
+        };
+        if p.notified || self.control.is_none() {
+            return;
+        }
+        p.notified = true;
+        let text = format!(
+            "[{}] This computer has not granted Screen Recording permission yet. The person at the device is being asked; the stream starts automatically once granted (waiting up to {} s).",
+            crate::branding::product_name(),
+            PERMISSION_WAIT.as_secs()
+        );
+        self.send_control(ControlMessage::Chat {
+            from: ChatParty::Device,
+            text,
+            ts_ms: crate::chat::now_ms(),
+        })
+        .await;
+    }
+
+    /// Called every second: start media once the permission arrived, or give up at the deadline.
+    async fn poll_pending_media(&mut self) -> PendingPoll {
+        let Some(p) = self.pending_media.as_ref() else {
+            return PendingPoll::Idle;
+        };
+        if self.deps.media.capture_permission_granted() {
+            let video_tracks = p.video_tracks;
+            self.pending_media = None;
+            tracing::info!(session = %self.id, "screen recording permission granted; starting media");
+            match self.on_connected(video_tracks).await {
+                Ok(()) => {
+                    self.send_control(ControlMessage::Chat {
+                        from: ChatParty::Device,
+                        text: format!(
+                            "[{}] Screen Recording permission granted — starting the stream.",
+                            crate::branding::product_name()
+                        ),
+                        ts_ms: crate::chat::now_ms(),
+                    })
+                    .await;
+                    PendingPoll::Started
+                }
+                Err(e) => {
+                    tracing::error!(session = %self.id, "starting media: {e:#}");
+                    PendingPoll::Failed
+                }
+            }
+        } else if tokio::time::Instant::now() >= p.deadline {
+            self.send_control(ControlMessage::Chat {
+                from: ChatParty::Device,
+                text: format!(
+                    "[{}] Screen Recording permission was not granted in time. Ending the session.",
+                    crate::branding::product_name()
+                ),
+                ts_ms: crate::chat::now_ms(),
+            })
+            .await;
+            PendingPoll::TimedOut
+        } else {
+            PendingPoll::Idle
         }
     }
 

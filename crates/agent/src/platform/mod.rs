@@ -210,6 +210,121 @@ pub fn secure_attention() {
     }
 }
 
+/// Ask the OS for the screen-capture permission (macOS prompts / opens Settings). Returns the
+/// current state; always true elsewhere.
+pub fn request_screen_capture() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        macos::request_screen_capture()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
+}
+
+/// Ask the OS for the accessibility (input injection) permission with the system prompt.
+pub fn request_accessibility() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        macos::request_accessibility()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
+}
+
+/// Which privacy pane to open in the OS settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivacyPane {
+    ScreenCapture,
+    Accessibility,
+}
+
+/// Open the OS privacy settings on `pane` (macOS System Settings deep links).
+pub fn open_privacy_settings(pane: PrivacyPane) {
+    #[cfg(target_os = "macos")]
+    {
+        macos::open_privacy_settings(pane);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pane;
+    }
+}
+
+/// Whether permissions are a concept the UI should surface (macOS TCC).
+pub fn permissions_supported() -> bool {
+    cfg!(target_os = "macos")
+}
+
+/// Where the running executable lives, for the "move to Applications" onboarding.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExeLocation {
+    /// The `.app` bundle path when running from one.
+    pub bundle: Option<std::path::PathBuf>,
+    /// Launched from a Gatekeeper App Translocation mount (read-only, random path).
+    pub translocated: bool,
+    /// Inside `/Applications` or `~/Applications`.
+    pub in_applications: bool,
+}
+
+impl ExeLocation {
+    /// Offer "Move to Applications" for bundles outside the Applications folders.
+    pub fn movable(&self) -> bool {
+        self.bundle.is_some() && !self.in_applications
+    }
+}
+
+pub fn exe_location() -> ExeLocation {
+    #[cfg(target_os = "macos")]
+    {
+        macos::exe_location()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        ExeLocation::default()
+    }
+}
+
+/// Copy the app bundle into the Applications folder and relaunch from there.
+pub fn move_to_applications() -> Result<String> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::move_to_applications()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        anyhow::bail!("not applicable on this platform")
+    }
+}
+
+/// Set the dock icon (macOS) from PNG bytes. No-op elsewhere.
+pub fn set_dock_icon(png: &[u8]) {
+    #[cfg(target_os = "macos")]
+    {
+        macos::set_dock_icon(png);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = png;
+    }
+}
+
+/// Whether the OS UI is in dark mode (used for non-template tray icons). macOS uses template
+/// images instead and never needs this.
+pub fn dark_theme() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        windows::dark_theme()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
 /// Whether screen capture is permitted (always true outside macOS).
 /// `(total, visible)` windows of this process (macOS only; `(0, 0)` elsewhere or without a UI loop).
 pub fn window_counts() -> (usize, usize) {

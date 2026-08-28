@@ -19,7 +19,7 @@
           <span class="tab-ico">◎</span><span>Status</span>
         </button>
         <button class="tab" data-screen="chat" id="tab-chat">
-          <span class="tab-ico">💬</span><span>Chat</span>
+          <span class="tab-ico">✉</span><span>Chat</span>
           <span class="badge" id="chatBadge" hidden>0</span>
         </button>
         <button class="tab" data-screen="install" id="tab-install" hidden>
@@ -39,6 +39,10 @@
 
       <!-- Main -->
       <main class="main">
+        <div class="warn-banner" id="permWarn" hidden>
+          <span>Screen Recording permission is required before a support session can display this screen.</span>
+          <button class="btn sm" id="permWarnBtn">Grant permission</button>
+        </div>
         <!-- HOME -->
         <section class="screen" id="screen-home">
           <header class="hero">
@@ -61,20 +65,52 @@
             </div>
           </div>
 
+          <div class="card move-card" id="moveCard" hidden>
+            <div class="card-label">Installation location</div>
+            <div class="card-value">This application is running from a temporary location.</div>
+            <div class="muted sm" id="movePath">Move it to the Applications folder so permissions and settings are kept.</div>
+            <div class="install-actions" style="margin-top:10px">
+              <button class="btn primary sm" id="moveBtn">Move to Applications</button>
+              <span class="install-status" id="moveStatus"></span>
+            </div>
+          </div>
+
+          <div class="card perms" id="permsCard" hidden>
+            <div class="card-label">System permissions</div>
+            <div class="perm-row" data-perm="screen">
+              <div class="perm-text">
+                <div class="perm-title">Screen Recording</div>
+                <div class="muted sm">Required to share this screen with a support technician.</div>
+              </div>
+              <span class="perm-badge" data-badge>—</span>
+              <button class="btn sm" data-request="screen">Request</button>
+              <button class="btn sm ghost" data-settings="screen" title="Open System Settings">Settings</button>
+            </div>
+            <div class="perm-row" data-perm="accessibility">
+              <div class="perm-text">
+                <div class="perm-title">Accessibility</div>
+                <div class="muted sm">Required for remote keyboard and mouse control.</div>
+              </div>
+              <span class="perm-badge" data-badge>—</span>
+              <button class="btn sm" data-request="accessibility">Request</button>
+              <button class="btn sm ghost" data-settings="accessibility" title="Open System Settings">Settings</button>
+            </div>
+          </div>
+
           <div class="session-panel" id="sessionPanel">
             <div class="session-none" id="sessionNone">
               <div class="pulse"></div>
               <div>
                 <div class="session-title">No active session</div>
-                <div class="muted">You're in control. An operator can request to connect; you decide.</div>
+                <div class="muted" id="sessionNoneText">A support technician can connect to this computer.</div>
               </div>
             </div>
             <div class="session-active" id="sessionActive" hidden>
               <div class="op">
                 <div class="op-avatar" id="opAvatar">?</div>
                 <div>
-                  <div class="session-title"><span id="opName">Operator</span> is connected</div>
-                  <div class="muted" id="sessionMeta">Viewing and controlling your screen</div>
+                  <div class="session-title">Session active — <span id="opName">Support technician</span> is connected</div>
+                  <div class="muted" id="sessionMeta">Screen sharing and remote control in progress</div>
                 </div>
               </div>
               <div class="session-actions">
@@ -83,7 +119,7 @@
               </div>
             </div>
           </div>
-          <p class="tip muted">You can close or minimize this window at any time — the session keeps running and this window stays reachable from the menu bar icon. Ending the session is always your choice.</p>
+          <p class="tip muted">Session control: you can end the session at any time. Closing or minimizing this window does not end the session; reopen it from the menu bar icon.</p>
         </section>
 
         <!-- CHAT -->
@@ -97,8 +133,15 @@
               </div>
               <button class="btn danger sm" id="chatEndBtn" hidden>End</button>
             </div>
+            <div class="chat-nosession" id="chatNoSession">
+              <div class="pulse"></div>
+              <div>
+                <div class="session-title">No active session</div>
+                <div class="muted">Chat is available while a support session is active.</div>
+              </div>
+            </div>
             <div class="transcript" id="transcript">
-              <div class="empty" id="chatEmpty">No messages yet.</div>
+              <div class="empty" id="chatEmpty">No messages.</div>
             </div>
             <div class="composer">
               <textarea id="composer" rows="1" placeholder="Message…" disabled></textarea>
@@ -113,17 +156,17 @@
         <section class="screen" id="screen-install" hidden>
           <header class="hero">
             <div>
-              <h1>Install on this computer</h1>
-              <p class="muted">Set up <span id="installProduct">Remote Support</span> to start automatically so it's ready whenever help is needed.</p>
+              <h1>Install as a system service</h1>
+              <p class="muted">Install <span id="installProduct">Remote Support</span> as a system service to enable unattended support for this computer.</p>
             </div>
           </header>
           <ul class="checklist">
-            <li>Starts automatically when you sign in</li>
-            <li>Runs in the background with a menu-bar icon</li>
-            <li>You keep full control — every session is shown, and you can end it at any time</li>
+            <li>Starts automatically at sign-in and runs in the background</li>
+            <li>Every session is indicated on screen and listed in this window</li>
+            <li>Sessions can be ended from this window at any time</li>
           </ul>
           <div class="install-actions">
-            <button class="btn primary" id="installBtn">Install as a service</button>
+            <button class="btn primary" id="installBtn">Install service</button>
             <span class="install-status" id="installStatus"></span>
           </div>
         </section>
@@ -131,29 +174,29 @@
         <!-- SETTINGS -->
         <section class="screen" id="screen-settings" hidden>
           <header class="hero"><div>
-            <h1>Privacy &amp; control</h1>
-            <p class="muted">You decide what an operator may do. These settings can only make things
-              stricter than your administrator allows — never looser — and apply immediately, even
-              during a session.</p>
+            <h1>Access restrictions</h1>
+            <p class="muted">Restrict what a support technician may do on this computer. Restrictions
+              can only be stricter than the administrator policy, and apply immediately, including
+              during an active session.</p>
           </div></header>
           <ul class="settings-list" id="settingsList">
             <li class="setting" data-key="require_approval">
               <div class="setting-text">
-                <div class="setting-title">Ask me before every session</div>
+                <div class="setting-title">Require approval for every session</div>
                 <div class="setting-sub" data-policy></div>
               </div>
               <button class="switch" role="switch" aria-checked="false" data-key="require_approval"></button>
             </li>
             <li class="setting" data-key="allow_input">
               <div class="setting-text">
-                <div class="setting-title">Allow keyboard &amp; mouse control</div>
+                <div class="setting-title">Allow keyboard and mouse control</div>
                 <div class="setting-sub" data-policy></div>
               </div>
               <button class="switch" role="switch" aria-checked="true" data-key="allow_input"></button>
             </li>
             <li class="setting" data-key="allow_audio">
               <div class="setting-text">
-                <div class="setting-title">Allow streaming this computer's audio</div>
+                <div class="setting-title">Allow audio streaming</div>
                 <div class="setting-sub" data-policy></div>
               </div>
               <button class="switch" role="switch" aria-checked="true" data-key="allow_audio"></button>
@@ -167,7 +210,7 @@
             </li>
             <li class="setting" data-key="allow_file_transfer">
               <div class="setting-text">
-                <div class="setting-title">Allow file transfer &amp; browsing</div>
+                <div class="setting-title">Allow file transfer and file browsing</div>
                 <div class="setting-sub" data-policy></div>
               </div>
               <button class="switch" role="switch" aria-checked="true" data-key="allow_file_transfer"></button>

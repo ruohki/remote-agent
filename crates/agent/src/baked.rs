@@ -54,12 +54,9 @@ pub fn get() -> Option<&'static Baked> {
         .as_ref()
 }
 
-/// Product name for UI, falling back to a neutral default when unbranded.
+/// Product name for UI. Delegates to [`crate::branding`] (console branding > trailer > default).
 pub fn product_name() -> String {
-    get()
-        .map(|b| b.config.branding.product_name.clone())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "Remote Support".to_string())
+    crate::branding::product_name()
 }
 
 /// Only read the tail of the file: last 12 bytes give the payload length + magic, then the

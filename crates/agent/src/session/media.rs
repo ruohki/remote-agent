@@ -14,6 +14,11 @@ pub trait MediaFactory: Send + Sync + 'static {
     fn available_codecs(&self) -> Vec<VideoCodec>;
     fn create_capturer(&self, cfg: &CaptureConfig) -> Result<Box<dyn Capturer>>;
     fn create_encoder(&self, cfg: &EncoderConfig) -> Result<Box<dyn Encoder>>;
+    /// Whether the OS currently allows screen capture (macOS Screen Recording permission).
+    /// Sessions wait for it instead of failing when it is missing.
+    fn capture_permission_granted(&self) -> bool {
+        true
+    }
     /// Whether system audio capture exists on this platform.
     fn audio_available(&self) -> bool {
         false
@@ -31,6 +36,10 @@ pub struct SystemMedia;
 impl MediaFactory for SystemMedia {
     fn list_displays(&self) -> Result<Vec<DisplayInfo>> {
         crate::capture::list_displays()
+    }
+
+    fn capture_permission_granted(&self) -> bool {
+        crate::platform::screen_capture_allowed()
     }
 
     fn available_codecs(&self) -> Vec<VideoCodec> {

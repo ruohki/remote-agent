@@ -67,6 +67,7 @@ pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let paths = crate::config::Paths::resolve(cli.config_dir.clone())?;
     init_logging(&cli.log, &paths);
+    crate::branding::init(&paths);
 
     match cli.command {
         // Service mode: the launch agent / service runs the agent behind the app loop, but the
@@ -98,6 +99,7 @@ fn run_in_app(paths: &crate::config::Paths, app_mode: bool) -> Result<()> {
         show_on_start: app_mode,
         installable: app_mode && !crate::service::is_installed(),
     };
+    crate::app::set_state_dir(paths.dir.clone());
     let paths = paths.clone();
     let code = crate::app::run(
         move || match run_agent_blocking(&paths) {

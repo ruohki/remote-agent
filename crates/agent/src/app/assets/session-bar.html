@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Session</title>
+    <style>
+      :root {
+        --accent: #3b82f6; --bg: #ffffff; --text: #16181d; --muted: #6b7280; --border: #d7dbe3;
+        --danger: #dc2626; --ok: #16a34a;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root { --bg: #1d2027; --text: #e7eaf0; --muted: #9aa3b2; --border: #3a3f4a; }
+      }
+      * { box-sizing: border-box; }
+      html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        font-size: 12px; color: var(--text); -webkit-user-select: none; user-select: none; cursor: default;
+      }
+      /* expanded bar */
+      .bar {
+        position: absolute; inset: 0; display: flex; align-items: center; gap: 10px;
+        background: var(--bg); border: 1px solid var(--border); border-radius: 12px;
+        padding: 0 8px 0 0; overflow: hidden; box-shadow: 0 6px 24px rgba(0,0,0,.25);
+      }
+      .stripe { width: 5px; align-self: stretch; background: var(--accent); flex: 0 0 auto; }
+      .logo { width: 22px; height: 22px; border-radius: 6px; background: var(--accent); background-size: contain; background-position: center; background-repeat: no-repeat; flex: 0 0 auto; }
+      .logo.has-logo { background-color: transparent; }
+      .text { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .text b { font-weight: 650; }
+      .text .sep { color: var(--muted); }
+      .text .muted { color: var(--muted); }
+      .btn { border: 1px solid var(--border); background: transparent; color: var(--text); border-radius: 7px; padding: 4px 9px; font: inherit; font-size: 11.5px; cursor: pointer; white-space: nowrap; }
+      .btn:hover { background: color-mix(in srgb, var(--text) 8%, transparent); }
+      .btn.danger { border-color: var(--danger); color: var(--danger); }
+      .btn.danger:hover { background: color-mix(in srgb, var(--danger) 12%, transparent); }
+      .collapse { border: 0; background: transparent; color: var(--muted); width: 22px; height: 22px; border-radius: 6px; cursor: pointer; font-size: 14px; line-height: 1; padding: 0; flex: 0 0 auto; }
+      .collapse:hover { background: color-mix(in srgb, var(--text) 8%, transparent); color: var(--text); }
+      /* collapsed pill */
+      .pill {
+        position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+        border-radius: 50%; background: var(--bg); border: 2px solid var(--accent); box-shadow: 0 4px 14px rgba(0,0,0,.3); cursor: pointer;
+      }
+      .pill .logo { width: 26px; height: 26px; border-radius: 7px; }
+      .pill .elapsed { position: absolute; bottom: -1px; left: 50%; transform: translate(-50%, 100%); background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 2px 6px; font-size: 10.5px; white-space: nowrap; display: none; }
+      .pill:hover .elapsed { display: block; }
+      .pill .dot { position: absolute; right: 2px; top: 2px; width: 9px; height: 9px; border-radius: 50%; background: var(--ok); border: 2px solid var(--bg); }
+      body.collapsed .bar { display: none; }
+      body.collapsed .pill { display: flex; }
+      body.collapsed { overflow: visible; }
+    </style>
+  </head>
+  <body>
+    <div class="bar" id="bar">
+      <div class="stripe"></div>
+      <div class="logo" id="logo"></div>
+      <div class="text" id="text"><b id="product">Remote Support</b><span class="sep"> · </span><span id="who">Support technician</span><span class="muted"> connected</span><span class="sep"> · </span><span class="muted" id="elapsed">0:00</span></div>
+      <button class="btn" id="open" title="Open the application window">Open</button>
+      <button class="btn danger" id="end">End session</button>
+      <button class="collapse" id="collapse" title="Collapse" aria-label="Collapse">⌄</button>
+    </div>
+    <div class="pill" id="pill" title="Support session active — click to expand">
+      <div class="logo" id="pillLogo"></div>
+      <div class="dot"></div>
+      <div class="elapsed" id="pillElapsed">0:00</div>
+    </div>
+    <script>
+      (function () {
+        function ipc(o) { try { window.ipc.postMessage(JSON.stringify(o)); } catch (e) {} }
+        var startedMs = Date.now();
+        function fmt(ms) { var s = Math.max(0, Math.floor(ms / 1000)); var m = Math.floor(s / 60); var h = Math.floor(m / 60); return (h ? h + ':' + String(m % 60).padStart(2, '0') : m) + ':' + String(s % 60).padStart(2, '0'); }
+        setInterval(function () {
+          var t = fmt(Date.now() - startedMs);
+          document.getElementById('elapsed').textContent = t;
+          document.getElementById('pillElapsed').textContent = t;
+        }, 1000);
+        document.getElementById('open').addEventListener('click', function () { ipc({ type: 'open' }); });
+        document.getElementById('end').addEventListener('click', function () {
+          if (window.confirm('End the support session now?')) ipc({ type: 'end' });
+        });
+        document.getElementById('collapse').addEventListener('click', function () { ipc({ type: 'collapse' }); });
+        document.getElementById('pill').addEventListener('click', function () { ipc({ type: 'expand' }); });
+        // Drag anywhere on the bar / pill except the buttons.
+        function dragStart(e) { if (e.target.closest('button')) return; if (e.button === 0) ipc({ type: 'drag' }); }
+        document.getElementById('bar').addEventListener('mousedown', dragStart);
+        document.getElementById('pill').addEventListener('mousedown', dragStart);
+        window.__bar = {
+          set: function (s) {
+            if (s.accent) document.documentElement.style.setProperty('--accent', s.accent);
+            if (s.product) document.getElementById('product').textContent = s.product;
+            if (s.operator) document.getElementById('who').textContent = s.operator;
+            if (typeof s.started_ms === 'number') startedMs = s.started_ms;
+            if ('logo' in s) {
+              var url = s.logo ? 'url("data:image/png;base64,' + s.logo + '")' : '';
+              ['logo', 'pillLogo'].forEach(function (id) { var el = document.getElementById(id); el.style.backgroundImage = url; el.classList.toggle('has-logo', !!s.logo); });
+            }
+          },
+          collapsed: function (on) { document.body.classList.toggle('collapsed', !!on); }
+        };
+        ipc({ type: 'ready' });
+      })();
+    </script>
+  </body>
+</html>

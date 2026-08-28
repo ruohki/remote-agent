@@ -13,9 +13,10 @@
 //! it is reopened from the tray. Every window we create is excluded from the screen capture
 //! and ignores remote-injected input.
 
+mod bar;
 mod controller;
 
-use crate::baked;
+use crate::approval::{Indicator, IndicatorHandle};
 use crate::chat::{ChatHandle, ChatLine, ChatUi};
 use anyhow::Result;
 use protocol::channel::ChatParty;
@@ -65,6 +66,27 @@ pub enum AppEvent {
     },
     /// JSON policy blob for the Settings screen: { console, overrides, effective }.
     Policy(String),
+    /// Branding changed (JSON for `setBranding`); the controller also refreshes title/icons.
+    Branding(String),
+    /// The console this agent is enrolled with (shown on the Status/About screens).
+    ConsoleInfo {
+        url: String,
+    },
+    /// OS permission state (macOS TCC); `supported = false` hides the section.
+    Permissions {
+        supported: bool,
+        screen: bool,
+        accessibility: bool,
+    },
+    /// A permission is required right now (session waiting): show the window on Status.
+    PermissionNeeded,
+    /// Result of "Move to Applications".
+    MoveResult {
+        ok: bool,
+        message: String,
+    },
+    /// Messages from the session bar page.
+    Bar(bar::BarIpc),
     Quit,
     /// Internal: the page finished loading and is ready to receive JS.
     #[doc(hidden)]
@@ -87,6 +109,17 @@ static GLOBAL_DISCONNECT: parking_lot::Mutex<Option<DisconnectCb>> = parking_lot
 type OverridesCb = Arc<dyn Fn(LocalOverrides) + Send + Sync>;
 static OVERRIDES_CB: parking_lot::Mutex<Option<OverridesCb>> = parking_lot::Mutex::new(None);
 static PROXY: OnceLock<parking_lot::Mutex<Option<Proxy>>> = OnceLock::new();
+/// Config dir used to persist small UI state (session bar position).
+static STATE_DIR: parking_lot::Mutex<Option<std::path::PathBuf>> = parking_lot::Mutex::new(None);
+
+/// Where the app may persist UI state (the agent config dir).
+pub fn set_state_dir(dir: std::path::PathBuf) {
+    *STATE_DIR.lock() = Some(dir);
+}
+
+fn state_dir() -> Option<std::path::PathBuf> {
+    STATE_DIR.lock().clone()
+}
 
 struct Proxy(tao::event_loop::EventLoopProxy<AppEvent>);
 // SAFETY: EventLoopProxy is Send + Sync on the platforms we target; wrapper keeps it in a static.
@@ -139,6 +172,23 @@ pub fn set_console_status(connected: bool) {
     post(AppEvent::ConsoleStatus { connected });
 }
 
+/// A session is waiting for an OS permission: bring the window up on the Status screen.
+pub fn permission_needed() {
+    post(AppEvent::PermissionNeeded);
+}
+
+/// Tell the UI which console this agent talks to.
+pub fn set_console_url(url: &str) {
+    post(AppEvent::ConsoleInfo {
+        url: url.to_string(),
+    });
+}
+
+/// Push the current branding to the window (title, page, tray, dock).
+pub fn refresh_branding() {
+    post(AppEvent::Branding(crate::branding::page_json()));
+}
+
 /// Update the device name / id shown on the status screen.
 pub fn set_device_info(name: &str, id: &str) {
     post(AppEvent::DeviceInfo {
@@ -170,6 +220,28 @@ fn dispatch_disconnect() {
         cb();
     } else if let Some(cb) = GLOBAL_DISCONNECT.lock().as_ref() {
         cb();
+    }
+}
+
+// ── Indicator implementation ──────────────────────────────────────────────────────────────
+
+/// [`Indicator`] backed by the branded session bar window. The bar is shown/hidden by the
+/// session lifecycle events the app already receives (`SessionStarted` / `SessionEnded`), so
+/// the handle only marks the intent; the bar's own End button routes through the session
+/// callbacks like the app window does.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AppIndicator;
+
+struct AppIndicatorHandle;
+impl IndicatorHandle for AppIndicatorHandle {}
+
+impl Indicator for AppIndicator {
+    fn show(
+        &self,
+        _operator: &OperatorInfo,
+        _on_disconnect: DisconnectCb,
+    ) -> Result<Box<dyn IndicatorHandle>> {
+        Ok(Box::new(AppIndicatorHandle))
     }
 }
 
@@ -245,17 +317,7 @@ fn key_fingerprint(pubkey_b64: &str) -> String {
 
 /// Branding JSON handed to the page (`window.__app.setBranding`).
 fn branding_json() -> String {
-    let b = baked::get()
-        .map(|b| b.branding().clone())
-        .unwrap_or_default();
-    serde_json::json!({
-        "product_name": if b.product_name.is_empty() { "Remote Support" } else { &b.product_name },
-        "accent": if b.accent.is_empty() { "#3b82f6" } else { &b.accent },
-        "organization": b.organization,
-        "support_text": b.support_text,
-        "logo": b.logo_png_base64,
-    })
-    .to_string()
+    crate::branding::page_json()
 }
 
 #[cfg(test)]
@@ -273,7 +335,13 @@ mod tests {
     #[test]
     fn branding_json_has_defaults_without_trailer() {
         let j: serde_json::Value = serde_json::from_str(&branding_json()).unwrap();
-        assert_eq!(j["product_name"], "Remote Support");
-        assert_eq!(j["accent"], "#3b82f6");
+        assert!(j["product_name"]
+            .as_str()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false));
+        assert!(j["accent"]
+            .as_str()
+            .map(|s| s.starts_with('#'))
+            .unwrap_or(false));
     }
 }

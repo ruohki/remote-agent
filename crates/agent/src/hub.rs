@@ -138,7 +138,10 @@ pub async fn run_agent(paths: Paths) -> Result<()> {
         tracing::warn!("no UI loop: help-me approval prompts will be denied");
         Arc::new(AutoApprover(ApprovalOutcome::Denied))
     };
-    let indicator: Arc<dyn Indicator> = if interactive {
+    let indicator: Arc<dyn Indicator> = if crate::app::is_running() {
+        // The branded session bar window replaces the native panel.
+        Arc::new(crate::app::AppIndicator)
+    } else if interactive {
         Arc::new(NativeIndicator)
     } else {
         Arc::new(NoIndicator)
@@ -178,6 +181,7 @@ pub async fn run_agent(paths: Paths) -> Result<()> {
             sessions_for_menu.end_all(EndReason::DeviceUserClosed)
         }));
         crate::app::set_device_info(&config.read().display_name, &local.device_id);
+        crate::app::set_console_url(&local.server_url);
     } else if interactive {
         // Fallback menu-bar item when the app window is not available.
         let sessions_for_menu = Arc::clone(&sessions);
@@ -211,6 +215,13 @@ pub async fn run_agent(paths: Paths) -> Result<()> {
         }));
         crate::app::set_policy(&state.policy_json());
     }
+
+    // Runtime branding: fetched from the console (public endpoint) on start, on demand and
+    // every 10 minutes; cached in the config dir so restarts are branded immediately.
+    tokio::spawn(crate::branding::refresh_loop(
+        local.server_url.clone(),
+        paths.clone(),
+    ));
 
     // Buffer of messages waiting for a live socket (bounded so we don't grow unbounded while
     // offline; signaling is time-sensitive so old entries are dropped).
@@ -305,6 +316,7 @@ async fn connect_once(
             tracing::info!("connected");
             crate::app::set_console_status(true);
             crate::app::set_policy(&state.policy_json());
+            crate::branding::request_refresh();
         }
         Some(ConsoleToAgent::Goodbye { reason }) => {
             return Err(anyhow!("console rejected connection: {reason}"));
@@ -385,6 +397,7 @@ where
         ConsoleToAgent::ConfigUpdate { config } => {
             apply_config(paths, local, state, config);
             sessions.apply_overrides(state.config.read().clone());
+            crate::branding::request_refresh();
         }
         ConsoleToAgent::SessionRequest {
             session_id,

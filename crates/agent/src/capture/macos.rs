@@ -21,6 +21,7 @@ use objc2_core_foundation::{CFDictionary, CFNumber, CFRetained, CFString, CFType
 use objc2_core_graphics::{
     CGDirectDisplayID, CGDisplayBounds, CGDisplayCopyDisplayMode, CGDisplayIsBuiltin,
     CGDisplayIsMain, CGDisplayMode, CGGetActiveDisplayList, CGPreflightScreenCaptureAccess,
+    CGRequestScreenCaptureAccess,
 };
 use objc2_core_media::{CMSampleBuffer, CMTime};
 use objc2_core_video::{
@@ -497,10 +498,21 @@ impl Drop for SckCapturer {
 
 pub fn create(cfg: &CaptureConfig) -> Result<Box<dyn Capturer>> {
     if !CGPreflightScreenCaptureAccess() {
-        bail!(
-            "Screen Recording permission not granted; enable it for this app in \
-             System Settings → Privacy & Security → Screen Recording"
-        );
+        // Ask the system for the permission: this shows the TCC prompt the first time
+        // and registers the app in System Settings → Screen Recording. Without this call
+        // a freshly installed app never even appears in that list.
+        static REQUESTED: std::sync::Once = std::sync::Once::new();
+        REQUESTED.call_once(|| {
+            let granted = CGRequestScreenCaptureAccess();
+            tracing::info!(granted, "requested Screen Recording permission");
+        });
+        if !CGPreflightScreenCaptureAccess() {
+            bail!(
+                "Screen Recording permission not granted; enable it for this app in \
+                 System Settings → Privacy & Security → Screen Recording, then quit and \
+                 reopen the app"
+            );
+        }
     }
     let entries = enumerate()?;
     let entry = entries

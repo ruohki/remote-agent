@@ -3,8 +3,9 @@
 //   Rust → JS: window.__app.<fn>(...)               -- see bottom.
 'use strict';
 (function () {
-  var OPERATOR = 'Operator';
+  var OPERATOR = 'Support technician';
   var connected = false; // a session is attached
+  var hadSession = false; // a session ran in this window at some point (keeps the transcript)
   var unread = 0;
   var lastFrom = null, lastDay = null;
 
@@ -71,13 +72,13 @@
     else b.hidden = true;
   }
   function clearTranscript() {
-    transcript.innerHTML = '<div class="empty" id="chatEmpty">Say hi to ' + OPERATOR + '.</div>';
+    transcript.innerHTML = '<div class="empty" id="chatEmpty">No messages.</div>';
     lastFrom = null; lastDay = null; unread = 0; renderBadge();
   }
 
   function autosize() {
     composer.style.height = 'auto';
-    composer.style.height = Math.min(composer.scrollHeight, 120) + 'px';
+    composer.style.height = Math.max(44, Math.min(composer.scrollHeight, 150)) + 'px';
     sendBtn.disabled = !connected || composer.value.trim() === '';
   }
   composer.addEventListener('input', autosize);
@@ -93,14 +94,45 @@
   sendBtn.addEventListener('click', doSend);
 
   function confirmEnd() {
-    if (window.confirm('End the remote support session now?')) ipc({ type: 'disconnect' });
+    if (window.confirm('End the support session now?')) ipc({ type: 'disconnect' });
   }
   $('endBtn').addEventListener('click', confirmEnd);
   $('chatEndBtn').addEventListener('click', confirmEnd);
   $('openChatBtn').addEventListener('click', function () { show('chat'); });
+  // ---- permissions (macOS) & install location ----
+  function bindPermissionButtons() {
+    document.querySelectorAll('[data-request]').forEach(function (b) {
+      b.addEventListener('click', function () { ipc({ type: 'request_permission', which: b.getAttribute('data-request') }); });
+    });
+    document.querySelectorAll('[data-settings]').forEach(function (b) {
+      b.addEventListener('click', function () { ipc({ type: 'open_settings', which: b.getAttribute('data-settings') }); });
+    });
+    $('permWarnBtn').addEventListener('click', function () { show('home'); ipc({ type: 'request_permission', which: 'screen' }); });
+    $('moveBtn').addEventListener('click', function () {
+      $('moveBtn').disabled = true;
+      setStatus2($('moveStatus'), 'Moving…', '');
+      ipc({ type: 'move_to_applications' });
+    });
+  }
+  bindPermissionButtons();
+  function renderPermissions(p) {
+    var card = $('permsCard');
+    if (!p || !p.supported) { card.hidden = true; $('permWarn').hidden = true; return; }
+    card.hidden = false;
+    [['screen', p.screen], ['accessibility', p.accessibility]].forEach(function (pair) {
+      var row = document.querySelector('.perm-row[data-perm="' + pair[0] + '"]');
+      if (!row) return;
+      row.classList.toggle('ok', !!pair[1]);
+      var badge = row.querySelector('[data-badge]');
+      badge.textContent = pair[1] ? 'Granted' : 'Not granted';
+      badge.classList.toggle('ok', !!pair[1]);
+    });
+    $('permWarn').hidden = !!p.screen;
+  }
+
   $('installBtn').addEventListener('click', function () {
     $('installBtn').disabled = true;
-    setStatus2($('installStatus'), 'Requesting administrator permission…', '');
+    setStatus2($('installStatus'), 'Administrator authorization required…', '');
     ipc({ type: 'install' });
   });
 
@@ -109,10 +141,15 @@
     $('sessionActive').hidden = !on;
     $('sessionNone').hidden = !!on;
     $('chatEndBtn').hidden = !on;
-    ['railDot', 'chatDot'].forEach(function (id) { $(id).classList.toggle('warn', !on); $(id).classList.toggle('on', !!on); });
+    $('chatDot').classList.toggle('warn', !on); $('chatDot').classList.toggle('on', !!on);
     composer.disabled = !on;
+    composer.placeholder = on ? 'Message…' : 'Chat becomes available when a support technician is connected';
+    var chatTab = $('tab-chat'); if (chatTab) chatTab.classList.toggle('inactive', !on);
     autosize();
-    $('chatStatus').textContent = on ? 'Connected' : 'Session ended';
+    var chat = document.querySelector('.chat'); if (chat) chat.classList.toggle('no-session', !on);
+    var ns = $('chatNoSession'); if (ns) ns.hidden = !!on || hadSession;
+    $('chatStatus').textContent = on ? 'Session active' : (hadSession ? 'Session ended' : 'No active session');
+    if (on) hadSession = true;
   }
   function setStatus2(el, text, cls) { el.textContent = text; el.className = 'install-status' + (cls ? ' ' + cls : ''); }
 
@@ -136,6 +173,10 @@
   function renderPolicy() {
     if (!policy) return;
     var c = policy.console || {}, eff = policy.effective || {};
+    var idle = $('sessionNoneText');
+    if (idle) idle.textContent = eff.mode === 'help_me'
+      ? 'A support technician can connect to this computer after your approval.'
+      : 'A support technician can connect to this computer.';
     SWITCH_KEYS.forEach(function (key) {
       var sw = document.querySelector('.switch[data-key="' + key + '"]');
       var sub = document.querySelector('.setting[data-key="' + key + '"] [data-policy]');
@@ -145,12 +186,12 @@
         var consoleRequires = c.mode === 'help_me';
         checked = consoleRequires || eff.mode === 'help_me';
         locked = consoleRequires; // administrator already requires approval
-        note = consoleRequires ? 'Required by your administrator' : 'Administrator lets operators connect without asking';
+        note = consoleRequires ? 'Required by administrator policy' : 'Administrator policy: sessions may start without approval';
       } else {
         var consoleBlocks = c[key] === false;
         checked = !consoleBlocks && eff[key] !== false; // allowed only if console allows AND not locally blocked
         locked = consoleBlocks; // cannot loosen what the administrator blocked
-        note = consoleBlocks ? 'Blocked by your administrator' : 'Allowed by your administrator';
+        note = consoleBlocks ? 'Disabled by administrator policy' : 'Permitted by administrator policy';
       }
       sw.setAttribute('aria-checked', checked ? 'true' : 'false');
       sw.classList.toggle('locked', !!locked);
@@ -187,7 +228,7 @@
   window.__app = {
     // Session lifecycle
     startSession: function (operator) {
-      OPERATOR = operator || 'Operator';
+      OPERATOR = operator || 'Support technician';
       $('opName').textContent = OPERATOR;
       $('opAvatar').textContent = initials(OPERATOR);
       $('chatAvatar').textContent = initials(OPERATOR);
@@ -199,29 +240,33 @@
     push: push,
     // Console / device status
     setConsole: function (url, connectedToConsole) {
-      $('consoleUrl').textContent = url || '—';
+      var host = (url || '').replace(/^[a-z]+:\/\//i, '').replace(/\/.*$/, '');
+      $('consoleUrl').textContent = host || '—';
+      $('consoleUrl').title = url || '';
       $('aboutConsole').textContent = url || '—';
-      $('consoleState').textContent = connectedToConsole ? 'Connected' : 'Connecting…';
+      $('consoleState').textContent = connectedToConsole ? 'Connected' : 'Not connected';
       $('consoleDot').classList.toggle('on', !!connectedToConsole);
-      $('railStatus').textContent = connectedToConsole ? 'Online' : 'Connecting…';
-      $('railDot').classList.toggle('on', !!connectedToConsole && !connected);
+      $('railStatus').textContent = connectedToConsole ? 'Online' : 'Offline';
+      $('railDot').classList.toggle('on', !!connectedToConsole);
+      $('railDot').classList.toggle('warn', !connectedToConsole);
     },
     setDevice: function (name, id) { $('deviceName').textContent = name || '—'; $('deviceId').textContent = id || '—'; },
     // Branding
     setBranding: function (b) {
       if (b.accent) document.documentElement.style.setProperty('--accent', b.accent);
       var name = b.product_name || 'Remote Support';
+      document.title = name;
       $('brandName').textContent = name;
       $('heroName').textContent = name;
       $('installProduct').textContent = name;
       $('aboutProduct').textContent = name;
       $('aboutOrg').textContent = b.organization || '—';
       $('supportText').textContent = b.support_text || '';
-      if (b.logo) {
-        var url = 'url("data:image/png;base64,' + b.logo + '")';
-        $('logo').style.backgroundImage = url;
-        $('heroLogo').style.backgroundImage = url;
-      }
+      var logoUrl = b.logo ? 'url("data:image/png;base64,' + b.logo + '")' : '';
+      ['logo', 'heroLogo'].forEach(function (id) {
+        $(id).style.backgroundImage = logoUrl;
+        $(id).classList.toggle('has-logo', !!b.logo);
+      });
     },
     setAbout: function (version, keyfp) { $('aboutVersion').textContent = version || '—'; $('aboutKey').textContent = keyfp || '—'; },
     setInstallable: function (yes) { $('tab-install').hidden = !yes; },
@@ -231,6 +276,14 @@
     },
     // Privacy & control policy
     setPolicy: function (p) { policy = p; renderPolicy(); },
+    // macOS permissions + install location onboarding
+    setPermissions: renderPermissions,
+    setLocation: function (l) {
+      var card = $('moveCard');
+      card.hidden = !(l && l.movable);
+      if (l && l.path) $('movePath').textContent = (l.translocated ? 'Running from a temporary Gatekeeper location. ' : 'Running from ' + l.path + '. ') + 'Move it to the Applications folder so permissions and settings are kept.';
+    },
+    moveResult: function (ok, message) { $('moveBtn').disabled = ok; setStatus2($('moveStatus'), message, ok ? 'ok' : 'err'); },
     // Navigation from Rust (tray "open chat")
     show: show,
   };

@@ -153,13 +153,22 @@ pub fn approval_dialog(operator: &str, timeout: Duration) -> Result<ApprovalOutc
         #[allow(deprecated)]
         app.activateIgnoringOtherApps(true);
         let alert = NSAlert::new(mtm);
-        alert.setMessageText(&NSString::from_str(&format!(
-            "{operator} wants to control this computer"
-        )));
+        let branding = crate::branding::current();
+        let product = crate::branding::product_name();
+        alert.setMessageText(&NSString::from_str(&format!("{product} — Support request")));
+        let support = if branding.support_text.trim().is_empty() {
+            String::new()
+        } else {
+            format!("\n\n{}", branding.support_text.trim())
+        };
         alert.setInformativeText(&NSString::from_str(&format!(
-            "An operator ({operator}) is asking to view and control your screen through the remote support console.\n\nAllow the session? It ends automatically if you do not answer within {} seconds.",
+            "{operator} requests remote access to this computer (screen sharing and remote control).\n\nThe request expires in {} seconds.{support}",
             timeout.as_secs()
         )));
+        if let Some(icon) = dock_icon_image(mtm) {
+            // SAFETY: the alert retains the image; main thread.
+            unsafe { alert.setIcon(Some(&icon)) };
+        }
         alert.setAlertStyle(NSAlertStyle::Warning);
         let _allow = alert.addButtonWithTitle(&NSString::from_str("Allow"));
         let _deny = alert.addButtonWithTitle(&NSString::from_str("Deny"));
@@ -263,8 +272,164 @@ impl Drop for PanelHandle {
 }
 
 fn banner_text(operator: &str) -> String {
-    let product = crate::baked::product_name();
-    format!("{product} · {operator} is controlling this computer")
+    let product = crate::branding::product_name();
+    format!("{product} — Support session active: {operator} is connected")
+}
+
+/// Branded app icon as an `NSImage` (from the logo or the default mark).
+fn dock_icon_image(_mtm: MainThreadMarker) -> Option<Retained<objc2_app_kit::NSImage>> {
+    use objc2::AllocAnyThread;
+    let png = crate::branding::encode_png(&crate::branding::app_icon(256));
+    let data = objc2_foundation::NSData::with_bytes(&png);
+    objc2_app_kit::NSImage::initWithData(objc2_app_kit::NSImage::alloc(), &data)
+}
+
+/// Accessibility permission with the system prompt (`AXIsProcessTrustedWithOptions`).
+pub fn request_accessibility() -> bool {
+    use objc2_foundation::{NSDictionary, NSNumber};
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        fn AXIsProcessTrustedWithOptions(options: *const c_void) -> bool;
+    }
+    let key = NSString::from_str("AXTrustedCheckOptionPrompt");
+    let value = NSNumber::new_bool(true);
+    let dict = NSDictionary::from_slices(&[&*key], &[&*value]);
+    // SAFETY: NSDictionary is toll-free bridged to CFDictionaryRef; it outlives the call.
+    unsafe { AXIsProcessTrustedWithOptions(Retained::as_ptr(&dict) as *const c_void) }
+}
+
+/// Open System Settings on a privacy pane.
+pub fn open_privacy_settings(pane: crate::platform::PrivacyPane) {
+    let url = match pane {
+        crate::platform::PrivacyPane::ScreenCapture => {
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+        }
+        crate::platform::PrivacyPane::Accessibility => {
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+        }
+    };
+    if let Err(e) = std::process::Command::new("open").arg(url).spawn() {
+        tracing::warn!("opening System Settings: {e}");
+    }
+}
+
+/// Bundle / translocation / Applications-folder detection for the running executable.
+pub fn exe_location() -> crate::platform::ExeLocation {
+    let mut loc = crate::platform::ExeLocation::default();
+    let Ok(exe) = std::env::current_exe() else {
+        return loc;
+    };
+    let text = exe.to_string_lossy();
+    loc.translocated = text.contains("/AppTranslocation/");
+    // …/<Name>.app/Contents/MacOS/<bin>
+    loc.bundle = exe
+        .ancestors()
+        .find(|p| p.extension().and_then(|e| e.to_str()) == Some("app"))
+        .map(|p| p.to_path_buf());
+    if let Some(b) = &loc.bundle {
+        let s = b.to_string_lossy();
+        let home = std::env::var("HOME").unwrap_or_default();
+        loc.in_applications = s.starts_with("/Applications/")
+            || (!home.is_empty() && s.starts_with(&format!("{home}/Applications/")));
+    }
+    loc
+}
+
+/// Copy the bundle into `/Applications` (or `~/Applications` when not writable, or
+/// `REMOTE_AGENT_APPLICATIONS_DIR`), relaunch from there and exit this instance.
+pub fn move_to_applications() -> Result<String> {
+    let loc = exe_location();
+    let src = loc
+        .bundle
+        .clone()
+        .context("not running from an app bundle")?;
+    let name = src.file_name().context("bundle name")?.to_owned();
+    let dest_dir = match std::env::var_os("REMOTE_AGENT_APPLICATIONS_DIR") {
+        Some(d) => std::path::PathBuf::from(d),
+        None => {
+            let sys = std::path::PathBuf::from("/Applications");
+            let probe = sys.join(".remote-agent-write-test");
+            let writable = std::fs::File::create(&probe).is_ok();
+            let _ = std::fs::remove_file(&probe);
+            if writable {
+                sys
+            } else {
+                let home = std::env::var("HOME").context("HOME")?;
+                std::path::PathBuf::from(home).join("Applications")
+            }
+        }
+    };
+    std::fs::create_dir_all(&dest_dir)
+        .with_context(|| format!("creating {}", dest_dir.display()))?;
+    let dest = dest_dir.join(&name);
+    if dest.exists() {
+        std::fs::remove_dir_all(&dest).with_context(|| format!("replacing {}", dest.display()))?;
+    }
+    let status = std::process::Command::new("ditto")
+        .arg(&src)
+        .arg(&dest)
+        .status()
+        .context("running ditto")?;
+    if !status.success() {
+        anyhow::bail!("ditto exited with {status}");
+    }
+    // Clear quarantine so the copy launches without a second Gatekeeper round-trip.
+    let _ = std::process::Command::new("xattr")
+        .args(["-dr", "com.apple.quarantine"])
+        .arg(&dest)
+        .status();
+    // Relaunch from the new location, then leave. The translocated original cannot be deleted
+    // (read-only mount); a plain download is removed so only one copy remains.
+    std::process::Command::new("open")
+        .arg("-n")
+        .arg(&dest)
+        .spawn()
+        .context("relaunching")?;
+    if !loc.translocated {
+        let _ = std::fs::remove_dir_all(&src);
+    }
+    let dest_text = dest.display().to_string();
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_millis(1500));
+        std::process::exit(0);
+    });
+    Ok(format!("Moved to {dest_text}; relaunching"))
+}
+
+/// Developer aid: `REMOTE_AGENT_APPEARANCE=light|dark` forces the app's appearance (screenshots).
+pub fn apply_debug_appearance() {
+    let Some(want) = std::env::var_os("REMOTE_AGENT_APPEARANCE") else {
+        return;
+    };
+    let name = match want.to_string_lossy().as_ref() {
+        "dark" => "NSAppearanceNameDarkAqua",
+        "light" => "NSAppearanceNameAqua",
+        _ => return,
+    };
+    let _ = run_on_main(move || {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let appearance = objc2_app_kit::NSAppearance::appearanceNamed(&NSString::from_str(name));
+        NSApplication::sharedApplication(mtm).setAppearance(appearance.as_deref());
+    });
+}
+
+/// Set the dock icon from PNG bytes (main thread, fire and forget).
+pub fn set_dock_icon(png: &[u8]) {
+    let png = png.to_vec();
+    DispatchQueue::main().exec_async(move || {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        use objc2::AllocAnyThread;
+        let data = objc2_foundation::NSData::with_bytes(&png);
+        let image = objc2_app_kit::NSImage::initWithData(objc2_app_kit::NSImage::alloc(), &data);
+        if let Some(image) = image {
+            // SAFETY: main thread; NSApplication is a singleton.
+            unsafe { NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&image)) };
+        }
+    });
 }
 
 /// Show the banner for `operator`. Returns a handle whose drop hides the banner again.
@@ -320,7 +485,10 @@ pub fn show_indicator(
                 NSBackingStoreType::Buffered,
                 false,
             );
-            panel.setTitle(&NSString::from_str("Remote session"));
+            panel.setTitle(&NSString::from_str(&format!(
+                "{} — remote session",
+                crate::branding::product_name()
+            )));
             panel.setLevel(NSStatusWindowLevel);
             panel.setCollectionBehavior(
                 NSWindowCollectionBehavior::CanJoinAllSpaces
@@ -335,16 +503,32 @@ pub fn show_indicator(
             }
 
             let target = IndicatorTarget::new(mtm, shared_for_main);
+            // Accent stripe on the left edge (branding colour).
+            let (ar, ag, ab) = crate::branding::accent_rgb();
+            let stripe = NSTextField::labelWithString(&NSString::from_str(""), mtm);
+            stripe.setFrame(NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(5.0, height),
+            ));
+            stripe.setDrawsBackground(true);
+            stripe.setBackgroundColor(Some(
+                &objc2_app_kit::NSColor::colorWithSRGBRed_green_blue_alpha(
+                    ar as f64 / 255.0,
+                    ag as f64 / 255.0,
+                    ab as f64 / 255.0,
+                    1.0,
+                ),
+            ));
             let label =
                 NSTextField::labelWithString(&NSString::from_str(&banner_text(&operator)), mtm);
             label.setFrame(NSRect::new(
-                NSPoint::new(12.0, 12.0),
-                NSSize::new(width - 120.0, 20.0),
+                NSPoint::new(16.0, 12.0),
+                NSSize::new(width - 124.0, 20.0),
             ));
             // SAFETY: target is retained for the panel's lifetime, selector exists on the class.
             let button = unsafe {
                 NSButton::buttonWithTitle_target_action(
-                    &NSString::from_str("Disconnect"),
+                    &NSString::from_str("End session"),
                     Some(&target),
                     Some(sel!(disconnect:)),
                     mtm,
@@ -355,6 +539,7 @@ pub fn show_indicator(
                 NSSize::new(96.0, 28.0),
             ));
             if let Some(content) = panel.contentView() {
+                content.addSubview(&stripe);
                 content.addSubview(&label);
                 content.addSubview(&button);
                 // Clicking the banner (outside the button) opens the app window.

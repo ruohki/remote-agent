@@ -16,6 +16,28 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MessageBoxW, IDYES, MB_ICONQUESTION, MB_SETFOREGROUND, MB_SYSTEMMODAL, MB_TOPMOST, MB_YESNO,
 };
 
+/// Whether Windows apps use the dark theme (`HKCU\\...\\Personalize\\AppsUseLightTheme == 0`).
+pub fn dark_theme() -> bool {
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+    let sub = HSTRING::from(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+    let name = HSTRING::from("AppsUseLightTheme");
+    let mut value: u32 = 1;
+    let mut size: u32 = std::mem::size_of::<u32>() as u32;
+    // SAFETY: the out-buffer is a u32 sized as advertised; the strings outlive the call.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            PCWSTR(sub.as_ptr()),
+            PCWSTR(name.as_ptr()),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut value as *mut u32 as *mut _),
+            Some(&mut size),
+        )
+    };
+    status.is_ok() && value == 0
+}
+
 /// User name of the active console session, if someone is logged in.
 pub fn console_user() -> Option<String> {
     // SAFETY: returns 0xFFFFFFFF when no one is logged in.

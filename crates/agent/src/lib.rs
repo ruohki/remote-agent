@@ -25,6 +25,7 @@ pub mod app;
 pub mod approval;
 pub mod audio;
 pub mod baked;
+pub mod branding;
 pub mod capture;
 pub mod chat;
 pub mod cli;
