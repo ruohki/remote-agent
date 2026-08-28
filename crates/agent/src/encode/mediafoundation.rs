@@ -40,9 +40,10 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_RATIONAL,
 };
 use windows::Win32::Media::MediaFoundation::{
-    eAVEncCommonRateControlMode_CBR, CODECAPI_AVEncCommonMeanBitRate,
-    CODECAPI_AVEncCommonQualityVsSpeed, CODECAPI_AVEncCommonRateControlMode,
-    CODECAPI_AVEncCommonRealTime, CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMPVGOPSize,
+    eAVEncCommonRateControlMode_PeakConstrainedVBR, CODECAPI_AVEncCommonMaxBitRate,
+    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonQualityVsSpeed,
+    CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncCommonRealTime,
+    CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMPVGOPSize,
     CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI, IMFActivate,
     IMFAttributes, IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFMediaType, IMFSample,
     IMFTransform, METransformHaveOutput, METransformNeedInput, MFCreateDXGIDeviceManager,
@@ -210,8 +211,12 @@ struct Converter {
     video_context: ID3D11VideoContext,
     enumerator: ID3D11VideoProcessorEnumerator,
     processor: ID3D11VideoProcessor,
+    /// Input (capture) size.
     width: u32,
     height: u32,
+    /// Output (encoded) size; the video processor scales when it differs.
+    out_width: u32,
+    out_height: u32,
     nv12_pool: Vec<(ID3D11Texture2D, ID3D11VideoProcessorOutputView)>,
     pool_next: usize,
     /// Upload target for CPU BGRA frames.
@@ -219,7 +224,14 @@ struct Converter {
 }
 
 impl Converter {
-    fn new(device: Arc<D3dDevice>, width: u32, height: u32, fps: u32) -> Result<Self> {
+    fn new(
+        device: Arc<D3dDevice>,
+        width: u32,
+        height: u32,
+        out_width: u32,
+        out_height: u32,
+        fps: u32,
+    ) -> Result<Self> {
         let video_device: ID3D11VideoDevice = device
             .device
             .cast()
@@ -238,8 +250,8 @@ impl Converter {
                 Numerator: fps,
                 Denominator: 1,
             },
-            OutputWidth: width,
-            OutputHeight: height,
+            OutputWidth: out_width,
+            OutputHeight: out_height,
             Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
         };
         // SAFETY: desc is fully initialised.
@@ -272,14 +284,16 @@ impl Converter {
             processor,
             width,
             height,
+            out_width,
+            out_height,
             nv12_pool: Vec::new(),
             pool_next: 0,
             upload: None,
         };
         for _ in 0..NV12_POOL {
             let tex = me.device.create_texture(
-                width,
-                height,
+                out_width,
+                out_height,
                 DXGI_FORMAT_NV12,
                 D3D11_USAGE_DEFAULT,
                 D3D11_BIND_RENDER_TARGET,
@@ -402,6 +416,8 @@ impl Converter {
 pub struct MfEncoder {
     codec: VideoCodec,
     cfg: EncoderConfig,
+    /// Encoded picture size (viewport cap applied; even dimensions).
+    output: (u32, u32),
     activate: IMFActivate,
     transform: IMFTransform,
     events: IMFMediaEventGenerator,
@@ -465,6 +481,7 @@ impl MfEncoder {
         Ok(Self {
             codec: cfg.codec,
             cfg: cfg.clone(),
+            output: cfg.target_size(),
             activate,
             transform,
             events,
@@ -488,7 +505,8 @@ impl MfEncoder {
 
     /// Bind to `device`, negotiate media types and start streaming. Called on the first frame.
     fn start(&mut self, device: Arc<D3dDevice>) -> Result<()> {
-        let (w, h, fps) = (self.cfg.width, self.cfg.height, self.cfg.fps.max(1));
+        let (src_w, src_h, fps) = (self.cfg.width, self.cfg.height, self.cfg.fps.max(1));
+        let (w, h) = self.output;
         // SAFETY: plain COM calls; the device outlives the manager binding (we hold an Arc).
         unsafe {
             self.device_manager
@@ -499,7 +517,7 @@ impl MfEncoder {
                 .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, mgr_ptr as usize)
                 .context("MFT_MESSAGE_SET_D3D_MANAGER (encoder is not D3D11 aware)")?;
         }
-        self.converter = Some(Converter::new(device, w, h, fps)?);
+        self.converter = Some(Converter::new(device, src_w, src_h, w, h, fps)?);
 
         // Codec settings that must precede type negotiation on most encoder MFTs.
         if let Some(api) = &self.codec_api {
@@ -518,8 +536,8 @@ impl MfEncoder {
             codec_set(
                 api,
                 &CODECAPI_AVEncCommonRateControlMode,
-                variant_u32(eAVEncCommonRateControlMode_CBR.0 as u32),
-                "AVEncCommonRateControlMode=CBR",
+                variant_u32(eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32),
+                "AVEncCommonRateControlMode=PeakConstrainedVBR",
             );
             codec_set(
                 api,
@@ -527,10 +545,18 @@ impl MfEncoder {
                 variant_u32(self.cfg.bitrate_kbps.saturating_mul(1000)),
                 "AVEncCommonMeanBitRate",
             );
+            // Peak cap at 150 % of the mean (VBR: static desktops sit far below the mean).
+            codec_set(
+                api,
+                &CODECAPI_AVEncCommonMaxBitRate,
+                variant_u32(self.cfg.bitrate_kbps.saturating_mul(1500)),
+                "AVEncCommonMaxBitRate",
+            );
+            // Infinite GOP: keyframes only on demand (`CODECAPI_AVEncVideoForceKeyFrame`).
             codec_set(
                 api,
                 &CODECAPI_AVEncMPVGOPSize,
-                variant_u32(fps * 2),
+                variant_u32(u32::MAX),
                 "AVEncMPVGOPSize",
             );
             codec_set(
@@ -867,6 +893,12 @@ impl Encoder for MfEncoder {
         self.cfg.bitrate_kbps = kbps;
         match &self.codec_api {
             Some(api) if self.streaming => {
+                codec_set(
+                    api,
+                    &CODECAPI_AVEncCommonMaxBitRate,
+                    variant_u32(kbps.saturating_mul(1500)),
+                    "AVEncCommonMaxBitRate",
+                );
                 if codec_set(
                     api,
                     &CODECAPI_AVEncCommonMeanBitRate,
@@ -888,6 +920,10 @@ impl Encoder for MfEncoder {
 
     fn is_hardware(&self) -> bool {
         true
+    }
+
+    fn output_size(&self) -> Option<(u32, u32)> {
+        Some(self.output)
     }
 }
 

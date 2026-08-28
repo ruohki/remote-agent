@@ -52,15 +52,41 @@ the wins are elsewhere.
   `jitterBufferDelay`, RTT, bitrate.
 * Send `set_viewport` on resize/fullscreen (debounced 250 ms).
 
-## Test rig (`crates/agent` example `perf-source` + `remote-console/web/perf/`)
+## Test rig
 
-* A synthetic capture source (enabled with `REMOTE_AGENT_SYNTHETIC_SOURCE=1`) renders a frame
-  counter + monotonic timestamp as large high-contrast digits and a QR-like binary strip.
-* A Playwright script connects, samples `requestVideoFrameCallback`, OCRs the binary strip from
-  the decoded frame (canvas readback), and computes glass-to-glass latency; it also drives
-  scenarios (static / typing / window drag / video playback) and records bandwidth from
-  `getStats()`; results written as JSON + a markdown table in `PERFORMANCE.md#results`.
+Agent side (implemented): set `REMOTE_AGENT_SYNTHETIC_SOURCE=1` on any agent command that
+captures (`run`, app mode, the ignored `macos_perf` tests) to replace the screen capturer
+with `capture::synthetic::SyntheticCapturer` — 1920×1080 BGRA at 60 Hz with:
+
+* a strip of 14 solid 64×64 px cells at the top-left: cell 0 white (marker), cells 1–12 the
+  low 12 bits of the Unix epoch capture time in ms (MSB first, white = 1), cell 13 even
+  parity over the 12 data bits (`capture::synthetic::decode_strip` / `latency_ms` are the
+  reference decoder; the browser rig averages rows 8–56 of each cell);
+* a six-digit 7-segment frame counter below the strip;
+* `REMOTE_AGENT_SYNTHETIC_SCENARIO=static|typing|drag|video` — `static` repaints the strip
+  once per second and produces no other frames, `typing` changes a small region 10×/s,
+  `drag` moves a 600×400 window every frame, `video` is full-frame noisy motion at 30 fps.
+
+Every per-second `perf` log line (`--log perf=info`) carries `last_capture_epoch_ms` so
+agent-side timings can be correlated with the browser's decoded stamps. Stats sent to the
+viewer (`ControlMessage::Stats`) include `encoded_width/height`, `capture_to_encoded_ms`,
+`encode_ms`, `keyframes` and `frames_skipped_idle` (idle refreshes) per window.
+
+Browser side: `remote-console/web/perf/` (see the console repo) connects, samples
+`requestVideoFrameCallback`, decodes the strip from the decoded frame and computes
+glass-to-glass latency; bandwidth comes from `getStats()`.
+
 
 ## Results
 
-_(filled in by the rig)_
+Agent-side measurements on this Mac (Apple Silicon, VideoToolbox H.265, 2026-08-28,
+`cargo test -p remote-agent --test macos_perf -- --ignored --nocapture`):
+
+| Scenario | Frames / 10 s | Keyframes | Bandwidth | capture→encoded | encode |
+|----------|---------------|-----------|-----------|-----------------|--------|
+| Synthetic `static` (strip repaints 1×/s) | 10 | 0 | **4.4 kbit/s** | 4.6 ms | 4.2 ms |
+| Live desktop (terminal scrolling, 3024×1964) | 70 | 0 | 307 kbit/s | 10.6 ms | 10.6 ms |
+| Synthetic `drag` (600×400 window, 1080p) | 133 / 3 s (44 fps) | 1 | — | 5.6 ms | 3.9 ms |
+
+First keyframe: 2.2 KB (synthetic 1080p) / 75 KB (live 3024×1964). Glass-to-glass numbers
+come from the browser rig (`remote-console/web/perf/`).

@@ -29,10 +29,38 @@ pub mod videotoolbox;
 #[derive(Debug, Clone)]
 pub struct EncoderConfig {
     pub codec: VideoCodec,
+    /// Source (capture) size.
     pub width: u32,
     pub height: u32,
     pub fps: u32,
     pub bitrate_kbps: u32,
+    /// Optional cap on the encoded picture (viewport scaling): the encoder scales the source
+    /// down to fit inside this box, keeping the aspect ratio (`None` = full size). Hardware
+    /// limits (e.g. 4096×2304 for H.264 on VideoToolbox) apply on top.
+    pub max_output: Option<(u32, u32)>,
+}
+
+impl EncoderConfig {
+    /// Encoded picture size after applying `max_output` (even dimensions, aspect kept).
+    pub fn target_size(&self) -> (u32, u32) {
+        match self.max_output {
+            Some(max) => fit_within(self.width, self.height, max),
+            None => (self.width, self.height),
+        }
+    }
+}
+
+/// Scale `width×height` down (never up) to fit inside `max`, keeping the aspect ratio and
+/// rounding to even dimensions (4:2:0 chroma).
+pub fn fit_within(width: u32, height: u32, max: (u32, u32)) -> (u32, u32) {
+    let (max_w, max_h) = (max.0.max(2), max.1.max(2));
+    if width <= max_w && height <= max_h {
+        return (width & !1, height & !1);
+    }
+    let scale = (max_w as f64 / width as f64).min(max_h as f64 / height as f64);
+    let w = ((width as f64 * scale).floor() as u32).max(2) & !1;
+    let h = ((height as f64 * scale).floor() as u32).max(2) & !1;
+    (w, h)
 }
 
 pub struct EncodedFrame {

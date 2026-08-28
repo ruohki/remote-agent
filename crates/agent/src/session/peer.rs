@@ -399,6 +399,23 @@ impl Peer {
     }
 }
 
+/// Feed REMB / receiver-report feedback from an RTCP batch into the congestion controller.
+pub fn feed_congestion(event: &TrackLocalEvent, cc: &mut crate::congestion::AimdController) {
+    use rtc::rtcp::payload_feedbacks::receiver_estimated_maximum_bitrate::ReceiverEstimatedMaximumBitrate;
+    use rtc::rtcp::receiver_report::ReceiverReport;
+    let TrackLocalEvent::OnRtcpPacket(packets) = event;
+    for p in packets {
+        let any = p.as_any();
+        if let Some(remb) = any.downcast_ref::<ReceiverEstimatedMaximumBitrate>() {
+            cc.on_remb(remb.bitrate);
+        } else if let Some(rr) = any.downcast_ref::<ReceiverReport>() {
+            for r in &rr.reports {
+                cc.on_receiver_report(r.fraction_lost, r.jitter);
+            }
+        }
+    }
+}
+
 /// True when the RTCP batch contains a keyframe request (PLI or FIR).
 pub fn is_keyframe_request(event: &TrackLocalEvent) -> bool {
     let TrackLocalEvent::OnRtcpPacket(packets) = event;

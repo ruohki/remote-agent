@@ -393,9 +393,46 @@ impl InputHandler for Injector {
     }
 }
 
+/// Last-wins slot for pointer moves arriving on the unreliable `input-fast` channel: the
+/// applier takes the newest position at the injector rate, stale ones are dropped, and the
+/// reliable channel drains it before a button event so clicks land where the operator sees
+/// the pointer.
+#[derive(Debug, Default)]
+pub struct LatestMove {
+    slot: parking_lot::Mutex<Option<(i32, i32)>>,
+    notify: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl LatestMove {
+    pub fn push(&self, x: i32, y: i32) {
+        *self.slot.lock() = Some((x, y));
+        self.notify.notify_one();
+    }
+
+    /// Take the newest pending position, if any.
+    pub fn take(&self) -> Option<(i32, i32)> {
+        self.slot.lock().take()
+    }
+
+    pub fn notify(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        std::sync::Arc::clone(&self.notify)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn latest_move_keeps_only_the_newest_position() {
+        let m = LatestMove::default();
+        assert_eq!(m.take(), None);
+        m.push(1, 1);
+        m.push(2, 2);
+        m.push(3, 3);
+        assert_eq!(m.take(), Some((3, 3)));
+        assert_eq!(m.take(), None);
+    }
 
     #[test]
     fn letters_and_digits_become_chars() {

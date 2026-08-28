@@ -136,6 +136,8 @@ struct Options {
     media: FakeMedia,
     /// Whether a UI exists that can draw annotations (false = headless service mode).
     annotations_available: bool,
+    /// Also open the unordered/unreliable `input-fast` channel.
+    fast_input: bool,
 }
 
 impl Default for Options {
@@ -149,6 +151,7 @@ impl Default for Options {
             },
             media: FakeMedia::default(),
             annotations_available: true,
+            fast_input: false,
         }
     }
 }
@@ -163,6 +166,7 @@ struct Harness {
     control_dc: Arc<dyn DataChannel>,
     control_rx: ControlRx,
     input_dc: Arc<dyn DataChannel>,
+    fast_input_dc: Option<Arc<dyn DataChannel>>,
     files_dc: Arc<dyn DataChannel>,
     files_rx: FilesRx,
     input_events: Arc<std::sync::Mutex<Vec<InputEvent>>>,
@@ -264,6 +268,23 @@ impl Harness {
             .create_data_channel(protocol::INPUT_CHANNEL_LABEL, None)
             .await
             .unwrap();
+        let fast_input_dc = if opts.fast_input {
+            Some(
+                browser
+                    .create_data_channel(
+                        protocol::FAST_INPUT_CHANNEL_LABEL,
+                        Some(rtc::data_channel::RTCDataChannelInit {
+                            ordered: false,
+                            max_retransmits: Some(0),
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
         let control_dc = browser
             .create_data_channel(protocol::CONTROL_CHANNEL_LABEL, None)
             .await
@@ -361,6 +382,18 @@ impl Harness {
         .await
         .expect("input channel never opened");
 
+        if let Some(dc) = &fast_input_dc {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Some(webrtc::data_channel::DataChannelEvent::OnOpen) = dc.poll().await {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("input-fast channel never opened");
+        }
+
         Self {
             sessions,
             browser,
@@ -370,6 +403,7 @@ impl Harness {
             control_dc,
             control_rx,
             input_dc,
+            fast_input_dc,
             files_dc,
             files_rx,
             input_events,
@@ -1682,4 +1716,217 @@ async fn annotations_without_ui_reply_disabled() {
     })
     .await;
     assert!(h.annotations.events.lock().unwrap().is_empty());
+}
+
+// ── performance pass ────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn set_viewport_scales_the_picture_and_forces_a_keyframe() {
+    let mut h = Harness::connect(Options::default()).await;
+    // Full size first (test displays are 320×240).
+    let full = next_control(&mut h.control_rx, |m| {
+        matches!(m, ControlMessage::Stats { display: 0, .. })
+    })
+    .await;
+    let ControlMessage::Stats {
+        encoded_width: w0,
+        encoded_height: h0,
+        ..
+    } = full
+    else {
+        unreachable!()
+    };
+    assert_eq!((w0, h0), (320, 240));
+
+    h.control(&ControlMessage::SetViewport {
+        display: 0,
+        width: Some(160),
+        height: Some(160),
+    })
+    .await;
+    // Debounced (250 ms) encoder rebuild → next stats report the capped size and a keyframe.
+    let scaled = tokio::time::timeout(Duration::from_secs(6), async {
+        next_control(&mut h.control_rx, |m| {
+            matches!(
+                m,
+                ControlMessage::Stats {
+                    display: 0,
+                    encoded_width: 160,
+                    ..
+                }
+            )
+        })
+        .await
+    })
+    .await
+    .expect("stats never reported the viewport-scaled size");
+    let ControlMessage::Stats {
+        encoded_height,
+        keyframes,
+        ..
+    } = scaled
+    else {
+        unreachable!()
+    };
+    assert_eq!(encoded_height, 120, "aspect kept");
+    assert!(
+        keyframes >= 1,
+        "viewport change forces a keyframe (got {keyframes})"
+    );
+
+    // A viewport larger than the display means full resolution again.
+    h.control(&ControlMessage::SetViewport {
+        display: 0,
+        width: Some(4000),
+        height: Some(4000),
+    })
+    .await;
+    tokio::time::timeout(Duration::from_secs(6), async {
+        next_control(&mut h.control_rx, |m| {
+            matches!(
+                m,
+                ControlMessage::Stats {
+                    display: 0,
+                    encoded_width: 320,
+                    ..
+                }
+            )
+        })
+        .await
+    })
+    .await
+    .expect("stats never returned to full size");
+    h.end().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cursor_shape_and_positions_arrive_on_the_control_channel() {
+    let mut h = Harness::connect(Options {
+        media: FakeMedia {
+            cursor: true,
+            ..FakeMedia::default()
+        },
+        ..Options::default()
+    })
+    .await;
+    let shape = tokio::time::timeout(Duration::from_secs(5), async {
+        next_control(&mut h.control_rx, |m| {
+            matches!(m, ControlMessage::CursorShape { .. })
+        })
+        .await
+    })
+    .await
+    .expect("no cursor_shape");
+    let ControlMessage::CursorShape {
+        id,
+        width,
+        height,
+        png_base64,
+        ..
+    } = shape
+    else {
+        unreachable!()
+    };
+    assert_eq!((id, width, height), (7, 8, 8));
+    assert!(!png_base64.is_empty());
+    let mut seen = 0;
+    while seen < 3 {
+        let m = tokio::time::timeout(Duration::from_secs(5), async {
+            next_control(&mut h.control_rx, |m| {
+                matches!(
+                    m,
+                    ControlMessage::CursorPosition {
+                        display: 0,
+                        shape_id: 7,
+                        visible: true,
+                        ..
+                    }
+                )
+            })
+            .await
+        })
+        .await
+        .expect("no cursor_position");
+        if let ControlMessage::CursorPosition { x, y, .. } = m {
+            assert!(x > 0 && y > 0);
+            seen += 1;
+        }
+    }
+    h.end().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fast_input_channel_moves_are_applied_and_flushed_before_clicks() {
+    let h = Harness::connect(Options {
+        fast_input: true,
+        ..Options::default()
+    })
+    .await;
+    let fast = h.fast_input_dc.clone().expect("fast channel");
+    for i in 1..=5 {
+        send_bytes(
+            &fast,
+            &serde_json::to_vec(&InputEvent::MouseMove {
+                x: i * 10,
+                y: i * 5,
+            })
+            .unwrap(),
+        )
+        .await;
+    }
+    // Wait for the applier to drain the slot (last position wins).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let ev = h.input_events.lock().unwrap().clone();
+        if ev
+            .iter()
+            .any(|e| matches!(e, InputEvent::MouseMove { x: 50, y: 25 }))
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "fast moves never applied: {ev:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // A fast move that arrived before a click on the reliable channel must be applied
+    // first (the two channels are independent SCTP streams, so give the move time to land).
+    send_bytes(
+        &fast,
+        &serde_json::to_vec(&InputEvent::MouseMove { x: 999, y: 888 }).unwrap(),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    send_bytes(
+        &h.input_dc,
+        &serde_json::to_vec(&InputEvent::MouseDown {
+            button: MouseButton::Left,
+        })
+        .unwrap(),
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let ev = h.input_events.lock().unwrap().clone();
+        if let Some(down) = ev
+            .iter()
+            .position(|e| matches!(e, InputEvent::MouseDown { .. }))
+        {
+            let before = &ev[..down];
+            assert!(
+                before
+                    .iter()
+                    .any(|e| matches!(e, InputEvent::MouseMove { x: 999, y: 888 })),
+                "move must precede the click: {ev:?}"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "click never applied: {ev:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    h.end().await;
 }

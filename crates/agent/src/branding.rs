@@ -295,6 +295,16 @@ impl Rgba {
         }
     }
 
+    /// Wrap an existing RGBA buffer (`width * height * 4` bytes; shorter buffers are padded).
+    pub fn from_rgba(width: u32, height: u32, mut data: Vec<u8>) -> Self {
+        data.resize((width * height * 4) as usize, 0);
+        Self {
+            width,
+            height,
+            data,
+        }
+    }
+
     fn px(&self, x: u32, y: u32) -> [u8; 4] {
         let i = ((y * self.width + x) * 4) as usize;
         [

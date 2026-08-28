@@ -26,8 +26,10 @@ pub mod video;
 use crate::approval::{ApprovalOutcome, Approver, Indicator, IndicatorHandle};
 use crate::chat::{ChatHandle, ChatModel, ChatUi};
 use crate::clipboard::{ClipboardBackend, ClipboardContent, ClipboardWatch};
+use crate::congestion::AimdController;
+use crate::cursor::CursorUpdate;
 use crate::hub::HubSink;
-use crate::input::InputHandler;
+use crate::input::{InputHandler, LatestMove};
 use crate::transfer::{TransferConfig, TransferManager, TransferNotice};
 use anyhow::{anyhow, Context, Result};
 use audio::{AudioPacket, AudioPipeline};
@@ -43,7 +45,9 @@ use protocol::common::{
 };
 use protocol::config::AgentConfig;
 use protocol::files::{FileMessage, TransferDirection, TransferKind};
-use protocol::{CONTROL_CHANNEL_LABEL, FILES_CHANNEL_LABEL, INPUT_CHANNEL_LABEL};
+use protocol::{
+    CONTROL_CHANNEL_LABEL, FAST_INPUT_CHANNEL_LABEL, FILES_CHANNEL_LABEL, INPUT_CHANNEL_LABEL,
+};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -237,6 +241,8 @@ enum ChannelEvent {
     ChatFromDevice(String),
     /// The person at the device ended the session (banner / app / session bar).
     UserEnd,
+    /// A control message produced by a helper thread (cursor source) to forward.
+    Outbound(ControlMessage),
 }
 
 /// One streaming display: its pipeline and the tasks feeding its video track.
@@ -307,6 +313,12 @@ struct Session {
     media: Option<Media>,
     channel_tx: mpsc::UnboundedSender<ChannelEvent>,
     readers: Vec<JoinHandle<()>>,
+    /// Newest pointer position from the unreliable `input-fast` channel.
+    fast_move: Arc<LatestMove>,
+    /// Set while a cursor source thread streams shape/position updates.
+    cursor_stop: Option<Arc<AtomicBool>>,
+    /// The capture omits the system cursor (client-side cursor active).
+    client_cursor: bool,
     clipboard: Option<ClipboardWatch>,
     /// Rich clipboard content (image / files) announced to the operator but not yet pulled.
     pending_clipboard: Option<ClipboardContent>,
@@ -458,6 +470,9 @@ async fn run_session(
         media: None,
         channel_tx,
         readers: Vec::new(),
+        fast_move: Arc::new(LatestMove::default()),
+        cursor_stop: None,
+        client_cursor: false,
         clipboard: None,
         pending_clipboard: None,
         transfers: None,
@@ -568,6 +583,7 @@ async fn run_session(
                 }
                 Some(ChannelEvent::ChatFromDevice(text)) => session.on_chat_from_device(text).await,
                 Some(ChannelEvent::UserEnd) => break EndReason::DeviceUserClosed,
+                Some(ChannelEvent::Outbound(msg)) => session.send_control(msg).await,
                 None => {}
             },
             Some(notice) = session.transfer_notices_rx.recv() => session.on_transfer_notice(notice).await,
@@ -803,6 +819,7 @@ impl Session {
             .map(|d| d.index)
             .unwrap_or(0);
         let (events_tx, events_rx) = mpsc::unbounded_channel();
+        self.start_cursor_source();
         self.media = Some(Media {
             displays,
             streams: BTreeMap::new(),
@@ -885,7 +902,10 @@ impl Session {
             codec: self.peer.codec(),
             max_fps: self.cfg.max_fps.clamp(1, 240),
             max_bitrate_kbps: self.cfg.max_bitrate_kbps.max(100),
-            show_cursor: true,
+            // With a client-side cursor the capture omits the system cursor: cursor-only
+            // changes then produce no frames at all and the browser draws it lag-free.
+            show_cursor: !self.client_cursor,
+            viewport: None,
         };
         let pipeline = tokio::task::spawn_blocking({
             let factory = Arc::clone(&factory);
@@ -938,18 +958,41 @@ impl Session {
         let rtcp = tokio::spawn({
             let peer = Arc::clone(&self.peer);
             let keyframe = pipeline.keyframe_requester();
+            let pipeline = Arc::clone(&pipeline);
+            let cap = self.cfg.max_bitrate_kbps.max(100);
+            let max_fps = self.cfg.max_fps.clamp(1, 240);
+            let sid = self.id.clone();
             async move {
+                let mut cc = AimdController::new(cap, std::time::Instant::now());
+                let mut fps = max_fps;
+                let mut ticker = tokio::time::interval(AimdController::INTERVAL);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     let Some(track) = peer.video(track_index) else {
                         break;
                     };
-                    match track.poll_rtcp().await {
-                        Some(ev) => {
-                            if is_keyframe_request(&ev) {
-                                keyframe.request();
+                    tokio::select! {
+                        ev = track.poll_rtcp() => match ev {
+                            Some(ev) => {
+                                if is_keyframe_request(&ev) {
+                                    keyframe.request();
+                                }
+                                peer::feed_congestion(&ev, &mut cc);
+                            }
+                            None => tokio::time::sleep(Duration::from_millis(200)).await,
+                        },
+                        _ = ticker.tick() => {
+                            if let Some(target) = cc.evaluate(std::time::Instant::now()) {
+                                tracing::debug!(session = %sid, display = index, target, "congestion control: new target bitrate");
+                                pipeline.set_target_bitrate(target);
+                            }
+                            let want = cc.fps_for(max_fps);
+                            if want != fps {
+                                fps = want;
+                                tracing::info!(session = %sid, display = index, fps, "congestion control: frame rate");
+                                pipeline.set_target_fps(fps);
                             }
                         }
-                        None => tokio::time::sleep(Duration::from_millis(200)).await,
                     }
                 }
             }
@@ -1123,18 +1166,54 @@ impl Session {
         };
         tracing::info!(session = %self.id, label, "data channel");
         match label.as_str() {
-            INPUT_CHANNEL_LABEL => {
-                if self.input.lock().is_none() {
-                    match (self.deps.input)() {
-                        Ok(h) => {
-                            *self.input.lock() = Some(h);
-                            self.update_input_display();
-                        }
-                        Err(e) => tracing::error!("input injection unavailable: {e:#}"),
-                    }
-                }
+            FAST_INPUT_CHANNEL_LABEL => {
+                self.ensure_input_handler();
                 let input = Arc::clone(&self.input);
                 let allow = Arc::clone(&self.input_allowed);
+                let fast = Arc::clone(&self.fast_move);
+                let sid = self.id.clone();
+                // Reader: keep only the newest position.
+                self.readers.push(tokio::spawn({
+                    let fast = Arc::clone(&fast);
+                    async move {
+                        while let Some(ev) = dc.poll().await {
+                            match ev {
+                                DataChannelEvent::OnMessage(msg) => {
+                                    if let Ok(InputEvent::MouseMove { x, y }) =
+                                        serde_json::from_slice::<InputEvent>(&msg.data)
+                                    {
+                                        fast.push(x, y);
+                                    }
+                                }
+                                DataChannelEvent::OnClose => break,
+                                _ => {}
+                            }
+                        }
+                    }
+                }));
+                // Applier: drain the slot at the injector rate (coalesces bursts).
+                let notify = fast.notify();
+                self.readers.push(tokio::spawn(async move {
+                    loop {
+                        notify.notified().await;
+                        while let Some((x, y)) = fast.take() {
+                            if allow.load(Ordering::Relaxed) {
+                                if let Some(h) = input.lock().as_mut() {
+                                    if let Err(e) = h.handle(InputEvent::MouseMove { x, y }) {
+                                        tracing::debug!(session = %sid, "fast input: {e:#}");
+                                    }
+                                }
+                            }
+                            tokio::time::sleep(Duration::from_millis(4)).await;
+                        }
+                    }
+                }));
+            }
+            INPUT_CHANNEL_LABEL => {
+                self.ensure_input_handler();
+                let input = Arc::clone(&self.input);
+                let allow = Arc::clone(&self.input_allowed);
+                let fast = Arc::clone(&self.fast_move);
                 let sid = self.id.clone();
                 self.readers.push(tokio::spawn(async move {
                     while let Some(ev) = dc.poll().await {
@@ -1146,6 +1225,14 @@ impl Session {
                                 match serde_json::from_slice::<InputEvent>(&msg.data) {
                                     Ok(event) => {
                                         if let Some(h) = input.lock().as_mut() {
+                                            // A click must land where the operator last
+                                            // saw the pointer: flush the fast channel first.
+                                            if !matches!(event, InputEvent::MouseMove { .. }) {
+                                                if let Some((x, y)) = fast.take() {
+                                                    let _ =
+                                                        h.handle(InputEvent::MouseMove { x, y });
+                                                }
+                                            }
                                             if let Err(e) = h.handle(event) {
                                                 tracing::debug!(session = %sid, "input: {e:#}");
                                             }
@@ -1538,6 +1625,21 @@ impl Session {
                     }
                 }
             }
+            ControlMessage::SetViewport {
+                display,
+                width,
+                height,
+            } => {
+                if let Some(m) = self.media.as_ref() {
+                    if let Some(s) = m.streams.get(&display) {
+                        let viewport = match (width, height) {
+                            (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
+                            _ => None,
+                        };
+                        s.pipeline.set_viewport(viewport);
+                    }
+                }
+            }
             ControlMessage::SecureAttention => {
                 if !self.cfg.allow_input {
                     return;
@@ -1674,6 +1776,85 @@ impl Session {
         }
     }
 
+    fn ensure_input_handler(&mut self) {
+        if self.input.lock().is_none() {
+            match (self.deps.input)() {
+                Ok(h) => {
+                    *self.input.lock() = Some(h);
+                    self.update_input_display();
+                }
+                Err(e) => tracing::error!("input injection unavailable: {e:#}"),
+            }
+        }
+    }
+
+    /// Stream cursor shape/position updates on the control channel from a dedicated thread
+    /// (client-side cursor); the capture then omits the system cursor.
+    fn start_cursor_source(&mut self) {
+        if self.cursor_stop.is_some() {
+            return;
+        }
+        let Some(mut source) = self.deps.media.create_cursor_source() else {
+            return;
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let tx = self.channel_tx.clone();
+        let sid = self.id.clone();
+        let stop2 = Arc::clone(&stop);
+        if let Err(e) = std::thread::Builder::new()
+            .name("cursor-source".into())
+            .spawn(move || {
+                while !stop2.load(Ordering::Relaxed) {
+                    let Some(update) = source.next(Duration::from_millis(50)) else {
+                        continue;
+                    };
+                    let msg = match update {
+                        CursorUpdate::Shape {
+                            id,
+                            png,
+                            hotspot_x,
+                            hotspot_y,
+                            width,
+                            height,
+                        } => ControlMessage::CursorShape {
+                            id,
+                            png_base64: {
+                                use base64::Engine;
+                                base64::engine::general_purpose::STANDARD.encode(png)
+                            },
+                            hotspot_x,
+                            hotspot_y,
+                            width,
+                            height,
+                        },
+                        CursorUpdate::Position {
+                            display,
+                            x,
+                            y,
+                            shape_id,
+                            visible,
+                        } => ControlMessage::CursorPosition {
+                            display,
+                            x,
+                            y,
+                            shape_id,
+                            visible,
+                        },
+                    };
+                    if tx.send(ChannelEvent::Outbound(msg)).is_err() {
+                        break;
+                    }
+                }
+                tracing::debug!(session = %sid, "cursor source stopped");
+            })
+        {
+            tracing::warn!("cursor source thread: {e:#}");
+            return;
+        }
+        self.cursor_stop = Some(stop);
+        self.client_cursor = true;
+    }
+
     async fn send_control(&self, msg: ControlMessage) {
         let Some(dc) = self.control.as_ref() else {
             return;
@@ -1709,6 +1890,12 @@ impl Session {
             self.send_control(ControlMessage::Stats {
                 display: *idx,
                 codec: st.codec,
+                encoded_width: st.encoded_width,
+                encoded_height: st.encoded_height,
+                capture_to_encoded_ms: st.capture_to_encoded_ms,
+                encode_ms: st.encode_ms,
+                keyframes: st.keyframes,
+                frames_skipped_idle: st.idle_refreshes,
                 fps: st.fps,
                 bitrate_kbps: st.bitrate_kbps,
                 width: st.encoded_width,
@@ -1721,6 +1908,9 @@ impl Session {
     }
 
     async fn teardown(&mut self) {
+        if let Some(stop) = self.cursor_stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
         if let Some(h) = self.input.lock().as_mut() {
             h.release_all();
         }

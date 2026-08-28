@@ -404,8 +404,9 @@ impl VtEncoder {
             )
         };
         self.set_i32(avg_key, bps, true)?;
-        // Hard cap: 125 % of the average over a one second window.
-        let bytes_per_second = (f64::from(bps) / 8.0 * 1.25).round();
+        // VBR with a cap: the average is the target, bursts may reach 150 % of it over a one
+        // second window (keyframes / big changes), static content sits far below.
+        let bytes_per_second = (f64::from(bps) / 8.0 * 1.5).round();
         let limits = CFArray::from_retained_objects(&[
             CFNumber::new_f64(bytes_per_second),
             CFNumber::new_f64(1.0),
@@ -424,14 +425,17 @@ impl VtEncoder {
                 true,
                 false,
             )?;
+            // Infinite GOP: keyframes only when the pipeline forces one (session start,
+            // display/size switch, PLI/FIR). Periodic keyframes at 5K cost more than
+            // everything else combined; `0` duration = no time limit.
             self.set_i32(
                 kVTCompressionPropertyKey_MaxKeyFrameInterval,
-                (fps * 2) as i32,
+                i32::MAX,
                 false,
             )?;
             self.set_f64(
                 kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
-                2.0,
+                0.0,
                 false,
             )?;
             self.set_f64(
@@ -746,7 +750,9 @@ pub fn create(cfg: &EncoderConfig) -> Result<Box<dyn Encoder>> {
     let source_attrs: CFRetained<CFDictionary<CFString, CFType>> =
         CFDictionary::from_slices(&[fmt_key, w_key, h_key], &[&fmt, &w, &h]);
 
-    let output = fit_size(cfg.width, cfg.height, max_output_size(cfg.codec));
+    // Viewport cap first (browser tile size), then the hardware limit of the codec.
+    let (tw, th) = cfg.target_size();
+    let output = fit_size(tw, th, max_output_size(cfg.codec));
     if output != (cfg.width, cfg.height) {
         tracing::info!(
             codec = ?cfg.codec,
@@ -896,6 +902,7 @@ mod tests {
             height: 360,
             fps: 30,
             bitrate_kbps: 2000,
+            max_output: None,
         };
         let mut enc = create(&cfg).expect("create encoder");
         assert!(enc.is_hardware());
@@ -961,6 +968,7 @@ mod tests {
             height: 2160,
             fps: 30,
             bitrate_kbps: 8000,
+            max_output: None,
         };
         let mut enc = create(&cfg).expect("create 5K H264 encoder");
         let mut frames = Vec::new();
@@ -1014,6 +1022,7 @@ mod tests {
                 height: h,
                 fps: 30,
                 bitrate_kbps: 8000,
+                max_output: None,
             };
             let mut enc = create(&cfg).expect("encoder");
             let mut frames = Vec::new();

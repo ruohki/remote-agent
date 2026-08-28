@@ -41,6 +41,27 @@ pub struct EncoderConfig {
     pub height: u32,
     pub fps: u32,
     pub bitrate_kbps: u32,
+    pub max_output: Option<(u32, u32)>,
+}
+
+impl EncoderConfig {
+    pub fn target_size(&self) -> (u32, u32) {
+        match self.max_output {
+            Some(max) => fit_within(self.width, self.height, max),
+            None => (self.width, self.height),
+        }
+    }
+}
+
+pub fn fit_within(width: u32, height: u32, max: (u32, u32)) -> (u32, u32) {
+    let (max_w, max_h) = (max.0.max(2), max.1.max(2));
+    if width <= max_w && height <= max_h {
+        return (width & !1, height & !1);
+    }
+    let scale = (max_w as f64 / width as f64).min(max_h as f64 / height as f64);
+    let w = ((width as f64 * scale).floor() as u32).max(2) & !1;
+    let h = ((height as f64 * scale).floor() as u32).max(2) & !1;
+    (w, h)
 }
 
 pub struct EncodedFrame {
@@ -143,6 +164,7 @@ fn config() -> EncoderConfig {
         height: H,
         fps: 30,
         bitrate_kbps: 2000,
+        max_output: None,
     }
 }
 

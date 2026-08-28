@@ -92,6 +92,8 @@ pub struct FakeEncoder {
     codec: VideoCodec,
     started: Option<Instant>,
     counter: u64,
+    /// Encoded size after the viewport cap (`EncoderConfig::target_size`).
+    output: (u32, u32),
 }
 
 fn annexb(nals: &[&[u8]]) -> Bytes {
@@ -136,6 +138,40 @@ impl Encoder for FakeEncoder {
     fn is_hardware(&self) -> bool {
         false
     }
+
+    fn output_size(&self) -> Option<(u32, u32)> {
+        Some(self.output)
+    }
+}
+
+/// Emits a moving cursor position every 50 ms (and one shape first).
+pub struct FakeCursorSource {
+    tick: u32,
+}
+
+impl remote_agent::cursor::CursorSource for FakeCursorSource {
+    fn next(&mut self, _timeout: Duration) -> Option<remote_agent::cursor::CursorUpdate> {
+        std::thread::sleep(Duration::from_millis(50));
+        self.tick += 1;
+        if self.tick == 1 {
+            let png = remote_agent::branding::encode_png(&remote_agent::branding::Rgba::new(8, 8));
+            return Some(remote_agent::cursor::CursorUpdate::Shape {
+                id: 7,
+                png,
+                hotspot_x: 1,
+                hotspot_y: 1,
+                width: 8,
+                height: 8,
+            });
+        }
+        Some(remote_agent::cursor::CursorUpdate::Position {
+            display: 0,
+            x: (self.tick * 3) as i32,
+            y: (self.tick * 2) as i32,
+            shape_id: 7,
+            visible: true,
+        })
+    }
 }
 
 /// Emits a 440 Hz sine at 48 kHz stereo in 10 ms blocks.
@@ -173,6 +209,8 @@ pub struct FakeMedia {
     pub displays: Vec<DisplayInfo>,
     pub fps: u32,
     pub audio: bool,
+    /// Provide a fake cursor source (client-side cursor path).
+    pub cursor: bool,
 }
 
 impl Default for FakeMedia {
@@ -182,6 +220,7 @@ impl Default for FakeMedia {
             displays: test_displays(),
             fps: 30,
             audio: true,
+            cursor: false,
         }
     }
 }
@@ -214,7 +253,14 @@ impl MediaFactory for FakeMedia {
             codec: cfg.codec,
             started: None,
             counter: 0,
+            output: cfg.target_size(),
         }))
+    }
+
+    fn create_cursor_source(&self) -> Option<Box<dyn remote_agent::cursor::CursorSource>> {
+        self.cursor.then(|| {
+            Box::new(FakeCursorSource { tick: 0 }) as Box<dyn remote_agent::cursor::CursorSource>
+        })
     }
 
     fn audio_available(&self) -> bool {

@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
 pub mod macos;
+pub mod synthetic;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
@@ -77,6 +78,10 @@ pub fn list_displays() -> Result<Vec<DisplayInfo>> {
 }
 
 pub fn create_capturer(cfg: &CaptureConfig) -> Result<Box<dyn Capturer>> {
+    if synthetic::enabled() {
+        tracing::info!(scenario = ?synthetic::Scenario::from_env(), "using the synthetic capture source");
+        return Ok(Box::new(synthetic::SyntheticCapturer::new(cfg)));
+    }
     #[cfg(target_os = "macos")]
     {
         macos::create(cfg)

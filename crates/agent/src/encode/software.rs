@@ -147,6 +147,45 @@ pub fn rgb_to_uv(r: u8, g: u8, b: u8) -> (u8, u8) {
     (u.clamp(16, 240) as u8, v.clamp(16, 240) as u8)
 }
 
+/// Box-filter downscale of a BGRA picture (integer accumulation per destination pixel).
+pub fn downscale_bgra(
+    src: &[u8],
+    stride: usize,
+    sw: usize,
+    sh: usize,
+    dw: usize,
+    dh: usize,
+    dst: &mut Vec<u8>,
+) {
+    dst.clear();
+    dst.resize(dw * dh * 4, 0);
+    for dy in 0..dh {
+        let y0 = dy * sh / dh;
+        let y1 = ((dy + 1) * sh / dh).max(y0 + 1).min(sh);
+        for dx in 0..dw {
+            let x0 = dx * sw / dw;
+            let x1 = ((dx + 1) * sw / dw).max(x0 + 1).min(sw);
+            let mut acc = [0u32; 4];
+            let mut n = 0u32;
+            for y in y0..y1 {
+                let row = &src[y * stride..];
+                for x in x0..x1 {
+                    let p = &row[x * 4..x * 4 + 4];
+                    acc[0] += p[0] as u32;
+                    acc[1] += p[1] as u32;
+                    acc[2] += p[2] as u32;
+                    acc[3] += p[3] as u32;
+                    n += 1;
+                }
+            }
+            let o = (dy * dw + dx) * 4;
+            for c in 0..4 {
+                dst[o + c] = (acc[c] / n.max(1)) as u8;
+            }
+        }
+    }
+}
+
 fn build_config(cfg: &EncoderConfig) -> H264Config {
     let fps = cfg.fps.max(1);
     H264Config::new()
@@ -157,7 +196,8 @@ fn build_config(cfg: &EncoderConfig) -> H264Config {
         ))
         .max_frame_rate(FrameRate::from_hz(fps as f32))
         .skip_frames(false)
-        .intra_frame_period(IntraFramePeriod::from_num_frames(fps * 2))
+        // Infinite GOP: keyframes only on demand (`force_intra_frame`).
+        .intra_frame_period(IntraFramePeriod::from_num_frames(0))
         .profile(Profile::Main)
         .scene_change_detect(true)
         // Not supported by OpenH264 for screen content (it would warn and disable them).
@@ -170,6 +210,10 @@ fn build_config(cfg: &EncoderConfig) -> H264Config {
 pub struct OpenH264Encoder {
     encoder: H264Encoder,
     cfg: EncoderConfig,
+    /// Encoded picture size (≤ source when `max_output` is set).
+    output: (u32, u32),
+    /// Scratch buffer for the downscaled BGRA picture.
+    scaled: Vec<u8>,
     yuv: I420Buffer,
     started: Option<Instant>,
     frames: u64,
@@ -181,12 +225,19 @@ impl OpenH264Encoder {
             return Err(anyhow!("frame size {}x{} too small", cfg.width, cfg.height));
         }
         let api = OpenH264API::from_source();
-        let encoder = H264Encoder::with_api_config(api, build_config(cfg))
+        let (ow, oh) = cfg.target_size();
+        let (ow, oh) = (ow.max(16), oh.max(16));
+        let mut enc_cfg = cfg.clone();
+        enc_cfg.width = ow;
+        enc_cfg.height = oh;
+        let encoder = H264Encoder::with_api_config(api, build_config(&enc_cfg))
             .map_err(|e| anyhow!("creating OpenH264 encoder: {e}"))?;
         Ok(Self {
             encoder,
             cfg: cfg.clone(),
-            yuv: I420Buffer::new(cfg.width as usize, cfg.height as usize),
+            output: (ow, oh),
+            scaled: Vec::new(),
+            yuv: I420Buffer::new(ow as usize, oh as usize),
             started: None,
             frames: 0,
         })
@@ -208,7 +259,13 @@ impl Encoder for OpenH264Encoder {
                 bgra.len()
             ));
         }
-        self.yuv.fill_from_bgra(&bgra, stride, w, h);
+        let (ow, oh) = (self.output.0 as usize, self.output.1 as usize);
+        if (ow, oh) != (w, h) {
+            downscale_bgra(&bgra, stride, w, h, ow, oh, &mut self.scaled);
+            self.yuv.fill_from_bgra(&self.scaled, ow * 4, ow, oh);
+        } else {
+            self.yuv.fill_from_bgra(&bgra, stride, w, h);
+        }
 
         if force_keyframe {
             self.encoder.force_intra_frame();
@@ -250,7 +307,10 @@ impl Encoder for OpenH264Encoder {
         if rc != 0 {
             tracing::warn!("OpenH264 live bitrate change failed ({rc}); re-creating encoder");
             let api = OpenH264API::from_source();
-            self.encoder = H264Encoder::with_api_config(api, build_config(&self.cfg))
+            let mut enc_cfg = self.cfg.clone();
+            enc_cfg.width = self.output.0;
+            enc_cfg.height = self.output.1;
+            self.encoder = H264Encoder::with_api_config(api, build_config(&enc_cfg))
                 .map_err(|e| anyhow!("re-creating OpenH264 encoder: {e}"))?;
         }
         Ok(())
@@ -262,6 +322,10 @@ impl Encoder for OpenH264Encoder {
 
     fn is_hardware(&self) -> bool {
         false
+    }
+
+    fn output_size(&self) -> Option<(u32, u32)> {
+        Some(self.output)
     }
 }
 

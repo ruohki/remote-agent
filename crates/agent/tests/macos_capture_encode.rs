@@ -41,6 +41,7 @@ fn macos_public_capture_encode_roundtrip() {
             height,
             fps: 30,
             bitrate_kbps: 6000,
+            max_output: None,
         })
         .expect("encoder");
         assert_eq!(

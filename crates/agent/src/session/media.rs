@@ -27,6 +27,11 @@ pub trait MediaFactory: Send + Sync + 'static {
     fn create_audio_source(&self) -> Result<Box<dyn AudioSource>> {
         anyhow::bail!("system audio capture is not available")
     }
+    /// Source of cursor shape/position updates for client-side cursor rendering; `None`
+    /// when the platform cannot provide one (the capture then keeps the system cursor).
+    fn create_cursor_source(&self) -> Option<Box<dyn crate::cursor::CursorSource>> {
+        None
+    }
 }
 
 /// The real thing: delegates to [`crate::capture`] and [`crate::encode`].
@@ -60,6 +65,10 @@ impl MediaFactory for SystemMedia {
 
     fn create_audio_source(&self) -> Result<Box<dyn AudioSource>> {
         crate::audio::create_source()
+    }
+
+    fn create_cursor_source(&self) -> Option<Box<dyn crate::cursor::CursorSource>> {
+        crate::cursor::create_source()
     }
 }
 
