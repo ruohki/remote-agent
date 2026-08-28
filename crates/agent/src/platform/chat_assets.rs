@@ -184,7 +184,14 @@ const HTML: &str = r#"<!doctype html>
   var lastFrom = null, lastRow = null, lastDay = null;
 
   function ipc(obj) {
-    try { window.__ipc(JSON.stringify(obj)); } catch (e) {}
+    var s = JSON.stringify(obj);
+    try {
+      if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.agent) {
+        window.webkit.messageHandlers.agent.postMessage(s);
+      } else if (window.__ipc) {
+        window.__ipc(s);
+      }
+    } catch (e) {}
   }
   function setOperator(name) {
     OPERATOR = name || OPERATOR;

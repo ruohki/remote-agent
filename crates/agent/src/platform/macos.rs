@@ -345,6 +345,19 @@ struct ChatDelegateIvars {
     on_disconnect: Arc<dyn Fn() + Send + Sync>,
     /// Set once the panel exists so `windowShouldClose:` can hide it.
     panel_addr: std::sync::atomic::AtomicUsize,
+    /// Set once the webview exists so the `ready` handshake can drive the page.
+    webview_addr: std::sync::atomic::AtomicUsize,
+    shared: Arc<ChatShared>,
+}
+
+/// State shared between the IPC delegate and the [`ChatHandle`]: the page is only driven
+/// after it reported `ready` (scripts evaluated before the HTML finished loading are lost),
+/// so lines are buffered and replayed on the handshake.
+#[derive(Default)]
+struct ChatShared {
+    ready: std::sync::atomic::AtomicBool,
+    /// JS snippets in transcript order (replayed verbatim on `ready`).
+    lines: parking_lot::Mutex<Vec<String>>,
 }
 
 define_class!(
@@ -375,7 +388,20 @@ define_class!(
             match serde_json::from_str::<IpcIn>(&json) {
                 Ok(IpcIn::Send { text }) => (self.ivars().on_send)(text),
                 Ok(IpcIn::Disconnect) => (self.ivars().on_disconnect)(),
-                Ok(IpcIn::Ready) => {}
+                Ok(IpcIn::Ready) => {
+                    let iv = self.ivars();
+                    iv.shared.ready.store(true, Ordering::SeqCst);
+                    let wv = iv.webview_addr.load(Ordering::SeqCst);
+                    if wv != 0 {
+                        let mut js = String::from(
+                            "window.__agent&&(window.__agent.setConnected(true),window.__agent.setStatus('Connected'));",
+                        );
+                        for line in iv.shared.lines.lock().iter() {
+                            js.push_str(line);
+                        }
+                        eval_js(wv, js);
+                    }
+                }
                 Err(e) => tracing::debug!("chat IPC parse error: {e}"),
             }
         }
@@ -402,11 +428,14 @@ impl ChatDelegate {
         mtm: MainThreadMarker,
         on_send: Arc<dyn Fn(String) + Send + Sync>,
         on_disconnect: Arc<dyn Fn() + Send + Sync>,
+        shared: Arc<ChatShared>,
     ) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(ChatDelegateIvars {
             on_send,
             on_disconnect,
             panel_addr: std::sync::atomic::AtomicUsize::new(0),
+            webview_addr: std::sync::atomic::AtomicUsize::new(0),
+            shared,
         });
         // SAFETY: plain NSObject init.
         unsafe { msg_send![super(this), init] }
@@ -426,6 +455,7 @@ struct ChatWebHandle {
     panel_addr: usize,
     webview_addr: usize,
     delegate_addr: usize,
+    shared: Arc<ChatShared>,
 }
 
 // SAFETY: addresses are only reconstituted on the main queue.
@@ -441,7 +471,10 @@ impl ChatHandle for ChatWebHandle {
         // Build the JS call with a JSON payload so text is always safely escaped.
         let payload = serde_json::json!({ "from": from, "text": line.text, "ts_ms": line.ts_ms });
         let js = format!("window.__agent&&window.__agent.push({payload});");
-        eval_js(self.webview_addr, js);
+        self.shared.lines.lock().push(js.clone());
+        if self.shared.ready.load(Ordering::SeqCst) {
+            eval_js(self.webview_addr, js);
+        }
         let show = matches!(line.from, ChatParty::Operator);
         if show {
             self.set_visible(true);
@@ -505,7 +538,7 @@ pub fn open_chat(
     let operator = operator.to_owned();
     let (tx, rx) = mpsc::channel();
     run_on_main(move || {
-        let result = (|| -> Result<(usize, usize, usize)> {
+        let result = (|| -> Result<(usize, usize, usize, Arc<ChatShared>)> {
             let mtm = MainThreadMarker::new().context("not on main thread")?;
             let width = 380.0;
             let height = 460.0;
@@ -546,7 +579,8 @@ pub fn open_chat(
                 panel.setSharingType(NSWindowSharingType::None);
             }
 
-            let delegate = ChatDelegate::new(mtm, on_send, on_disconnect);
+            let shared = Arc::new(ChatShared::default());
+            let delegate = ChatDelegate::new(mtm, on_send, on_disconnect, Arc::clone(&shared));
 
             // WKWebView configuration + "agent" message handler.
             let config = unsafe { WKWebViewConfiguration::new(mtm) };
@@ -591,19 +625,25 @@ pub fn open_chat(
             panel.orderFrontRegardless();
 
             let webview_addr = Retained::into_raw(webview) as usize;
+            delegate
+                .ivars()
+                .webview_addr
+                .store(webview_addr, Ordering::SeqCst);
             let panel_addr = Retained::into_raw(panel) as usize;
             let delegate_addr = Retained::into_raw(delegate) as usize;
             // Let the menu-bar item re-open this window and disconnect the session.
             set_menu_chat(panel_addr);
-            Ok((panel_addr, webview_addr, delegate_addr))
+            Ok((panel_addr, webview_addr, delegate_addr, shared))
         })();
         let _ = tx.send(result);
     })?;
-    let (panel_addr, webview_addr, delegate_addr) = rx.recv().context("chat task dropped")??;
+    let (panel_addr, webview_addr, delegate_addr, shared) =
+        rx.recv().context("chat task dropped")??;
     Ok(Box::new(ChatWebHandle {
         panel_addr,
         webview_addr,
         delegate_addr,
+        shared,
     }))
 }
 
