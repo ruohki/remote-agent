@@ -12,4 +12,4 @@ export type LocalOverrides = {
  * `Some(HelpMe)` forces approval even when the console says unattended (`Some(Unattended)`
  * is ignored — it cannot loosen policy).
  */
-mode?: DeviceMode, allow_input?: boolean, allow_audio?: boolean, allow_clipboard?: boolean, allow_file_transfer?: boolean, };
+mode?: DeviceMode, allow_input?: boolean, allow_audio?: boolean, allow_clipboard?: boolean, allow_file_transfer?: boolean, allow_annotations?: boolean, };

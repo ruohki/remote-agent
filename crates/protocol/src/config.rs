@@ -38,6 +38,10 @@ pub struct AgentConfig {
     /// Whether system audio may be streamed to the operator.
     #[serde(default = "default_true")]
     pub allow_audio: bool,
+    /// Whether operators may draw guidance annotations on the device screen (independent of
+    /// `allow_input`, so guidance works while control is disabled or paused).
+    #[serde(default = "default_true")]
+    pub allow_annotations: bool,
 }
 
 fn default_true() -> bool {
@@ -64,6 +68,7 @@ impl Default for AgentConfig {
             allow_file_transfer: true,
             transfer_dir: None,
             allow_audio: true,
+            allow_annotations: true,
         }
     }
 }
@@ -92,6 +97,9 @@ pub struct LocalOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub allow_file_transfer: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub allow_annotations: Option<bool>,
 }
 
 impl LocalOverrides {
@@ -115,6 +123,9 @@ impl LocalOverrides {
         }
         if self.allow_file_transfer == Some(false) {
             cfg.allow_file_transfer = false;
+        }
+        if self.allow_annotations == Some(false) {
+            cfg.allow_annotations = false;
         }
         cfg
     }

@@ -165,4 +165,31 @@ pub enum ControlMessage {
     ControlPaused {
         paused: bool,
     },
+    // ── screen annotations (browser → agent; independent of input permission) ─────
+    /// Start or continue a freehand stroke. `points` are physical pixels of `display`,
+    /// appended in order; the first message for an `id` starts the stroke.
+    AnnotateStroke {
+        id: u32,
+        display: u32,
+        color: String,
+        /// Width in physical pixels.
+        width: f32,
+        points: Vec<(f32, f32)>,
+    },
+    /// The stroke is complete (fade-out timer starts on the device).
+    AnnotateEnd {
+        id: u32,
+    },
+    /// Laser pointer position (physical pixels of `display`); `None` hides it.
+    AnnotatePointer {
+        display: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        point: Option<(f32, f32)>,
+        color: String,
+    },
+    /// Remove all annotations (all displays).
+    AnnotateClear,
+    /// Agent → browser: annotations are not allowed on this device (policy or local override).
+    AnnotationsDisabled,
 }

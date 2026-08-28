@@ -56,4 +56,9 @@ transfer_dir?: string,
 /**
  * Whether system audio may be streamed to the operator.
  */
-allow_audio: boolean, };
+allow_audio: boolean, 
+/**
+ * Whether operators may draw guidance annotations on the device screen (independent of
+ * `allow_input`, so guidance works while control is disabled or paused).
+ */
+allow_annotations: boolean, };

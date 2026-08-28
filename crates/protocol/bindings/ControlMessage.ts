@@ -28,4 +28,8 @@ names: Array<string>, total_bytes: bigint, } | { "t": "clipboard_changed", text:
 /**
  * Capture→encode→send latency estimate in milliseconds.
  */
-pipeline_ms: number, hardware: boolean, } | { "t": "session_ended_by_user" } | { "t": "observer_joined", name: string, } | { "t": "observer_left", name: string, } | { "t": "control_paused", paused: boolean, };
+pipeline_ms: number, hardware: boolean, } | { "t": "session_ended_by_user" } | { "t": "observer_joined", name: string, } | { "t": "observer_left", name: string, } | { "t": "control_paused", paused: boolean, } | { "t": "annotate_stroke", id: number, display: number, color: string, 
+/**
+ * Width in physical pixels.
+ */
+width: number, points: Array<[number, number]>, } | { "t": "annotate_end", id: number, } | { "t": "annotate_pointer", display: number, point?: [number, number], color: string, } | { "t": "annotate_clear" } | { "t": "annotations_disabled" };
