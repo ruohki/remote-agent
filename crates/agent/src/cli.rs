@@ -136,8 +136,16 @@ fn init_logging(filter: &str, paths: &crate::config::Paths) {
     let stderr_layer = fmt::layer().with_target(false).with_writer(std::io::stderr);
 
     // Also log to a rolling file inside the config dir when we can create it.
-    if let Ok(()) = std::fs::create_dir_all(paths.log_dir()) {
-        let appender = tracing_appender::rolling::daily(paths.log_dir(), "remote-agent.log");
+    let appender = std::fs::create_dir_all(paths.log_dir()).ok().and_then(|_| {
+        tracing_appender::rolling::RollingFileAppender::builder()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix("remote-agent")
+            .filename_suffix("log")
+            .max_log_files(14)
+            .build(paths.log_dir())
+            .ok()
+    });
+    if let Some(appender) = appender {
         let file_layer = fmt::layer()
             .with_ansi(false)
             .with_target(false)

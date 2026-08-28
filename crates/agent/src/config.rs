@@ -24,7 +24,23 @@ impl Paths {
     pub fn resolve(override_dir: Option<PathBuf>) -> Result<Self> {
         let dir = match override_dir {
             Some(d) => d,
-            None => default_dir(),
+            None => {
+                // Services run as root/SYSTEM and use the machine-wide directory; an
+                // interactive launch by a normal user (double-clicked app bundle) must
+                // never fail on permissions, so fall back to the per-user directory.
+                let system = default_dir();
+                if dir_is_writable(&system) {
+                    system
+                } else {
+                    let user = user_dir().unwrap_or_else(|| system.clone());
+                    tracing::debug!(
+                        "{} is not writable; using {}",
+                        system.display(),
+                        user.display()
+                    );
+                    user
+                }
+            }
         };
         Ok(Self { dir })
     }
@@ -35,6 +51,41 @@ impl Paths {
 
     pub fn log_dir(&self) -> PathBuf {
         self.dir.join("logs")
+    }
+}
+
+/// Whether `dir` exists (or can be created) and files can be written into it.
+fn dir_is_writable(dir: &Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(format!(".write-probe-{}", std::process::id()));
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Per-user state directory used when the machine-wide one is not writable.
+fn user_dir() -> Option<PathBuf> {
+    let base = directories::BaseDirs::new()?;
+    #[cfg(target_os = "macos")]
+    {
+        Some(
+            base.home_dir()
+                .join("Library/Application Support/RemoteAgent"),
+        )
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Some(base.data_local_dir().join("RemoteAgent"))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Some(base.config_dir().join("remote-agent"))
     }
 }
 
