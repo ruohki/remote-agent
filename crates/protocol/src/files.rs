@@ -40,8 +40,39 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+/// How the payload of a version-2 chunk frame is encoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum ChunkCodec {
+    Raw,
+    /// Per-chunk raw DEFLATE stream (RFC 1951, no zlib/gzip wrapper).
+    Deflate,
+}
+
+impl ChunkCodec {
+    pub fn byte(self) -> u8 {
+        match self {
+            ChunkCodec::Raw => 0,
+            ChunkCodec::Deflate => 1,
+        }
+    }
+    pub fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(ChunkCodec::Raw),
+            1 => Some(ChunkCodec::Deflate),
+            _ => None,
+        }
+    }
+}
+
 /// Bytes of the binary chunk header (`u8` version + `u32` id + `u64` offset, little-endian).
 pub const CHUNK_HEADER_LEN: usize = 13;
+/// Bytes of the version-2 header: `[2][codec: u8][transfer_id: u32][offset: u64]`.
+pub const CHUNK_HEADER_V2_LEN: usize = 14;
+/// Version byte of frames that carry a codec byte (only sent to receivers that advertised
+/// codecs in `accept`).
+pub const CHUNK_VERSION_V2: u8 = 2;
 /// Header version currently emitted.
 pub const CHUNK_VERSION: u8 = 1;
 /// Maximum *payload* bytes per binary frame. Header + payload never exceeds 64 KiB (65,536
@@ -126,6 +157,11 @@ pub enum FileMessage {
         transfer_id: u32,
         /// Bytes the receiver already has (resume point).
         offset: u64,
+        /// Chunk codecs the receiver can decode. The sender may compress chunks with any of
+        /// them (version-2 frames); absent or empty means raw version-1 frames only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        codecs: Option<Vec<ChunkCodec>>,
     },
     Reject {
         transfer_id: u32,
@@ -212,7 +248,7 @@ pub fn encode_chunk_header(transfer_id: u32, offset: u64, buf: &mut [u8]) {
     buf[5..13].copy_from_slice(&offset.to_le_bytes());
 }
 
-/// Decode a chunk frame into `(transfer_id, offset, payload)`.
+/// Decode a version-1 chunk frame into `(transfer_id, offset, payload)`.
 pub fn decode_chunk(frame: &[u8]) -> Option<(u32, u64, &[u8])> {
     if frame.len() < CHUNK_HEADER_LEN || frame[0] != CHUNK_VERSION {
         return None;
@@ -222,9 +258,71 @@ pub fn decode_chunk(frame: &[u8]) -> Option<(u32, u64, &[u8])> {
     Some((id, offset, &frame[CHUNK_HEADER_LEN..]))
 }
 
+/// A decoded chunk frame of either version. `payload` is still encoded per `codec`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ChunkFrame<'a> {
+    pub transfer_id: u32,
+    pub offset: u64,
+    pub codec: ChunkCodec,
+    pub payload: &'a [u8],
+}
+
+/// Decode a version-1 or version-2 chunk frame.
+pub fn decode_chunk_any(frame: &[u8]) -> Option<ChunkFrame<'_>> {
+    match frame.first()? {
+        &CHUNK_VERSION => decode_chunk(frame).map(|(transfer_id, offset, payload)| ChunkFrame {
+            transfer_id,
+            offset,
+            codec: ChunkCodec::Raw,
+            payload,
+        }),
+        &CHUNK_VERSION_V2 => {
+            if frame.len() < CHUNK_HEADER_V2_LEN {
+                return None;
+            }
+            let codec = ChunkCodec::from_byte(frame[1])?;
+            let transfer_id = u32::from_le_bytes(frame[2..6].try_into().ok()?);
+            let offset = u64::from_le_bytes(frame[6..14].try_into().ok()?);
+            Some(ChunkFrame {
+                transfer_id,
+                offset,
+                codec,
+                payload: &frame[CHUNK_HEADER_V2_LEN..],
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Encode a version-2 header. `buf` must have room for [`CHUNK_HEADER_V2_LEN`] bytes.
+pub fn encode_chunk_header_v2(transfer_id: u32, offset: u64, codec: ChunkCodec, buf: &mut [u8]) {
+    buf[0] = CHUNK_VERSION_V2;
+    buf[1] = codec.byte();
+    buf[2..6].copy_from_slice(&transfer_id.to_le_bytes());
+    buf[6..14].copy_from_slice(&offset.to_le_bytes());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v2_frames_carry_a_codec_and_v1_frames_are_raw() {
+        let mut v2 = vec![0u8; CHUNK_HEADER_V2_LEN + 2];
+        encode_chunk_header_v2(9, 512, ChunkCodec::Deflate, &mut v2);
+        v2[CHUNK_HEADER_V2_LEN..].copy_from_slice(b"zz");
+        let f = decode_chunk_any(&v2).unwrap();
+        assert_eq!(
+            (f.transfer_id, f.offset, f.codec, f.payload),
+            (9, 512, ChunkCodec::Deflate, &b"zz"[..])
+        );
+        let mut v1 = vec![0u8; CHUNK_HEADER_LEN + 1];
+        encode_chunk_header(3, 4, &mut v1);
+        v1[CHUNK_HEADER_LEN] = 7;
+        let f = decode_chunk_any(&v1).unwrap();
+        assert_eq!((f.transfer_id, f.offset, f.codec), (3, 4, ChunkCodec::Raw));
+        assert!(decode_chunk_any(&[2u8, 9, 0, 0]).is_none());
+    }
 
     #[test]
     fn chunk_header_roundtrip() {

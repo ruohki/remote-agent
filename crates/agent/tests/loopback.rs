@@ -719,7 +719,8 @@ async fn file_upload_resumes_across_sessions() {
         accept,
         FileMessage::Accept {
             transfer_id: 1,
-            offset: 0
+            offset: 0,
+            codecs: None,
         }
     ));
     assert!(matches!(
@@ -957,6 +958,7 @@ async fn file_download_with_resume_and_browser_ops() {
     h.files(&FileMessage::Accept {
         transfer_id: 7,
         offset: resume,
+        codecs: None,
     })
     .await;
     let complete = next_files_msg(&mut h.files_rx, &mut chunks, |m| {
@@ -1058,6 +1060,7 @@ async fn clipboard_image_both_directions_and_chat() {
     h.files(&FileMessage::Accept {
         transfer_id,
         offset: 0,
+        codecs: None,
     })
     .await;
     let complete = next_files_msg(&mut h.files_rx, &mut chunks, |m| {

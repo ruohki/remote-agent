@@ -366,6 +366,7 @@ impl TransferManager {
                         self.send(FileMessage::Accept {
                             transfer_id,
                             offset,
+                            codecs: None,
                         })
                         .await;
                     }
@@ -381,6 +382,7 @@ impl TransferManager {
             FileMessage::Accept {
                 transfer_id,
                 offset,
+                ..
             } => {
                 let size = self.outgoing.get(&transfer_id).map(|o| o.size);
                 match size {
@@ -1124,7 +1126,8 @@ mod tests {
             sink.msgs.lock().last(),
             Some(FileMessage::Accept {
                 transfer_id: 1,
-                offset: 0
+                offset: 0,
+                codecs: None,
             })
         ));
         let mut off = 0u64;
@@ -1291,6 +1294,7 @@ mod tests {
         m.handle_message(FileMessage::Accept {
             transfer_id: 11,
             offset: resume,
+            codecs: None,
         })
         .await;
         // Wait for the sender task.
