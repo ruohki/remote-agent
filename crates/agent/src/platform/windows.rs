@@ -289,13 +289,15 @@ use windows::Win32::System::Ole::CF_HDROP;
 use windows::Win32::UI::Controls::EM_SETSEL;
 use windows::Win32::UI::Shell::{DragQueryFileW, DROPFILES, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, PostMessageW, RegisterClassW,
-    SendMessageW, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage,
-    CW_USEDEFAULT, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, GWLP_USERDATA, HMENU, HWND_TOPMOST,
-    MSG, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WM_CLOSE, WM_COMMAND,
-    WM_DESTROY, WM_USER, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE, WS_VSCROLL,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageExtraInfo,
+    GetMessageW, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, PostMessageW,
+    RegisterClassW, SendMessageW, SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos,
+    SetWindowTextW, ShowWindow, TranslateMessage, CW_USEDEFAULT, ES_AUTOVSCROLL, ES_MULTILINE,
+    ES_READONLY, GWLP_USERDATA, HMENU, HWND_TOPMOST, MSG, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE,
+    SW_SHOWNOACTIVATE, WDA_EXCLUDEFROMCAPTURE, WINDOW_EX_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY,
+    WM_KEYFIRST, WM_KEYLAST, WM_MOUSEFIRST, WM_MOUSELAST, WM_USER, WNDCLASSW, WS_BORDER,
+    WS_CAPTION, WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE,
+    WS_VSCROLL,
 };
 
 const ID_SEND: usize = 1001;
@@ -315,6 +317,11 @@ struct ChatShared {
     input: Mutex<Option<isize>>,
 }
 
+/// Whether `msg` is a mouse or keyboard input message (for the injected-input guard).
+fn is_input_message(msg: u32) -> bool {
+    (WM_MOUSEFIRST..=WM_MOUSELAST).contains(&msg) || (WM_KEYFIRST..=WM_KEYLAST).contains(&msg)
+}
+
 unsafe extern "system" fn chat_wndproc(
     hwnd: HWND,
     msg: u32,
@@ -323,6 +330,13 @@ unsafe extern "system" fn chat_wndproc(
 ) -> LRESULT {
     // SAFETY: GWLP_USERDATA holds an `Arc<ChatShared>` pointer set at creation.
     let shared_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const ChatShared;
+    // Reject remote-injected input so the operator can never operate the chat window; the local
+    // user's real input carries no marker and passes through.
+    if is_input_message(msg)
+        && GetMessageExtraInfo().0 == crate::input::INJECTED_EVENT_MARKER as isize
+    {
+        return LRESULT(0);
+    }
     match msg {
         WM_COMMAND => {
             let id = (wparam.0 & 0xffff) as usize;
@@ -570,6 +584,9 @@ pub fn open_chat(
                         .input
                         .lock()
                         .unwrap_or_else(|e| e.into_inner()) = Some(input.0 as isize);
+                    // Exclude our window from screen capture (Win10 2004+ / DXGI duplication);
+                    // silently ignored on older builds.
+                    let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
                     let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                     Ok(())
                 })()

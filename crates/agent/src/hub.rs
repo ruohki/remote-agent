@@ -112,6 +112,18 @@ pub async fn run_agent(paths: Paths) -> Result<()> {
     };
     let sessions = SessionManager::new(deps);
 
+    // Menu-bar / tray item so the person at the device can always reach Open chat / Disconnect
+    // / Quit, and remote input can never operate our own windows. Only in an interactive loop.
+    if interactive {
+        crate::platform::install_input_guard();
+        let sessions_for_menu = Arc::clone(&sessions);
+        let status = format!("Remote support — connected to {}", local.server_url);
+        crate::platform::install_menu_bar(
+            &status,
+            Arc::new(move || sessions_for_menu.end_all(EndReason::DeviceUserClosed)),
+        );
+    }
+
     // Buffer of messages waiting for a live socket (bounded so we don't grow unbounded while
     // offline; signaling is time-sensitive so old entries are dropped).
     let pending: Arc<parking_lot::Mutex<std::collections::VecDeque<AgentToConsole>>> =

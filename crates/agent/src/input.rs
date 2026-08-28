@@ -14,6 +14,10 @@ use protocol::channel::{InputEvent, MouseButton};
 use protocol::common::DisplayInfo;
 use std::collections::{HashMap, HashSet};
 
+/// Marker stamped on every injected event so the agent's own windows can recognise and drop
+/// remote input (macOS: `kCGEventSourceUserData`; Windows: `dwExtraInfo`). "RMTINJ1".
+pub const INJECTED_EVENT_MARKER: i64 = 0x52_4d_54_49_4e_4a_31;
+
 /// Something that can apply input events (the real injector or a test double).
 pub trait InputHandler: Send {
     /// Display the operator is looking at, and the size of the encoded picture the browser's
@@ -261,6 +265,10 @@ impl Injector {
     pub fn new() -> Result<Self> {
         let settings = Settings {
             release_keys_when_dropped: true,
+            // Tag injected events so `platform` can drop remote input aimed at our own
+            // windows (the operator must never be able to click the chat/banner).
+            event_source_user_data: Some(INJECTED_EVENT_MARKER),
+            windows_dw_extra_info: Some(INJECTED_EVENT_MARKER as usize),
             ..Settings::default()
         };
         let enigo =
@@ -459,5 +467,14 @@ mod tests {
         assert_eq!(to_global(&d, (0, 0), 200, 0), (1440 + 100, -200));
         let d1 = DisplayInfo { scale: 0.0, ..d };
         assert_eq!(to_global(&d1, full, 10, 10), (1450, -190));
+    }
+
+    #[test]
+    fn injection_marker_is_stable_and_nonzero() {
+        // Both platform fields carry it: our own windows drop events whose marker matches
+        // (macOS EVENT_SOURCE_USER_DATA / Windows dwExtraInfo). It must never be 0 (the default
+        // for real user input) so local input is never mistaken for injected input.
+        assert_ne!(INJECTED_EVENT_MARKER, 0);
+        assert_eq!(INJECTED_EVENT_MARKER as usize as i64, INJECTED_EVENT_MARKER);
     }
 }

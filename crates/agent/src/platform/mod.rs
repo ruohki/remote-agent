@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+pub mod chat_assets;
 #[cfg(target_os = "macos")]
 pub mod macos;
 #[cfg(target_os = "windows")]
@@ -131,6 +132,29 @@ pub fn open_chat(
     {
         let _ = (operator, on_send, on_disconnect);
         anyhow::bail!("chat window is not supported on this platform")
+    }
+}
+
+/// Ensure remote-injected input cannot act on the agent's own windows (chat, banner). The
+/// operator must not be able to operate our UI; the local user keeps full control. No-op where
+/// unsupported. Idempotent.
+pub fn install_input_guard() {
+    #[cfg(target_os = "macos")]
+    {
+        macos::install_input_guard();
+    }
+}
+
+/// Install the always-present menu-bar / tray item exposing *Open chat*, *Disconnect* and
+/// *Quit*, so the person at the device can always reach these even after closing the chat.
+pub fn install_menu_bar(status_text: &str, on_disconnect: Arc<dyn Fn() + Send + Sync>) {
+    #[cfg(target_os = "macos")]
+    {
+        macos::install_menu_bar(status_text, on_disconnect);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (status_text, on_disconnect);
     }
 }
 

@@ -10,7 +10,7 @@ use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThr
 use objc2_app_kit::{
     NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSApplication, NSApplicationActivationPolicy,
     NSBackingStoreType, NSButton, NSPanel, NSScreen, NSStatusWindowLevel, NSTextField, NSWindow,
-    NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSWindowCollectionBehavior, NSWindowSharingType, NSWindowStyleMask,
 };
 use objc2_core_graphics::{CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess};
 use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
@@ -268,6 +268,10 @@ pub fn show_indicator(
             panel.setHidesOnDeactivate(false);
             // SAFETY: the panel is retained by us and released explicitly on close.
             unsafe { panel.setReleasedWhenClosed(false) };
+            // Keep the banner out of the screen capture the operator sees.
+            if std::env::var_os("REMOTE_AGENT_SHOW_WINDOWS").is_none() {
+                panel.setSharingType(NSWindowSharingType::None);
+            }
 
             let target = IndicatorTarget::new(mtm, on_disconnect);
             let label = NSTextField::labelWithString(
@@ -319,110 +323,129 @@ struct Banner {
     target: Retained<IndicatorTarget>,
 }
 
-// ─── chat window ────────────────────────────────────────────────────────────────────────
+// ─── chat window: a WKWebView hosting the messaging UI (see chat_assets.rs) ───────────────
+//
+// The window is an `NSPanel` whose content view is a `WKWebView`. IPC: JS posts to a
+// `WKScriptMessageHandler` named "agent"; Rust drives the page with `evaluateJavaScript`.
+// Closing the window HIDES it (the session keeps running); the local user re-opens it from the
+// menu-bar item or the banner. Remote-injected events are dropped app-wide by `install_input_guard`.
 
 use crate::chat::{ChatHandle, ChatLine};
-use objc2_app_kit::{NSControl, NSScrollView, NSTextView, NSView};
-use objc2_foundation::NSRange;
+use crate::platform::chat_assets::chat_html;
+use block2::RcBlock;
+use objc2_app_kit::{NSView, NSWindowDelegate};
+use objc2_web_kit::{
+    WKScriptMessage, WKScriptMessageHandler, WKUserContentController, WKWebView,
+    WKWebViewConfiguration,
+};
 use protocol::channel::ChatParty;
 
-struct ChatIvars {
+struct ChatDelegateIvars {
     on_send: Arc<dyn Fn(String) + Send + Sync>,
     on_disconnect: Arc<dyn Fn() + Send + Sync>,
-    /// Address of the input `NSTextField` (owned by the panel's view hierarchy).
-    input_addr: std::sync::atomic::AtomicUsize,
+    /// Set once the panel exists so `windowShouldClose:` can hide it.
+    panel_addr: std::sync::atomic::AtomicUsize,
 }
 
 define_class!(
-    // SAFETY: NSObject has no subclassing requirements; the type does not implement Drop.
+    // SAFETY: NSObject subclass; no Drop; used only on the main thread.
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
-    #[name = "RemoteAgentChatTarget"]
-    #[ivars = ChatIvars]
-    struct ChatTarget;
+    #[name = "RemoteAgentChatDelegate"]
+    #[ivars = ChatDelegateIvars]
+    struct ChatDelegate;
 
-    impl ChatTarget {
-        #[unsafe(method(send:))]
-        fn send(&self, _sender: Option<&AnyObject>) {
-            let addr = self.ivars().input_addr.load(Ordering::SeqCst);
-            if addr == 0 {
-                return;
-            }
-            // SAFETY: the field is alive as long as the panel (which outlives the target).
-            let field: &NSTextField = unsafe { &*(addr as *const NSTextField) };
-            let text = field.stringValue().to_string();
-            if text.trim().is_empty() {
-                return;
-            }
-            field.setStringValue(&NSString::from_str(""));
-            (self.ivars().on_send)(text);
-        }
+    unsafe impl NSObjectProtocol for ChatDelegate {}
 
-        #[unsafe(method(disconnect:))]
-        fn disconnect(&self, _sender: Option<&AnyObject>) {
-            (self.ivars().on_disconnect)();
+    // JS → Rust bridge.
+    unsafe impl WKScriptMessageHandler for ChatDelegate {
+        #[unsafe(method(userContentController:didReceiveScriptMessage:))]
+        #[allow(non_snake_case)]
+        unsafe fn userContentController_didReceiveScriptMessage(
+            &self,
+            _ucc: &WKUserContentController,
+            message: &WKScriptMessage,
+        ) {
+            // The body is the JSON string we posted from JS.
+            let body = message.body();
+            let Some(s) = body.downcast_ref::<NSString>() else {
+                return;
+            };
+            let json = s.to_string();
+            match serde_json::from_str::<IpcIn>(&json) {
+                Ok(IpcIn::Send { text }) => (self.ivars().on_send)(text),
+                Ok(IpcIn::Disconnect) => (self.ivars().on_disconnect)(),
+                Ok(IpcIn::Ready) => {}
+                Err(e) => tracing::debug!("chat IPC parse error: {e}"),
+            }
         }
     }
 
-    unsafe impl NSObjectProtocol for ChatTarget {}
+    // Close button hides the window instead of ending the session.
+    unsafe impl NSWindowDelegate for ChatDelegate {
+        #[unsafe(method(windowShouldClose:))]
+        #[allow(non_snake_case)]
+        fn windowShouldClose(&self, _sender: &NSWindow) -> bool {
+            let addr = self.ivars().panel_addr.load(Ordering::SeqCst);
+            if addr != 0 {
+                // SAFETY: panel_addr is a live NSPanel while the delegate exists.
+                let panel: &NSPanel = unsafe { &*(addr as *const NSPanel) };
+                panel.orderOut(None);
+            }
+            false
+        }
+    }
 );
 
-impl ChatTarget {
+impl ChatDelegate {
     fn new(
         mtm: MainThreadMarker,
         on_send: Arc<dyn Fn(String) + Send + Sync>,
         on_disconnect: Arc<dyn Fn() + Send + Sync>,
     ) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(ChatIvars {
+        let this = Self::alloc(mtm).set_ivars(ChatDelegateIvars {
             on_send,
             on_disconnect,
-            input_addr: std::sync::atomic::AtomicUsize::new(0),
+            panel_addr: std::sync::atomic::AtomicUsize::new(0),
         });
-        // SAFETY: plain NSObject init on a freshly allocated instance.
+        // SAFETY: plain NSObject init.
         unsafe { msg_send![super(this), init] }
     }
 }
 
-/// Handle whose drop closes the chat panel on the main thread (see [`PanelHandle`]).
-struct ChatPanelHandle {
-    panel_addr: usize,
-    target_addr: usize,
-    transcript_addr: usize,
-    text: Arc<parking_lot::Mutex<String>>,
+#[derive(serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum IpcIn {
+    Ready,
+    Send { text: String },
+    Disconnect,
 }
 
-// SAFETY: the addresses are only converted back to `Retained` / references on the main queue.
-unsafe impl Send for ChatPanelHandle {}
-unsafe impl Sync for ChatPanelHandle {}
+/// Handle whose drop closes the chat panel on the main thread.
+struct ChatWebHandle {
+    panel_addr: usize,
+    webview_addr: usize,
+    delegate_addr: usize,
+}
 
-impl ChatHandle for ChatPanelHandle {
+// SAFETY: addresses are only reconstituted on the main queue.
+unsafe impl Send for ChatWebHandle {}
+unsafe impl Sync for ChatWebHandle {}
+
+impl ChatHandle for ChatWebHandle {
     fn push_line(&self, line: &ChatLine) {
-        let who = match line.from {
-            ChatParty::Operator => "Operator",
-            ChatParty::Device => "You",
+        let from = match line.from {
+            ChatParty::Operator => "operator",
+            ChatParty::Device => "device",
         };
-        let rendered = {
-            let mut t = self.text.lock();
-            if !t.is_empty() {
-                t.push('\n');
-            }
-            t.push_str(&format!("{who}: {}", line.text));
-            t.clone()
-        };
-        let transcript_addr = self.transcript_addr;
-        let panel_addr = self.panel_addr;
-        DispatchQueue::main().exec_async(move || {
-            // SAFETY: main thread; the views are alive while the panel is (we hold +1).
-            unsafe {
-                let tv: &NSTextView = &*(transcript_addr as *const NSTextView);
-                let s = NSString::from_str(&rendered);
-                tv.setString(&s);
-                let len = s.length();
-                tv.scrollRangeToVisible(NSRange::new(len, 0));
-                let panel: &NSPanel = &*(panel_addr as *const NSPanel);
-                panel.orderFrontRegardless();
-            }
-        });
+        // Build the JS call with a JSON payload so text is always safely escaped.
+        let payload = serde_json::json!({ "from": from, "text": line.text, "ts_ms": line.ts_ms });
+        let js = format!("window.__agent&&window.__agent.push({payload});");
+        eval_js(self.webview_addr, js);
+        let show = matches!(line.from, ChatParty::Operator);
+        if show {
+            self.set_visible(true);
+        }
     }
 
     fn set_visible(&self, visible: bool) {
@@ -441,40 +464,53 @@ impl ChatHandle for ChatPanelHandle {
     }
 }
 
-impl Drop for ChatPanelHandle {
+impl Drop for ChatWebHandle {
     fn drop(&mut self) {
-        let panel_addr = self.panel_addr;
-        let target_addr = self.target_addr;
+        let (panel_addr, webview_addr, delegate_addr) =
+            (self.panel_addr, self.webview_addr, self.delegate_addr);
+        clear_menu_chat();
         DispatchQueue::main().exec_async(move || {
-            // SAFETY: reclaims the +1 references created in `open_chat`; main thread; each
-            // address is turned back into a `Retained` exactly once.
+            // SAFETY: reclaims the +1 refs from `open_chat`; main thread; once each.
             unsafe {
                 if let Some(panel) = Retained::from_raw(panel_addr as *mut NSPanel) {
                     let window: &NSWindow = &panel;
+                    window.setDelegate(None);
                     window.close();
                 }
-                let _ = Retained::from_raw(target_addr as *mut ChatTarget);
+                let _ = Retained::from_raw(webview_addr as *mut WKWebView);
+                let _ = Retained::from_raw(delegate_addr as *mut ChatDelegate);
             }
         });
     }
 }
 
-/// Create the chat panel: transcript, input field, Send and Disconnect.
+/// Evaluate `js` in the webview on the main thread (fire and forget).
+fn eval_js(webview_addr: usize, js: String) {
+    DispatchQueue::main().exec_async(move || {
+        // SAFETY: main thread; the webview is alive while the handle exists.
+        unsafe {
+            let wv: &WKWebView = &*(webview_addr as *const WKWebView);
+            wv.evaluateJavaScript_completionHandler(&NSString::from_str(&js), None);
+        }
+    });
+}
+
+/// Create the chat panel with an embedded WKWebView.
 pub fn open_chat(
     operator: &str,
     on_send: Arc<dyn Fn(String) + Send + Sync>,
     on_disconnect: Arc<dyn Fn() + Send + Sync>,
 ) -> Result<Box<dyn ChatHandle>> {
+    install_input_guard();
     let operator = operator.to_owned();
     let (tx, rx) = mpsc::channel();
     run_on_main(move || {
         let result = (|| -> Result<(usize, usize, usize)> {
             let mtm = MainThreadMarker::new().context("not on main thread")?;
-            let width = 360.0;
-            let height = 300.0;
+            let width = 380.0;
+            let height = 460.0;
             let screen = NSScreen::mainScreen(mtm).context("no main screen")?;
             let visible = screen.visibleFrame();
-            // Below the session banner (which sits in the top-right corner).
             let origin = NSPoint::new(
                 visible.origin.x + visible.size.width - width - 12.0,
                 visible.origin.y + visible.size.height - height - 72.0,
@@ -482,6 +518,7 @@ pub fn open_chat(
             let frame = NSRect::new(origin, NSSize::new(width, height));
             let style = NSWindowStyleMask::Titled
                 | NSWindowStyleMask::Closable
+                | NSWindowStyleMask::Resizable
                 | NSWindowStyleMask::NonactivatingPanel
                 | NSWindowStyleMask::UtilityWindow;
             let panel: Retained<NSPanel> = NSPanel::initWithContentRect_styleMask_backing_defer(
@@ -491,107 +528,263 @@ pub fn open_chat(
                 NSBackingStoreType::Buffered,
                 false,
             );
-            panel.setTitle(&NSString::from_str(&format!("Chat with {operator}")));
-            panel.setLevel(NSStatusWindowLevel);
+            panel.setTitle(&NSString::from_str(&format!("{operator} — Remote support")));
+            // Floating: visible above normal windows but not maximally intrusive; the session
+            // scopes its lifetime, so it is only on top while a session is active.
+            panel.setLevel(objc2_app_kit::NSFloatingWindowLevel);
             panel.setCollectionBehavior(
                 NSWindowCollectionBehavior::CanJoinAllSpaces
                     | NSWindowCollectionBehavior::Stationary,
             );
             panel.setHidesOnDeactivate(false);
-            // SAFETY: the panel is retained by us and released explicitly on close.
+            panel.setMovableByWindowBackground(true);
+            // SAFETY: retained by us; released explicitly on close.
             unsafe { panel.setReleasedWhenClosed(false) };
+            // The operator must never SEE the chat window: exclude it from all screen capture.
+            // (Skippable only for local UI previews via REMOTE_AGENT_SHOW_WINDOWS.)
+            if std::env::var_os("REMOTE_AGENT_SHOW_WINDOWS").is_none() {
+                panel.setSharingType(NSWindowSharingType::None);
+            }
 
-            let target = ChatTarget::new(mtm, on_send, on_disconnect);
+            let delegate = ChatDelegate::new(mtm, on_send, on_disconnect);
 
-            // Transcript (read-only text view in a scroll view).
-            let scroll = NSScrollView::initWithFrame(
-                NSScrollView::alloc(mtm),
-                NSRect::new(
-                    NSPoint::new(8.0, 44.0),
-                    NSSize::new(width - 16.0, height - 52.0),
-                ),
-            );
-            scroll.setHasVerticalScroller(true);
-            let text_view = NSTextView::initWithFrame(
-                NSTextView::alloc(mtm),
-                NSRect::new(
-                    NSPoint::new(0.0, 0.0),
-                    NSSize::new(width - 16.0, height - 52.0),
-                ),
-            );
-            text_view.setEditable(false);
-            text_view.setString(&NSString::from_str(""));
-            let doc: &NSView = &text_view;
-            scroll.setDocumentView(Some(doc));
+            // WKWebView configuration + "agent" message handler.
+            let config = unsafe { WKWebViewConfiguration::new(mtm) };
+            let ucc = unsafe { config.userContentController() };
+            let handler = ProtocolObject::from_ref(&*delegate);
+            unsafe { ucc.addScriptMessageHandler_name(handler, &NSString::from_str("agent")) };
 
-            // Input field + buttons.
-            let input = NSTextField::textFieldWithString(&NSString::from_str(""), mtm);
-            input.setFrame(NSRect::new(
-                NSPoint::new(8.0, 8.0),
-                NSSize::new(width - 16.0 - 64.0 - 96.0 - 8.0, 28.0),
-            ));
-            input.setPlaceholderString(Some(&NSString::from_str("Type a message…")));
-            let control: &NSControl = &input;
-            // SAFETY: target is retained for the panel's lifetime; selector exists on the class.
+            let content_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, height));
+            let webview = unsafe {
+                WKWebView::initWithFrame_configuration(
+                    WKWebView::alloc(mtm),
+                    content_frame,
+                    &config,
+                )
+            };
+            // Wire window.__ipc → the "agent" handler.
+            let bootstrap =
+                "window.__ipc=function(s){window.webkit.messageHandlers.agent.postMessage(s);};";
             unsafe {
-                control.setTarget(Some(&target));
-                control.setAction(Some(sel!(send:)));
+                webview.evaluateJavaScript_completionHandler(&NSString::from_str(bootstrap), None);
             }
-            target
-                .ivars()
-                .input_addr
-                .store(Retained::as_ptr(&input) as usize, Ordering::SeqCst);
+            webview.setAutoresizingMask(
+                objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable
+                    | objc2_app_kit::NSAutoresizingMaskOptions::ViewHeightSizable,
+            );
+            let html = chat_html(&operator);
+            unsafe { webview.loadHTMLString_baseURL(&NSString::from_str(&html), None) };
 
-            // SAFETY: see above.
-            let send = unsafe {
-                NSButton::buttonWithTitle_target_action(
-                    &NSString::from_str("Send"),
-                    Some(&target),
-                    Some(sel!(send:)),
-                    mtm,
-                )
-            };
-            send.setFrame(NSRect::new(
-                NSPoint::new(width - 8.0 - 96.0 - 8.0 - 64.0, 8.0),
-                NSSize::new(64.0, 28.0),
-            ));
-            // SAFETY: see above.
-            let disconnect = unsafe {
-                NSButton::buttonWithTitle_target_action(
-                    &NSString::from_str("Disconnect"),
-                    Some(&target),
-                    Some(sel!(disconnect:)),
-                    mtm,
-                )
-            };
-            disconnect.setFrame(NSRect::new(
-                NSPoint::new(width - 8.0 - 96.0, 8.0),
-                NSSize::new(96.0, 28.0),
-            ));
             if let Some(content) = panel.contentView() {
-                content.addSubview(&scroll);
-                content.addSubview(&input);
-                content.addSubview(&send);
-                content.addSubview(&disconnect);
+                let wv_view: &NSView = &webview;
+                content.addSubview(wv_view);
             }
-            // The text view is owned by the scroll view (part of the panel's hierarchy).
-            let transcript_addr = Retained::as_ptr(&text_view) as usize;
+
+            let panel_ptr = Retained::as_ptr(&panel) as usize;
+            delegate
+                .ivars()
+                .panel_addr
+                .store(panel_ptr, Ordering::SeqCst);
+            let win: &NSWindow = &panel;
+            win.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+
             panel.orderFrontRegardless();
-            Ok((
-                Retained::into_raw(panel) as usize,
-                Retained::into_raw(target) as usize,
-                transcript_addr,
-            ))
+
+            let webview_addr = Retained::into_raw(webview) as usize;
+            let panel_addr = Retained::into_raw(panel) as usize;
+            let delegate_addr = Retained::into_raw(delegate) as usize;
+            // Let the menu-bar item re-open this window and disconnect the session.
+            set_menu_chat(panel_addr);
+            Ok((panel_addr, webview_addr, delegate_addr))
         })();
         let _ = tx.send(result);
     })?;
-    let (panel_addr, target_addr, transcript_addr) = rx.recv().context("chat task dropped")??;
-    Ok(Box::new(ChatPanelHandle {
+    let (panel_addr, webview_addr, delegate_addr) = rx.recv().context("chat task dropped")??;
+    Ok(Box::new(ChatWebHandle {
         panel_addr,
-        target_addr,
-        transcript_addr,
-        text: Arc::new(parking_lot::Mutex::new(String::new())),
+        webview_addr,
+        delegate_addr,
     }))
+}
+
+// ─── input guard: drop remote-injected events aimed at our own windows ────────────────────
+
+use objc2_app_kit::{NSEvent, NSEventMask};
+use objc2_core_graphics::CGEventField;
+
+static INPUT_GUARD: std::sync::Once = std::sync::Once::new();
+
+/// Install a process-wide local event monitor that swallows any mouse/keyboard event carrying
+/// the injection marker (see `crate::input::INJECTED_EVENT_MARKER`). Local (real) input is
+/// untouched, so the person at the device keeps full control of our windows while the operator
+/// cannot click or type into them. Idempotent.
+pub fn install_input_guard() {
+    INPUT_GUARD.call_once(|| {
+        let _ = run_on_main(|| {
+            let Some(_mtm) = MainThreadMarker::new() else {
+                return;
+            };
+            let mask = NSEventMask::LeftMouseDown
+                | NSEventMask::LeftMouseUp
+                | NSEventMask::RightMouseDown
+                | NSEventMask::RightMouseUp
+                | NSEventMask::OtherMouseDown
+                | NSEventMask::OtherMouseUp
+                | NSEventMask::ScrollWheel
+                | NSEventMask::KeyDown
+                | NSEventMask::KeyUp;
+            let block = RcBlock::new(|event: std::ptr::NonNull<NSEvent>| -> *mut NSEvent {
+                // SAFETY: the monitor hands us a valid, live NSEvent for the duration of the call.
+                let event: &NSEvent = unsafe { event.as_ref() };
+                if event_is_injected(event) {
+                    // Returning null drops the event before any of our windows sees it.
+                    std::ptr::null_mut()
+                } else {
+                    event as *const NSEvent as *mut NSEvent
+                }
+            });
+            // SAFETY: valid mask and a block matching the expected signature; the returned
+            // monitor object is intentionally leaked for the process lifetime.
+            let monitor =
+                unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(mask, &block) };
+            std::mem::forget(monitor);
+            std::mem::forget(block);
+        });
+    });
+}
+
+fn event_is_injected(event: &NSEvent) -> bool {
+    if let Some(cg) = event.CGEvent() {
+        let v = objc2_core_graphics::CGEvent::integer_value_field(
+            Some(&cg),
+            CGEventField::EventSourceUserData,
+        );
+        return v == crate::input::INJECTED_EVENT_MARKER;
+    }
+    false
+}
+
+// ─── menu-bar status item ─────────────────────────────────────────────────────────────────
+
+use objc2_app_kit::{NSMenu, NSMenuItem, NSStatusBar, NSVariableStatusItemLength};
+use std::sync::atomic::AtomicUsize;
+
+struct MenuIvars {
+    disconnect: Arc<dyn Fn() + Send + Sync>,
+}
+
+define_class!(
+    // SAFETY: NSObject subclass, main-thread only, no Drop.
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "RemoteAgentMenuTarget"]
+    #[ivars = MenuIvars]
+    struct MenuTarget;
+
+    impl MenuTarget {
+        #[unsafe(method(openChat:))]
+        fn open_chat(&self, _sender: Option<&AnyObject>) {
+            let addr = MENU_CHAT_PANEL.load(Ordering::SeqCst);
+            if addr != 0 {
+                // SAFETY: only set to a live panel address while a chat exists; cleared on drop.
+                let panel: &NSPanel = unsafe { &*(addr as *const NSPanel) };
+                panel.orderFrontRegardless();
+            }
+        }
+
+        #[unsafe(method(disconnect:))]
+        fn disconnect(&self, _sender: Option<&AnyObject>) {
+            (self.ivars().disconnect)();
+        }
+
+        #[unsafe(method(quit:))]
+        fn quit(&self, _sender: Option<&AnyObject>) {
+            std::process::exit(0);
+        }
+    }
+
+    unsafe impl NSObjectProtocol for MenuTarget {}
+);
+
+/// Address of the current chat panel, so the menu can re-open it; 0 when no session.
+static MENU_CHAT_PANEL: AtomicUsize = AtomicUsize::new(0);
+
+fn set_menu_chat(panel_addr: usize) {
+    MENU_CHAT_PANEL.store(panel_addr, Ordering::SeqCst);
+}
+fn clear_menu_chat() {
+    MENU_CHAT_PANEL.store(0, Ordering::SeqCst);
+}
+
+/// Install the menu-bar (status bar) item. Idempotent; `disconnect` ends the active session.
+/// The item is always present so the person at the device can reach *Open chat* / *Disconnect*
+/// even after closing the chat window. Menu items are enabled only while a session is active.
+pub fn install_menu_bar(status_text: &str, disconnect: Arc<dyn Fn() + Send + Sync>) {
+    static MENU: std::sync::Once = std::sync::Once::new();
+    let status_text = status_text.to_owned();
+    MENU.call_once(|| {
+        let _ = run_on_main(move || {
+            let Some(mtm) = MainThreadMarker::new() else {
+                return;
+            };
+            let bar = NSStatusBar::systemStatusBar();
+            let item = bar.statusItemWithLength(NSVariableStatusItemLength);
+            if let Some(button) = item.button(mtm) {
+                button.setTitle(&NSString::from_str("🖥"));
+            }
+            let target = {
+                let this = MenuTarget::alloc(mtm).set_ivars(MenuIvars { disconnect });
+                let t: Retained<MenuTarget> = unsafe { msg_send![super(this), init] };
+                t
+            };
+            let menu = NSMenu::new(mtm);
+            let title = NSMenuItem::new(mtm);
+            title.setTitle(&NSString::from_str(&status_text));
+            title.setEnabled(false);
+            menu.addItem(&title);
+            menu.addItem(&NSMenuItem::separatorItem(mtm));
+            // SAFETY: selectors exist on MenuTarget; target retained below.
+            let open = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    &NSString::from_str("Open chat"),
+                    Some(sel!(openChat:)),
+                    &NSString::from_str(""),
+                )
+            };
+            // SAFETY: target outlives the menu (forgotten below).
+            unsafe { open.setTarget(Some(&target)) };
+            menu.addItem(&open);
+            let disc = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    &NSString::from_str("Disconnect session"),
+                    Some(sel!(disconnect:)),
+                    &NSString::from_str(""),
+                )
+            };
+            // SAFETY: target outlives the menu (forgotten below).
+            unsafe { disc.setTarget(Some(&target)) };
+            menu.addItem(&disc);
+            menu.addItem(&NSMenuItem::separatorItem(mtm));
+            let quit = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    &NSString::from_str("Quit Remote Agent"),
+                    Some(sel!(quit:)),
+                    &NSString::from_str("q"),
+                )
+            };
+            // SAFETY: target outlives the menu (forgotten below).
+            unsafe { quit.setTarget(Some(&target)) };
+            menu.addItem(&quit);
+            item.setMenu(Some(&menu));
+            // Keep the status item + target + menu alive for the process lifetime.
+            let _ = Retained::into_raw(item);
+            let _ = Retained::into_raw(target);
+            let _ = Retained::into_raw(menu);
+        });
+    });
 }
 
 // ─── clipboard (NSPasteboard) ───────────────────────────────────────────────────────────

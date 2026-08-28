@@ -524,6 +524,10 @@ pub fn create(cfg: &CaptureConfig) -> Result<Box<dyn Capturer>> {
         .find(|d| unsafe { d.displayID() } == entry.id)
         .with_context(|| format!("display {} is not shareable", entry.id))?;
 
+    // The agent's own windows (chat, banner, dialogs) are kept out of the capture by giving
+    // them `NSWindowSharingType::None` (see `platform::macos`), so a plain full-display filter
+    // is used here. That per-window exclusion covers windows created after the stream starts and
+    // avoids the SCK connection problems seen when excluding the capturing application itself.
     // SAFETY: constructing SCK objects with valid arguments.
     let filter = unsafe {
         SCContentFilter::initWithDisplay_excludingWindows(
