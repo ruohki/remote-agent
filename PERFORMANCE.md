@@ -105,3 +105,10 @@ Notes: the `static` number is not pipeline latency — at 1 frame/s the browser 
 until the next one arrives; a follow-up frame ~50 ms after every change frame (planned) will
 bring it in line. `video` is bitrate-limited by the 8 Mb/s cap (fps ladder engaged), not by
 latency. Hardware decode (headed Chrome/Safari) should shave a further ~10 ms off all rows.
+
+After the 50 ms follow-up frame (agent build 909183e, rig sampling only new stamps):
+
+| Scenario | Change-to-visible median | p95 | Bandwidth |
+|----------|--------------------------|-----|-----------|
+| static (strip repaint 1×/s) | **13 ms** | 21 ms | 2–3 kbit/s |
+| typing | **25 ms** | 34 ms | ~80 kbit/s |
