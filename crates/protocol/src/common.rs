@@ -102,6 +102,18 @@ pub struct IceServer {
     pub credential: Option<String>,
 }
 
+/// Role of a participant in a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS, Default)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum SessionRole {
+    /// Controls the device.
+    #[default]
+    Operator,
+    /// Admin shadowing the session: receives the same video/audio, no input.
+    Observer,
+}
+
 /// Minimal description of the operator shown to the person at the device.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]

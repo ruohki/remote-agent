@@ -5,6 +5,7 @@ import type { IceCandidate } from "./IceCandidate";
 import type { IceServer } from "./IceServer";
 import type { OperatorInfo } from "./OperatorInfo";
 import type { SessionDescription } from "./SessionDescription";
+import type { SessionRole } from "./SessionRole";
 
 export type ConsoleToAgent = { "type": "hello_ack", protocol_version: number, 
 /**
@@ -14,4 +15,18 @@ server_time_ms: bigint, config: AgentConfig, } | { "type": "config_update", conf
 /**
  * ICE servers for this session (includes short-lived TURN credentials).
  */
-ice_servers: Array<IceServer>, } | { "type": "ice_candidate", session_id: string, candidate: IceCandidate, } | { "type": "session_end", session_id: string, reason: EndReason, } | { "type": "ping", nonce: bigint, } | { "type": "update", version: string, url: string, sha256: string, } | { "type": "goodbye", reason: string, };
+ice_servers: Array<IceServer>, 
+/**
+ * `Observer` = an admin shadowing `shadow_of`; the agent fans out the existing
+ * encoded stream to this extra peer, ignores its `input` channel and reports
+ * `SessionEvent::ObserverJoined/Left`.
+ */
+role: SessionRole, 
+/**
+ * The operator session being shadowed (observers only).
+ */
+shadow_of?: string, 
+/**
+ * Whether the operator's viewer / device banner should announce the observer.
+ */
+notify_operator: boolean, } | { "type": "ice_candidate", session_id: string, candidate: IceCandidate, } | { "type": "session_end", session_id: string, reason: EndReason, } | { "type": "ping", nonce: bigint, } | { "type": "update", version: string, url: string, sha256: string, } | { "type": "goodbye", reason: string, };

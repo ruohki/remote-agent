@@ -57,6 +57,18 @@ pub enum SessionEvent {
     AudioChanged {
         enabled: bool,
     },
+    ObserverJoined {
+        observer: crate::common::OperatorInfo,
+        session_id: String,
+    },
+    ObserverLeft {
+        observer: crate::common::OperatorInfo,
+        session_id: String,
+    },
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// What an agent can do, reported in `hello` and whenever it changes.
@@ -161,6 +173,18 @@ pub enum ConsoleToAgent {
         offer: SessionDescription,
         /// ICE servers for this session (includes short-lived TURN credentials).
         ice_servers: Vec<IceServer>,
+        /// `Observer` = an admin shadowing `shadow_of`; the agent fans out the existing
+        /// encoded stream to this extra peer, ignores its `input` channel and reports
+        /// `SessionEvent::ObserverJoined/Left`.
+        #[serde(default)]
+        role: crate::common::SessionRole,
+        /// The operator session being shadowed (observers only).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        shadow_of: Option<String>,
+        /// Whether the operator's viewer / device banner should announce the observer.
+        #[serde(default = "default_true")]
+        notify_operator: bool,
     },
     IceCandidate {
         session_id: String,

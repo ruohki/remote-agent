@@ -57,6 +57,9 @@ fn console_session_request_roundtrip() {
             username: Some("1700000000:u1".into()),
             credential: Some("hmac".into()),
         }],
+        role: SessionRole::Operator,
+        shadow_of: None,
+        notify_operator: true,
     };
     let json = serde_json::to_string(&msg).unwrap();
     assert!(json.contains("\"type\":\"session_request\""));
@@ -97,6 +100,7 @@ fn control_and_ui_roundtrip() {
             kind: "offer".into(),
             sdp: "x".into(),
         },
+        shadow_of: None,
     };
     let back: UiToConsole = serde_json::from_str(&serde_json::to_string(&ui).unwrap()).unwrap();
     assert_eq!(back, ui);

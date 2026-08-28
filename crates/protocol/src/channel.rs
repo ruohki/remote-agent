@@ -73,13 +73,19 @@ pub enum InputEvent {
 pub enum ControlMessage {
     // ── browser → agent ────────────────────────────────────────────────────────
     /// Switch the *primary* video track to another display (kept for single-tile viewers).
-    SelectDisplay { index: u32 },
+    SelectDisplay {
+        index: u32,
+    },
     /// Multi-display: which displays should stream. The browser adds one `recvonly` video
     /// transceiver per display (in `DisplayInfo` index order); the agent binds the i-th video
     /// m-line to display i and only encodes the displays listed here.
-    SetActiveDisplays { indices: Vec<u32> },
+    SetActiveDisplays {
+        indices: Vec<u32>,
+    },
     /// Enable / disable the system-audio track (requires `AgentConfig.allow_audio`).
-    SetAudio { enabled: bool },
+    SetAudio {
+        enabled: bool,
+    },
     /// Chat line; sent by either side, echoed to the console as a session event by the agent.
     Chat {
         from: ChatParty,
@@ -101,7 +107,9 @@ pub enum ControlMessage {
     /// Send Ctrl+Alt+Del (Windows) / equivalent secure attention sequence.
     SecureAttention,
     /// Operator's clipboard text to place on the device clipboard.
-    ClipboardSet { text: String },
+    ClipboardSet {
+        text: String,
+    },
 
     // ── agent → browser ────────────────────────────────────────────────────────
     /// Sent once after the control channel opens and whenever displays change.
@@ -125,7 +133,9 @@ pub enum ControlMessage {
         total_bytes: u64,
     },
     /// Device clipboard changed.
-    ClipboardChanged { text: String },
+    ClipboardChanged {
+        text: String,
+    },
     /// Periodic encoder/capture statistics (one per active display).
     Stats {
         #[serde(default)]
@@ -141,4 +151,12 @@ pub enum ControlMessage {
     },
     /// The person at the device ended the session.
     SessionEndedByUser,
+    /// An admin started / stopped shadowing this session (only sent when the console asked
+    /// the agent to notify the operator).
+    ObserverJoined {
+        name: String,
+    },
+    ObserverLeft {
+        name: String,
+    },
 }

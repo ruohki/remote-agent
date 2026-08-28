@@ -93,6 +93,15 @@ pub struct SessionSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub codec: Option<VideoCodec>,
+    /// `observer` when this row is a shadow of `shadow_of`.
+    #[serde(default)]
+    pub role: crate::common::SessionRole,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub shadow_of: Option<String>,
+    /// Admins currently shadowing this (operator) session.
+    #[serde(default)]
+    pub observers: Vec<crate::common::OperatorInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -103,6 +112,10 @@ pub enum UiToConsole {
     SessionOffer {
         device_id: String,
         offer: SessionDescription,
+        /// Admins only: shadow this running session instead of starting a new one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        shadow_of: Option<String>,
     },
     IceCandidate {
         session_id: String,

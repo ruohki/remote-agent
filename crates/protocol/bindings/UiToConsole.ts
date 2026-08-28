@@ -2,4 +2,8 @@
 import type { IceCandidate } from "./IceCandidate";
 import type { SessionDescription } from "./SessionDescription";
 
-export type UiToConsole = { "type": "session_offer", device_id: string, offer: SessionDescription, } | { "type": "ice_candidate", session_id: string, candidate: IceCandidate, } | { "type": "session_end", session_id: string, } | { "type": "subscribe" } | { "type": "ping", nonce: bigint, };
+export type UiToConsole = { "type": "session_offer", device_id: string, offer: SessionDescription, 
+/**
+ * Admins only: shadow this running session instead of starting a new one.
+ */
+shadow_of?: string, } | { "type": "ice_candidate", session_id: string, candidate: IceCandidate, } | { "type": "session_end", session_id: string, } | { "type": "subscribe" } | { "type": "ping", nonce: bigint, };
