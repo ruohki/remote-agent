@@ -90,3 +90,18 @@ Agent-side measurements on this Mac (Apple Silicon, VideoToolbox H.265, 2026-08-
 
 First keyframe: 2.2 KB (synthetic 1080p) / 75 KB (live 3024×1964). Glass-to-glass numbers
 come from the browser rig (`remote-console/web/perf/`).
+
+Browser rig on the same Mac (headless Chromium, software H.264 decode, `npm run perf:latency`,
+15 s per scenario, 2026-08-28, agent build c34e01f):
+
+| Scenario | Glass-to-glass median | p95 | Bandwidth | Decoded fps | Samples |
+|----------|----------------------|-----|-----------|-------------|---------|
+| static (strip repaint 1×/s) | 244 ms | 1338 ms | 4 kbit/s | 1.0 | 15 |
+| typing | **31 ms** | 39 ms | 81 kbit/s | 29.3 | 439 |
+| drag (600×400 window) | **32 ms** | 38 ms | 284 kbit/s | 29.2 | 437 |
+| video (full-frame motion) | 67 ms | 74 ms | 8018 kbit/s (cap) | 14.7 | 219 |
+
+Notes: the `static` number is not pipeline latency — at 1 frame/s the browser holds a frame
+until the next one arrives; a follow-up frame ~50 ms after every change frame (planned) will
+bring it in line. `video` is bitrate-limited by the 8 Mb/s cap (fps ladder engaged), not by
+latency. Hardware decode (headed Chrome/Safari) should shave a further ~10 ms off all rows.

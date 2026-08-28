@@ -20,4 +20,9 @@ quick_support: boolean, branding: Branding,
 /**
  * Unix epoch seconds when the trailer was produced.
  */
-issued_at: bigint, };
+issued_at: bigint, 
+/**
+ * SHA-256 of the console TLS certificate's SubjectPublicKeyInfo (base64); when present the
+ * agent pins it for every connection to `server_url`.
+ */
+console_tls_spki_sha256?: string, };

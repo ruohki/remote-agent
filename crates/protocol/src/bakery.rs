@@ -76,6 +76,11 @@ pub struct BakedConfig {
     pub branding: Branding,
     /// Unix epoch seconds when the trailer was produced.
     pub issued_at: u64,
+    /// SHA-256 of the console TLS certificate's SubjectPublicKeyInfo (base64); when present the
+    /// agent pins it for every connection to `server_url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub console_tls_spki_sha256: Option<String>,
 }
 
 /// Signed envelope stored in the trailer.
@@ -199,6 +204,7 @@ mod tests {
                 apply_to_console: true,
             },
             issued_at: 1_700_000_000,
+            console_tls_spki_sha256: None,
         }
     }
 
