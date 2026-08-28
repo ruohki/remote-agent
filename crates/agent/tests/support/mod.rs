@@ -277,6 +277,7 @@ impl Indicator for NoopIndicator {
 }
 
 type SendCallback = Arc<dyn Fn(String) + Send + Sync>;
+type DisconnectCallback = Arc<dyn Fn() + Send + Sync>;
 
 /// Chat UI that records lines and lets the test "type" as the device user.
 #[derive(Clone, Default)]
@@ -284,6 +285,7 @@ pub struct RecordingChat {
     pub lines: Arc<Mutex<Vec<ChatLine>>>,
     pub visible: Arc<Mutex<Vec<bool>>>,
     pub on_send: Arc<Mutex<Option<SendCallback>>>,
+    pub on_disconnect: Arc<Mutex<Option<DisconnectCallback>>>,
 }
 
 struct RecordingChatHandle {
@@ -304,14 +306,23 @@ impl ChatUi for RecordingChat {
         &self,
         _operator: &OperatorInfo,
         on_send: Arc<dyn Fn(String) + Send + Sync>,
-        _on_disconnect: Arc<dyn Fn() + Send + Sync>,
+        on_disconnect: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<Box<dyn ChatHandle>> {
         *self.on_send.lock().unwrap() = Some(on_send);
+        *self.on_disconnect.lock().unwrap() = Some(on_disconnect);
         Ok(Box::new(RecordingChatHandle { chat: self.clone() }))
     }
 }
 
 impl RecordingChat {
+    /// Simulate the device user pressing "End session" on the window / session bar.
+    pub fn press_disconnect(&self) {
+        let cb = self.on_disconnect.lock().unwrap().clone();
+        if let Some(cb) = cb {
+            cb();
+        }
+    }
+
     /// Simulate the device user typing a line.
     pub fn type_line(&self, text: &str) {
         let cb = self

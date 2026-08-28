@@ -53,6 +53,8 @@ struct Controller {
     pending: Vec<String>,
     // last-known state, replayed to the page on (re)ready
     session_active: bool,
+    /// Remote control paused by the device user (session bar switch).
+    control_paused: bool,
     operator: String,
     transcript: Vec<(ChatParty, String, u64)>,
     console_connected: bool,
@@ -115,6 +117,9 @@ impl Controller {
                 "window.__app.startSession({});",
                 serde_json::json!(self.operator)
             ));
+            if self.control_paused {
+                js.push_str("window.__app.setControlPaused(true);");
+            }
             for (from, text, ts) in &self.transcript {
                 js.push_str(&push_js(*from, text, *ts));
             }
@@ -157,6 +162,7 @@ impl Controller {
         match ev {
             AppEvent::SessionStarted { operator } => {
                 self.session_active = true;
+                self.control_paused = false;
                 self.operator = operator.clone();
                 self.transcript.clear();
                 self.end_item.set_enabled(true);
@@ -170,6 +176,7 @@ impl Controller {
             }
             AppEvent::SessionEnded => {
                 self.session_active = false;
+                self.control_paused = false;
                 self.end_item.set_enabled(false);
                 self.chat_item.set_enabled(false);
                 self.refresh_tooltip();
@@ -229,6 +236,19 @@ impl Controller {
                     .evaluate_script("window.__app&&window.__app.show('home');");
             }
             AppEvent::Bar(msg) => self.on_bar(target, msg),
+            AppEvent::ControlPaused { paused } => {
+                self.control_paused = paused;
+                if let Some(bar) = self.bar.as_mut() {
+                    bar.set_paused(paused);
+                }
+                self.eval(format!("window.__app.setControlPaused({paused});"));
+                self.refresh_tooltip();
+            }
+            AppEvent::TogglePause => {
+                if self.session_active {
+                    super::dispatch_pause(!self.control_paused);
+                }
+            }
             AppEvent::MoveResult { ok, message } => {
                 self.eval(format!(
                     "window.__app.moveResult({},{});",
@@ -293,6 +313,8 @@ impl Controller {
             }
             BarIpc::Open => self.show(target, false),
             BarIpc::End => dispatch_disconnect(),
+            BarIpc::Pause => super::dispatch_pause(true),
+            BarIpc::Resume => super::dispatch_pause(false),
             BarIpc::Collapse => {
                 if let Some(bar) = self.bar.as_mut() {
                     bar.set_collapsed(true);
@@ -314,7 +336,12 @@ impl Controller {
     /// Tray tooltip: product, session state, and a warning while Screen Recording is missing.
     fn refresh_tooltip(&self) {
         let product = branding::product_name();
-        let mut text = if self.session_active {
+        let mut text = if self.session_active && self.control_paused {
+            format!(
+                "{product} — Session active: {} is connected · remote control paused",
+                self.operator
+            )
+        } else if self.session_active {
             format!("{product} — Session active: {} is connected", self.operator)
         } else {
             format!("{product} — No active session")
@@ -426,6 +453,7 @@ fn build_and_run(work: impl FnOnce() -> i32 + Send + 'static, opts: AppOptions) 
             Ok(IpcIn::Ready) => super::post(AppEvent::__Ready),
             Ok(IpcIn::Send { text }) => dispatch_send(text),
             Ok(IpcIn::Disconnect) => dispatch_disconnect(),
+            Ok(IpcIn::PauseControl { paused }) => super::dispatch_pause(paused),
             Ok(IpcIn::OpenScreen { .. }) => {}
             Ok(IpcIn::SetOverrides { overrides }) => {
                 super::dispatch_overrides(overrides.into_local());
@@ -491,6 +519,9 @@ fn build_and_run(work: impl FnOnce() -> i32 + Send + 'static, opts: AppOptions) 
     ])
     .ok();
     let (tray_icon, tray_template) = tray_icon_for_platform();
+    #[cfg(target_os = "macos")]
+    crate::platform::macos::install_pause_hotkey();
+
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip(format!("{product} — no active session"))
@@ -528,6 +559,7 @@ fn build_and_run(work: impl FnOnce() -> i32 + Send + 'static, opts: AppOptions) 
         ready: false,
         pending: Vec::new(),
         session_active: false,
+        control_paused: false,
         operator: String::new(),
         transcript: Vec::new(),
         console_connected: false,
@@ -626,6 +658,10 @@ enum IpcIn {
         text: String,
     },
     Disconnect,
+    /// Session panel: pause / resume remote control.
+    PauseControl {
+        paused: bool,
+    },
     OpenScreen {
         #[allow(dead_code)]
         screen: String,

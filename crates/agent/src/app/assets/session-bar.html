@@ -7,7 +7,7 @@
     <style>
       :root {
         --accent: #3b82f6; --bg: #ffffff; --text: #16181d; --muted: #6b7280; --border: #d7dbe3;
-        --danger: #dc2626; --ok: #16a34a;
+        --danger: #dc2626; --ok: #16a34a; --warn: #f59e0b;
       }
       @media (prefers-color-scheme: dark) {
         :root { --bg: #1d2027; --text: #e7eaf0; --muted: #9aa3b2; --border: #3a3f4a; }
@@ -35,6 +35,24 @@
       .btn:hover { background: color-mix(in srgb, var(--text) 8%, transparent); }
       .btn.danger { border-color: var(--danger); color: var(--danger); }
       .btn.danger:hover { background: color-mix(in srgb, var(--danger) 12%, transparent); }
+      .btn.warn { border-color: var(--warn); color: var(--warn); font-weight: 600; }
+      .btn.warn:hover { background: color-mix(in srgb, var(--warn) 14%, transparent); }
+      .btn.solid { background: var(--warn); border-color: var(--warn); color: #1a1200; }
+      .btn.solid:hover { filter: brightness(1.08); }
+      /* paused: amber everything, so it is obvious from across the room */
+      body.paused .stripe { background: var(--warn); }
+      body.paused .bar { border-color: var(--warn); box-shadow: 0 0 0 2px color-mix(in srgb, var(--warn) 45%, transparent), 0 6px 24px rgba(0,0,0,.25); }
+      body.paused .pill { border-color: var(--warn); }
+      body.paused .pill .dot { background: var(--warn); }
+      body.paused .text .state { color: var(--warn); font-weight: 650; }
+      .text .state { display: none; }
+      body.paused .text .state { display: inline; }
+      body.paused .text .who-line { display: none; }
+      /* inline End confirmation */
+      .confirm { display: none; align-items: center; gap: 6px; }
+      body.confirming .confirm { display: flex; }
+      body.confirming #end, body.confirming #pause, body.confirming #open { display: none; }
+      .confirm .q { color: var(--danger); font-weight: 600; white-space: nowrap; }
       .collapse { border: 0; background: transparent; color: var(--muted); width: 22px; height: 22px; border-radius: 6px; cursor: pointer; font-size: 14px; line-height: 1; padding: 0; flex: 0 0 auto; }
       .collapse:hover { background: color-mix(in srgb, var(--text) 8%, transparent); color: var(--text); }
       /* collapsed pill */
@@ -55,9 +73,11 @@
     <div class="bar" id="bar">
       <div class="stripe"></div>
       <div class="logo" id="logo"></div>
-      <div class="text" id="text"><b id="product">Remote Support</b><span class="sep"> · </span><span id="who">Support technician</span><span class="muted"> connected</span><span class="sep"> · </span><span class="muted" id="elapsed">0:00</span></div>
+      <div class="text" id="text"><b id="product">Remote Support</b><span class="sep"> · </span><span class="who-line"><span id="who">Support technician</span><span class="muted"> connected</span></span><span class="state">Remote control paused</span><span class="sep"> · </span><span class="muted" id="elapsed">0:00</span></div>
       <button class="btn" id="open" title="Open the application window">Open</button>
+      <button class="btn warn" id="pause" title="Immediately block the technician's keyboard and mouse. Only you can resume. Shortcut: ⌥⌘P">Pause control</button>
       <button class="btn danger" id="end">End session</button>
+      <span class="confirm"><span class="q">End session?</span><button class="btn danger" id="endYes">Confirm</button><button class="btn" id="endNo">Cancel</button></span>
       <button class="collapse" id="collapse" title="Collapse" aria-label="Collapse">⌄</button>
     </div>
     <div class="pill" id="pill" title="Support session active — click to expand">
@@ -76,9 +96,30 @@
           document.getElementById('pillElapsed').textContent = t;
         }, 1000);
         document.getElementById('open').addEventListener('click', function () { ipc({ type: 'open' }); });
-        document.getElementById('end').addEventListener('click', function () {
-          if (window.confirm('End the support session now?')) ipc({ type: 'end' });
-        });
+        // End: inline two-step confirmation (JS confirm() is not reliable inside the webview).
+        var confirmTimer = null;
+        function setConfirming(on) {
+          document.body.classList.toggle('confirming', !!on);
+          if (confirmTimer) { clearTimeout(confirmTimer); confirmTimer = null; }
+          if (on) confirmTimer = setTimeout(function () { setConfirming(false); }, 5000);
+        }
+        document.getElementById('end').addEventListener('click', function () { setConfirming(true); });
+        document.getElementById('endNo').addEventListener('click', function () { setConfirming(false); });
+        document.getElementById('endYes').addEventListener('click', function () { setConfirming(false); ipc({ type: 'end' }); });
+        var paused = false;
+        function renderPaused() {
+          document.body.classList.toggle('paused', paused);
+          var b = document.getElementById('pause');
+          b.textContent = paused ? 'Resume control' : 'Pause control';
+          b.classList.toggle('solid', paused);
+          b.title = paused
+            ? 'Allow the technician to use keyboard and mouse again. Shortcut: ⌥⌘P'
+            : "Immediately block the technician's keyboard and mouse. Only you can resume. Shortcut: ⌥⌘P";
+          document.getElementById('pill').title = paused
+            ? 'Support session active — remote control paused. Click to expand'
+            : 'Support session active — click to expand';
+        }
+        document.getElementById('pause').addEventListener('click', function () { ipc({ type: paused ? 'resume' : 'pause' }); });
         document.getElementById('collapse').addEventListener('click', function () { ipc({ type: 'collapse' }); });
         document.getElementById('pill').addEventListener('click', function () { ipc({ type: 'expand' }); });
         // Drag anywhere on the bar / pill except the buttons.
@@ -91,12 +132,14 @@
             if (s.product) document.getElementById('product').textContent = s.product;
             if (s.operator) document.getElementById('who').textContent = s.operator;
             if (typeof s.started_ms === 'number') startedMs = s.started_ms;
+            if (typeof s.paused === 'boolean') { paused = s.paused; renderPaused(); }
             if ('logo' in s) {
               var url = s.logo ? 'url("data:image/png;base64,' + s.logo + '")' : '';
               ['logo', 'pillLogo'].forEach(function (id) { var el = document.getElementById(id); el.style.backgroundImage = url; el.classList.toggle('has-logo', !!s.logo); });
             }
           },
-          collapsed: function (on) { document.body.classList.toggle('collapsed', !!on); }
+          collapsed: function (on) { document.body.classList.toggle('collapsed', !!on); },
+          paused: function (on) { paused = !!on; renderPaused(); }
         };
         ipc({ type: 'ready' });
       })();

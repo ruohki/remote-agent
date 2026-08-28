@@ -111,10 +111,12 @@
                 <div>
                   <div class="session-title">Session active — <span id="opName">Support technician</span> is connected</div>
                   <div class="muted" id="sessionMeta">Screen sharing and remote control in progress</div>
+                  <div class="paused-note" id="pausedNote" hidden>Remote control paused by you — screen sharing and chat continue. Only you can resume.</div>
                 </div>
               </div>
               <div class="session-actions">
                 <button class="btn ghost" id="openChatBtn">Open chat</button>
+                <button class="btn warn" id="pauseBtn" title="Immediately block the technician's keyboard and mouse. Only you can resume. Shortcut: ⌥⌘P">Pause control</button>
                 <button class="btn danger" id="endBtn">End session</button>
               </div>
             </div>

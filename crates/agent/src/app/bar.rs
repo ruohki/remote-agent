@@ -13,7 +13,7 @@ use tao::window::{Window, WindowBuilder};
 use wry::{WebView, WebViewBuilder};
 
 const HTML: &str = include_str!("assets/session-bar.html");
-const EXPANDED: (f64, f64) = (540.0, 46.0);
+const EXPANDED: (f64, f64) = (700.0, 46.0);
 const COLLAPSED: (f64, f64) = (46.0, 46.0);
 const POSITION_FILE: &str = "session-bar.json";
 
@@ -24,6 +24,9 @@ pub enum BarIpc {
     Ready,
     Open,
     End,
+    /// Emergency switch: pause / resume remote keyboard & mouse control.
+    Pause,
+    Resume,
     Collapse,
     Expand,
     Drag,
@@ -35,6 +38,8 @@ pub(super) struct SessionBar {
     ready: bool,
     pending: Vec<String>,
     collapsed: bool,
+    /// Remote control paused by the device user.
+    paused: bool,
     /// Top-left of the expanded bar in logical points (persisted).
     position: LogicalPosition<f64>,
     state_dir: Option<std::path::PathBuf>,
@@ -82,6 +87,7 @@ impl SessionBar {
             ready: false,
             pending: Vec::new(),
             collapsed: false,
+            paused: false,
             position,
             state_dir,
             operator: String::new(),
@@ -115,23 +121,31 @@ impl SessionBar {
                 "logo": b.logo_png_base64,
                 "operator": self.operator,
                 "started_ms": self.started_ms,
+                "paused": self.paused,
             }),
             self.collapsed
         );
         let _ = self.webview.evaluate_script(&js);
     }
 
+    /// Reflect the pause state (amber stripe, "Remote control paused", Resume button).
+    pub(super) fn set_paused(&mut self, paused: bool) {
+        self.paused = paused;
+        self.eval(format!("window.__bar&&window.__bar.paused({paused});"));
+    }
+
     /// Show the bar for a new session (expanded).
     pub(super) fn show(&mut self, operator: &str) {
         self.operator = operator.to_string();
         self.started_ms = crate::chat::now_ms();
+        self.paused = false;
         // Developer aid for screenshots of the collapsed pill.
         self.collapsed = std::env::var_os("REMOTE_AGENT_BAR_COLLAPSED").is_some();
         self.apply_size();
         self.window.set_outer_position(self.position);
         let js = format!(
             "window.__bar&&window.__bar.set({});window.__bar&&window.__bar.collapsed({});",
-            serde_json::json!({ "operator": self.operator, "started_ms": self.started_ms }),
+            serde_json::json!({ "operator": self.operator, "started_ms": self.started_ms, "paused": false }),
             self.collapsed
         );
         self.eval(js);

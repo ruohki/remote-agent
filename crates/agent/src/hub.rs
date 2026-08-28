@@ -180,6 +180,10 @@ pub async fn run_agent(paths: Paths) -> Result<()> {
         crate::app::set_global_disconnect(Arc::new(move || {
             sessions_for_menu.end_all(EndReason::DeviceUserClosed)
         }));
+        let sessions_for_pause = Arc::clone(&sessions);
+        crate::app::set_pause_handler(Arc::new(move |paused| {
+            sessions_for_pause.set_control_paused(paused)
+        }));
         crate::app::set_device_info(&config.read().display_name, &local.device_id);
         crate::app::set_console_url(&local.server_url);
     } else if interactive {

@@ -4,6 +4,18 @@
 'use strict';
 (function () {
   var OPERATOR = 'Support technician';
+  var controlPaused = false;
+  function renderPaused() {
+    var note = $('pausedNote'); if (note) note.hidden = !controlPaused;
+    var meta = $('sessionMeta'); if (meta) meta.textContent = controlPaused ? 'Screen sharing in progress — remote control paused' : 'Screen sharing and remote control in progress';
+    var b = $('pauseBtn');
+    if (b) { b.textContent = controlPaused ? 'Resume control' : 'Pause control'; b.classList.toggle('solid', controlPaused); }
+    var cs = $('chatStatus'); if (cs && cs.textContent.indexOf('Session active') === 0) cs.textContent = controlPaused ? 'Session active · remote control paused' : 'Session active';
+  }
+  document.addEventListener('click', function (e) {
+    var b = e.target.closest && e.target.closest('#pauseBtn');
+    if (b) ipc({ type: 'pause_control', paused: !controlPaused });
+  });
   var connected = false; // a session is attached
   var hadSession = false; // a session ran in this window at some point (keeps the transcript)
   var unread = 0;
@@ -148,7 +160,7 @@
     autosize();
     var chat = document.querySelector('.chat'); if (chat) chat.classList.toggle('no-session', !on);
     var ns = $('chatNoSession'); if (ns) ns.hidden = !!on || hadSession;
-    $('chatStatus').textContent = on ? 'Session active' : (hadSession ? 'Session ended' : 'No active session');
+    $('chatStatus').textContent = on ? (controlPaused ? 'Session active · remote control paused' : 'Session active') : (hadSession ? 'Session ended' : 'No active session');
     if (on) hadSession = true;
   }
   function setStatus2(el, text, cls) { el.textContent = text; el.className = 'install-status' + (cls ? ' ' + cls : ''); }
@@ -236,7 +248,8 @@
       clearTranscript();
       setConnected(true);
     },
-    endSession: function () { setConnected(false); },
+    endSession: function () { controlPaused = false; renderPaused(); setConnected(false); },
+    setControlPaused: function (on) { controlPaused = !!on; renderPaused(); },
     push: push,
     // Console / device status
     setConsole: function (url, connectedToConsole) {

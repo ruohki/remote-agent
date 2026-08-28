@@ -87,6 +87,8 @@ enum SessionCommand {
     AddIceCandidate(IceCandidate),
     /// Live-apply a new effective config (console policy tightened by local overrides).
     UpdateConfig(AgentConfig),
+    /// The person at the device paused / resumed remote control (session bar switch).
+    SetControlPaused(bool),
     End(EndReason),
 }
 
@@ -168,6 +170,15 @@ impl SessionManager {
         }
     }
 
+    /// Emergency switch from the session bar: drop all remote input until the device user
+    /// resumes. Only the device side can call this; nothing the operator sends lifts it.
+    pub fn set_control_paused(&self, paused: bool) {
+        let active = self.active.lock();
+        if let Some(s) = active.as_ref() {
+            let _ = s.cmd_tx.send(SessionCommand::SetControlPaused(paused));
+        }
+    }
+
     /// Apply a new effective config to the running session (live policy change).
     pub fn apply_overrides(&self, effective: AgentConfig) {
         let active = self.active.lock();
@@ -222,6 +233,8 @@ enum ChannelEvent {
     FilesClosed,
     /// The local user typed a chat line.
     ChatFromDevice(String),
+    /// The person at the device ended the session (banner / app / session bar).
+    UserEnd,
 }
 
 /// One streaming display: its pipeline and the tasks feeding its video track.
@@ -280,8 +293,10 @@ struct Session {
     cfg: AgentConfig,
     peer: Arc<Peer>,
     input: Arc<Mutex<Option<Box<dyn InputHandler>>>>,
-    /// Live input gate (mirrors `cfg.allow_input`; the reader task checks it every event).
+    /// Live input gate (`cfg.allow_input && !control_paused`; the reader task checks it every event).
     input_allowed: Arc<AtomicBool>,
+    /// Device user pressed "Pause control" on the session bar.
+    control_paused: bool,
     control: Option<Arc<dyn DataChannel>>,
     media: Option<Media>,
     channel_tx: mpsc::UnboundedSender<ChannelEvent>,
@@ -430,6 +445,7 @@ async fn run_session(
         peer,
         input: Arc::new(Mutex::new(None)),
         input_allowed: Arc::new(AtomicBool::new(cfg_allow_input)),
+        control_paused: false,
         control: None,
         media: None,
         channel_tx,
@@ -480,6 +496,7 @@ async fn run_session(
             cmd = cmd_rx.recv() => match cmd {
                 Some(SessionCommand::AddIceCandidate(c)) => session.add_candidate(&c).await,
                 Some(SessionCommand::UpdateConfig(new)) => session.apply_config(new).await,
+                Some(SessionCommand::SetControlPaused(p)) => session.set_control_paused(p).await,
                 Some(SessionCommand::End(reason)) => break reason,
                 None => break EndReason::Error,
             },
@@ -522,6 +539,10 @@ async fn run_session(
                     session.control = Some(dc);
                     session.send_display_info().await;
                     session.notify_pending_permission().await;
+                    if session.control_paused {
+                        // Survives an operator reconnect within the same session.
+                        session.send_control(ControlMessage::ControlPaused { paused: true }).await;
+                    }
                 }
                 Some(ChannelEvent::Control(msg)) => session.on_control(msg).await,
                 Some(ChannelEvent::ControlClosed) => session.control = None,
@@ -538,6 +559,7 @@ async fn run_session(
                     }
                 }
                 Some(ChannelEvent::ChatFromDevice(text)) => session.on_chat_from_device(text).await,
+                Some(ChannelEvent::UserEnd) => break EndReason::DeviceUserClosed,
                 None => {}
             },
             Some(notice) = session.transfer_notices_rx.recv() => session.on_transfer_notice(notice).await,
@@ -609,6 +631,8 @@ async fn drain_until_end(
             // A policy change before the session is up is picked up from the shared config when
             // the session builds; ignore it here.
             Some(SessionCommand::UpdateConfig(_)) => {}
+            // No input yet before the session is up; the pause applies once it exists.
+            Some(SessionCommand::SetControlPaused(_)) => {}
             Some(SessionCommand::End(reason)) => return reason,
             None => return EndReason::Error,
         }
@@ -626,7 +650,8 @@ impl Session {
     async fn apply_config(&mut self, new: AgentConfig) {
         let old = self.cfg.clone();
         self.cfg = new.clone();
-        self.input_allowed.store(new.allow_input, Ordering::Relaxed);
+        self.input_allowed
+            .store(new.allow_input && !self.control_paused, Ordering::Relaxed);
         if old.allow_input && !new.allow_input {
             tracing::info!(session = %self.id, "input disabled by the device user");
             if let Some(h) = self.input.lock().as_mut() {
@@ -648,6 +673,29 @@ impl Session {
         self.send_display_info().await;
     }
 
+    /// Device-side emergency switch: pause / resume remote keyboard & mouse control. Screen
+    /// sharing and chat continue; the operator is told and cannot lift the pause.
+    async fn set_control_paused(&mut self, paused: bool) {
+        if self.control_paused == paused {
+            return;
+        }
+        self.control_paused = paused;
+        self.input_allowed
+            .store(self.cfg.allow_input && !paused, Ordering::Relaxed);
+        if paused {
+            tracing::info!(session = %self.id, "remote control paused by the device user");
+            if let Some(h) = self.input.lock().as_mut() {
+                h.release_all();
+            }
+        } else {
+            tracing::info!(session = %self.id, "remote control resumed by the device user");
+        }
+        self.send_control(ControlMessage::ControlPaused { paused })
+            .await;
+        self.event(SessionEvent::ControlPaused { paused });
+        crate::app::set_control_paused_state(paused);
+    }
+
     /// Report an in-session event to the console.
     fn event(&self, event: SessionEvent) {
         self.deps.hub.send(AgentToConsole::SessionEvent {
@@ -661,8 +709,12 @@ impl Session {
         let user_ended = Arc::clone(&self.user_ended);
         let hub = self.deps.hub.clone();
         let sid = self.id.clone();
+        let tx = self.channel_tx.clone();
         Arc::new(move || {
             user_ended.store(true, Ordering::Relaxed);
+            // End locally too: the session loop exits right away instead of waiting for the
+            // console / peer to react.
+            let _ = tx.send(ChannelEvent::UserEnd);
             // Route through the console so its bookkeeping (and the browser) see the end;
             // the session loop also exits when the peer connection closes.
             hub.send(AgentToConsole::SessionState {

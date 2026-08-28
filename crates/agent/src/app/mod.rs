@@ -87,6 +87,12 @@ pub enum AppEvent {
     },
     /// Messages from the session bar page.
     Bar(bar::BarIpc),
+    /// Remote control paused / resumed by the device user (state for bar + window).
+    ControlPaused {
+        paused: bool,
+    },
+    /// Global shortcut (⌥⌘P): toggle the pause while a session is active.
+    TogglePause,
     Quit,
     /// Internal: the page finished loading and is ready to receive JS.
     #[doc(hidden)]
@@ -108,6 +114,9 @@ static GLOBAL_DISCONNECT: parking_lot::Mutex<Option<DisconnectCb>> = parking_lot
 /// Applies device-side restriction changes (persist + recompute + apply live). Set by the hub.
 type OverridesCb = Arc<dyn Fn(LocalOverrides) + Send + Sync>;
 static OVERRIDES_CB: parking_lot::Mutex<Option<OverridesCb>> = parking_lot::Mutex::new(None);
+/// Pause / resume remote control on the active session (session bar emergency switch).
+type PauseCb = Arc<dyn Fn(bool) + Send + Sync>;
+static PAUSE_CB: parking_lot::Mutex<Option<PauseCb>> = parking_lot::Mutex::new(None);
 static PROXY: OnceLock<parking_lot::Mutex<Option<Proxy>>> = OnceLock::new();
 /// Config dir used to persist small UI state (session bar position).
 static STATE_DIR: parking_lot::Mutex<Option<std::path::PathBuf>> = parking_lot::Mutex::new(None);
@@ -152,6 +161,24 @@ pub fn set_global_disconnect(cb: DisconnectCb) {
 /// Register the handler the Settings screen calls when the local restrictions change.
 pub fn set_overrides_handler(cb: OverridesCb) {
     *OVERRIDES_CB.lock() = Some(cb);
+}
+
+/// Register the handler for the session bar's "Pause control" / "Resume control" switch.
+pub fn set_pause_handler(cb: PauseCb) {
+    *PAUSE_CB.lock() = Some(cb);
+}
+
+/// Called from the bar / window / shortcut when the device user pauses or resumes control.
+fn dispatch_pause(paused: bool) {
+    let cb = PAUSE_CB.lock().clone();
+    if let Some(cb) = cb {
+        cb(paused);
+    }
+}
+
+/// The session reports its pause state so the bar and the window render it.
+pub fn set_control_paused_state(paused: bool) {
+    post(AppEvent::ControlPaused { paused });
 }
 
 /// Called from the webview IPC when the local user changes the restrictions.

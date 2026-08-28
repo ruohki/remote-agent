@@ -1304,3 +1304,183 @@ async fn local_override_blocks_input_live() {
 
     h.end().await;
 }
+
+/// The session bar's emergency switch: pausing drops remote input immediately, tells the
+/// browser (`control_paused`) and the console (`SessionEvent::ControlPaused`); only the device
+/// side resumes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn device_pause_control_blocks_input_and_notifies() {
+    use protocol::agent::SessionEvent;
+    use protocol::config::AgentConfig;
+
+    let mut h = Harness::connect(Options {
+        config: AgentConfig {
+            max_fps: 30,
+            allow_input: true,
+            ..AgentConfig::default()
+        },
+        ..Default::default()
+    })
+    .await;
+    next_control(&mut h.control_rx, |m| {
+        matches!(m, ControlMessage::DisplayInfo { .. })
+    })
+    .await;
+
+    // Baseline: input flows.
+    send_bytes(
+        &h.input_dc,
+        &serde_json::to_vec(&InputEvent::MouseDown {
+            button: MouseButton::Left,
+        })
+        .unwrap(),
+    )
+    .await;
+    let reached = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if !h.input_events.lock().unwrap().is_empty() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(reached, "input should reach the injector before the pause");
+
+    // Device user hits "Pause control".
+    let releases_before = h.releases.load(Ordering::SeqCst);
+    h.sessions.set_control_paused(true);
+    next_control(&mut h.control_rx, |m| {
+        matches!(m, ControlMessage::ControlPaused { paused: true })
+    })
+    .await;
+    let ev = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match h.hub_events.recv().await {
+                Some(AgentToConsole::SessionEvent {
+                    event: SessionEvent::ControlPaused { paused: true },
+                    ..
+                }) => return true,
+                Some(_) => continue,
+                None => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        ev,
+        "console must receive SessionEvent::ControlPaused {{ paused: true }}"
+    );
+    assert!(
+        h.releases.load(Ordering::SeqCst) > releases_before,
+        "pausing must release held keys/buttons"
+    );
+
+    let before = h.input_events.lock().unwrap().len();
+    for _ in 0..5 {
+        send_bytes(
+            &h.input_dc,
+            &serde_json::to_vec(&InputEvent::MouseDown {
+                button: MouseButton::Right,
+            })
+            .unwrap(),
+        )
+        .await;
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        before,
+        h.input_events.lock().unwrap().len(),
+        "input injected while paused must be dropped"
+    );
+
+    // Nothing the operator sends lifts the pause (control messages keep working, input stays off).
+    send_json(&h.control_dc, &ControlMessage::RequestKeyframe).await;
+    send_json(
+        &h.control_dc,
+        &ControlMessage::SetQuality {
+            max_fps: Some(15),
+            max_bitrate_kbps: None,
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    send_bytes(
+        &h.input_dc,
+        &serde_json::to_vec(&InputEvent::MouseDown {
+            button: MouseButton::Middle,
+        })
+        .unwrap(),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(before, h.input_events.lock().unwrap().len());
+
+    // Only the device user resumes.
+    h.sessions.set_control_paused(false);
+    next_control(&mut h.control_rx, |m| {
+        matches!(m, ControlMessage::ControlPaused { paused: false })
+    })
+    .await;
+    send_bytes(
+        &h.input_dc,
+        &serde_json::to_vec(&InputEvent::MouseDown {
+            button: MouseButton::Left,
+        })
+        .unwrap(),
+    )
+    .await;
+    let resumed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if h.input_events.lock().unwrap().len() > before {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(resumed, "input must flow again after resume");
+
+    h.end().await;
+}
+
+/// "End session" on the window / session bar ends the session locally and reports it as
+/// closed by the device user.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn device_end_button_ends_session() {
+    let mut h = Harness::connect(Options::default()).await;
+    next_control(&mut h.control_rx, |m| {
+        matches!(m, ControlMessage::DisplayInfo { .. })
+    })
+    .await;
+
+    h.chat.press_disconnect();
+
+    let ended = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match h.hub_events.recv().await {
+                Some(AgentToConsole::SessionState {
+                    state: SessionState::Ended,
+                    reason,
+                    ..
+                }) => return reason,
+                Some(_) => continue,
+                None => return None,
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten();
+    assert_eq!(ended, Some(EndReason::DeviceUserClosed));
+    // The session loop exits on its own (UserEnd), without waiting for the console or peer.
+    let started = std::time::Instant::now();
+    h.sessions.wait_idle(Duration::from_secs(10)).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "session task must finish promptly after the device user ended it"
+    );
+}

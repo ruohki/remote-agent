@@ -1034,6 +1034,63 @@ pub fn install_input_guard() {
     });
 }
 
+/// ⌥⌘P toggles "Pause control" while a session is active (the session bar's emergency
+/// switch). Global monitor for keys typed into other apps (needs Accessibility, which remote
+/// control requires anyway) plus a local one for our own windows. Idempotent.
+pub fn install_pause_hotkey() {
+    static HOTKEY: std::sync::Once = std::sync::Once::new();
+    HOTKEY.call_once(|| {
+        let _ = run_on_main(|| {
+            let Some(_mtm) = MainThreadMarker::new() else {
+                return;
+            };
+            fn is_pause_chord(event: &NSEvent) -> bool {
+                use objc2_app_kit::NSEventModifierFlags;
+                let flags = event.modifierFlags();
+                let want = NSEventModifierFlags::Option | NSEventModifierFlags::Command;
+                let mask = NSEventModifierFlags::Option
+                    | NSEventModifierFlags::Command
+                    | NSEventModifierFlags::Control
+                    | NSEventModifierFlags::Shift;
+                // keyCode 35 = P on every layout that has one.
+                flags.intersection(mask) == want && event.keyCode() == 35
+            }
+            let global = RcBlock::new(|event: std::ptr::NonNull<NSEvent>| {
+                // SAFETY: live NSEvent for the duration of the call.
+                let event: &NSEvent = unsafe { event.as_ref() };
+                if !event_is_injected(event) && is_pause_chord(event) {
+                    crate::app::post(crate::app::AppEvent::TogglePause);
+                }
+            });
+            let local = RcBlock::new(|event: std::ptr::NonNull<NSEvent>| -> *mut NSEvent {
+                // SAFETY: as above.
+                let event: &NSEvent = unsafe { event.as_ref() };
+                if !event_is_injected(event) && is_pause_chord(event) {
+                    crate::app::post(crate::app::AppEvent::TogglePause);
+                    return std::ptr::null_mut();
+                }
+                event as *const NSEvent as *mut NSEvent
+            });
+            // SAFETY: valid mask + blocks with the expected signatures; monitors are leaked
+            // for the process lifetime on purpose.
+            unsafe {
+                let g = NSEvent::addGlobalMonitorForEventsMatchingMask_handler(
+                    NSEventMask::KeyDown,
+                    &global,
+                );
+                std::mem::forget(g);
+                let l = NSEvent::addLocalMonitorForEventsMatchingMask_handler(
+                    NSEventMask::KeyDown,
+                    &local,
+                );
+                std::mem::forget(l);
+            }
+            std::mem::forget(global);
+            std::mem::forget(local);
+        });
+    });
+}
+
 fn event_is_injected(event: &NSEvent) -> bool {
     if let Some(cg) = event.CGEvent() {
         let v = objc2_core_graphics::CGEvent::integer_value_field(
