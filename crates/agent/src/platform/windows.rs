@@ -308,14 +308,48 @@ const ID_TRANSCRIPT: usize = 1004;
 const WM_APP_REFRESH: u32 = WM_USER + 1;
 const EN_RETURN_HACK: u32 = 0;
 
+/// Callbacks of the session currently attached to the (single) chat window; `None` between
+/// sessions, when typing / Disconnect are no-ops.
+type SendCb = Arc<dyn Fn(String) + Send + Sync>;
+type DisconnectCb = Arc<dyn Fn() + Send + Sync>;
+
 struct ChatShared {
-    on_send: Arc<dyn Fn(String) + Send + Sync>,
-    on_disconnect: Arc<dyn Fn() + Send + Sync>,
+    callbacks: Mutex<Option<(SendCb, DisconnectCb)>>,
     text: Mutex<String>,
     hwnd: Mutex<Option<isize>>,
     transcript: Mutex<Option<isize>>,
     input: Mutex<Option<isize>>,
 }
+
+impl ChatShared {
+    fn on_send(&self, text: String) {
+        let cb = self
+            .callbacks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|(s, _)| Arc::clone(s));
+        match cb {
+            Some(cb) => cb(text),
+            None => tracing::debug!("chat line typed but no session is attached"),
+        }
+    }
+    fn on_disconnect(&self) {
+        let cb = self
+            .callbacks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|(_, d)| Arc::clone(d));
+        match cb {
+            Some(cb) => cb(),
+            None => tracing::debug!("disconnect pressed but no session is attached"),
+        }
+    }
+}
+
+/// The process-wide chat window (created on the first session, re-used afterwards).
+static CHAT: Mutex<Option<Arc<ChatShared>>> = Mutex::new(None);
 
 /// Whether `msg` is a mouse or keyboard input message (for the injected-input guard).
 fn is_input_message(msg: u32) -> bool {
@@ -353,11 +387,11 @@ unsafe extern "system" fn chat_wndproc(
                             let text = String::from_utf16_lossy(&buf[..n]);
                             if !text.trim().is_empty() {
                                 let _ = SetWindowTextW(input, windows::core::w!(""));
-                                (shared.on_send)(text);
+                                shared.on_send(text);
                             }
                         }
                     }
-                    ID_DISCONNECT => (shared.on_disconnect)(),
+                    ID_DISCONNECT => shared.on_disconnect(),
                     _ => {}
                 }
             }
@@ -448,12 +482,20 @@ impl ChatHandle for ChatWindowHandle {
 
 impl Drop for ChatWindowHandle {
     fn drop(&mut self) {
-        if let Some(h) = *self.shared.hwnd.lock().unwrap_or_else(|e| e.into_inner()) {
-            // SAFETY: WM_CLOSE-equivalent teardown through DestroyWindow on the UI thread.
-            unsafe {
-                let _ = PostMessageW(Some(HWND(h as *mut _)), WM_USER + 2, WPARAM(0), LPARAM(0));
+        // Detach the session; the window itself lives for the whole process and is hidden.
+        *self
+            .shared
+            .callbacks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        {
+            let mut t = self.shared.text.lock().unwrap_or_else(|e| e.into_inner());
+            if !t.is_empty() {
+                t.push_str("\r\n");
             }
+            t.push_str("— Session ended —");
         }
+        self.set_visible(false);
     }
 }
 
@@ -463,15 +505,36 @@ pub fn open_chat(
     on_send: Arc<dyn Fn(String) + Send + Sync>,
     on_disconnect: Arc<dyn Fn() + Send + Sync>,
 ) -> Result<Box<dyn ChatHandle>> {
+    let title = HSTRING::from(format!("Chat with {operator}"));
+    // Re-use the existing window: new callbacks, empty transcript, new title.
+    let existing = CHAT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(Arc::clone);
+    if let Some(shared) = existing {
+        *shared.callbacks.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((on_send, on_disconnect));
+        shared
+            .text
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        if let Some(h) = *shared.hwnd.lock().unwrap_or_else(|e| e.into_inner()) {
+            // SAFETY: our own window; WM_SETTEXT is marshalled across threads.
+            unsafe {
+                let _ = SetWindowTextW(HWND(h as *mut _), &title);
+            }
+        }
+        return Ok(Box::new(ChatWindowHandle { shared }));
+    }
     let shared = Arc::new(ChatShared {
-        on_send,
-        on_disconnect,
+        callbacks: Mutex::new(Some((on_send, on_disconnect))),
         text: Mutex::new(String::new()),
         hwnd: Mutex::new(None),
         transcript: Mutex::new(None),
         input: Mutex::new(None),
     });
-    let title = HSTRING::from(format!("Chat with {operator}"));
     let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
     let thread_shared = Arc::clone(&shared);
     std::thread::Builder::new()
@@ -587,7 +650,8 @@ pub fn open_chat(
                     // Exclude our window from screen capture (Win10 2004+ / DXGI duplication);
                     // silently ignored on older builds.
                     let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
-                    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                    // Created hidden: the session shows it on the first operator message.
+                    let _ = ShowWindow(hwnd, SW_HIDE);
                     Ok(())
                 })()
             };
@@ -614,6 +678,7 @@ pub fn open_chat(
     ready_rx
         .recv_timeout(Duration::from_secs(5))
         .context("chat window did not start")??;
+    *CHAT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&shared));
     Ok(Box::new(ChatWindowHandle { shared }))
 }
 

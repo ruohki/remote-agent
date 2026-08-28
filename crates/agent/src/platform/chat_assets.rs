@@ -5,7 +5,9 @@
 //! * JS → Rust: `window.__ipc(json)` posts `{type:"ready"}` / `{type:"send",text}` /
 //!   `{type:"disconnect"}` (each platform wires `__ipc` to its native bridge).
 //! * Rust → JS: `window.__agent.push({from,text,ts_ms})`, `window.__agent.setOperator(name)`,
-//!   `window.__agent.setStatus(text)`, `window.__agent.setConnected(bool)`.
+//!   `window.__agent.setStatus(text)`, `window.__agent.setConnected(bool)` (also enables /
+//!   disables the composer and the End-session button), `window.__agent.reset(operator)`
+//!   (empty transcript + new operator when the next session attaches).
 
 /// Build the chat page for `operator`. `operator` is inserted as a JS string literal
 /// (JSON-escaped) so it cannot break out of the script.
@@ -141,12 +143,16 @@ const HTML: &str = r#"<!doctype html>
   }
   #box::placeholder { color: var(--muted); }
   #send {
-    flex: 0 0 auto; width: 34px; height: 34px; border-radius: 50%; border: none;
-    background: var(--accent); color: #fff; cursor: pointer; display: grid; place-items: center;
-    transition: opacity .12s;
+    flex: 0 0 36px; width: 36px; height: 36px; margin: 0; padding: 0; line-height: 0;
+    border-radius: 50%; border: none; background: var(--accent); color: #fff; cursor: pointer;
+    display: inline-flex; align-items: center; justify-content: center; position: relative;
+    -webkit-appearance: none; appearance: none; transition: opacity .12s;
   }
+  /* 44px hit area around the 36px button. */
+  #send::after { content: ''; position: absolute; inset: -4px; border-radius: 50%; }
   #send:disabled { opacity: .4; cursor: default; }
-  #send svg { width: 17px; height: 17px; }
+  /* The paper plane glyph leans down-right; nudge it back onto the optical centre. */
+  #send svg { width: 18px; height: 18px; display: block; transform: translate(-1px, 1px); }
 </style>
 </head>
 <body>
@@ -200,7 +206,27 @@ const HTML: &str = r#"<!doctype html>
     document.getElementById('emptyTitle').textContent = 'Say hi to ' + OPERATOR + ' 👋';
   }
   function setStatus(t) { statusEl.textContent = t; }
-  function setConnected(on) { dot.classList.toggle('on', !!on); }
+  var CONNECTED = false;
+  function setConnected(on) {
+    CONNECTED = !!on;
+    dot.classList.toggle('on', CONNECTED);
+    document.getElementById('end').style.display = CONNECTED ? '' : 'none';
+    box.disabled = !CONNECTED;
+    box.placeholder = CONNECTED ? 'Message…' : 'The session has ended.';
+    send.disabled = !CONNECTED || box.value.trim() === '';
+  }
+  /* Re-point the window at a new session: empty transcript, new operator. */
+  function reset(name) {
+    while (log.firstChild) log.removeChild(log.firstChild);
+    empty = document.createElement('div'); empty.className = 'empty'; empty.id = 'empty';
+    var big = document.createElement('div'); big.className = 'big'; big.id = 'emptyTitle';
+    var sub = document.createElement('div'); sub.textContent = 'Messages you send here are private to this session.';
+    empty.appendChild(big); empty.appendChild(sub); log.appendChild(empty);
+    lastFrom = null; lastRow = null; lastDay = null;
+    pill.classList.remove('show');
+    box.value = ''; autosize();
+    setOperator(name);
+  }
 
   function fmtTime(ms) {
     try { return new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); }
@@ -232,15 +258,15 @@ const HTML: &str = r#"<!doctype html>
     else { pill.classList.add('show'); }
   }
 
-  window.__agent = { push: push, setOperator: setOperator, setStatus: setStatus, setConnected: setConnected };
+  window.__agent = { push: push, setOperator: setOperator, setStatus: setStatus, setConnected: setConnected, reset: reset };
 
   pill.addEventListener('click', function () { log.scrollTop = log.scrollHeight; pill.classList.remove('show'); });
   log.addEventListener('scroll', function () { if (nearBottom()) pill.classList.remove('show'); });
 
-  function autosize() { box.style.height = 'auto'; box.style.height = Math.min(box.scrollHeight, 120) + 'px'; send.disabled = box.value.trim() === ''; }
+  function autosize() { box.style.height = 'auto'; box.style.height = Math.min(box.scrollHeight, 120) + 'px'; send.disabled = !CONNECTED || box.value.trim() === ''; }
   box.addEventListener('input', autosize);
   function doSend() {
-    var t = box.value.trim(); if (!t) return;
+    var t = box.value.trim(); if (!t || !CONNECTED) return;
     ipc({ type: 'send', text: t });
     box.value = ''; autosize(); box.focus();
   }

@@ -545,7 +545,8 @@ async fn run_session(
             reason
         };
     session.teardown().await;
-    tracing::info!(session = %session_id, ?reason, "session ended");
+    let (total, visible) = crate::platform::window_counts();
+    tracing::info!(session = %session_id, ?reason, total, visible, "session ended");
     report(SessionState::Ended, Some(reason));
 }
 
@@ -663,6 +664,8 @@ impl Session {
             }
             Err(e) => tracing::warn!("chat window unavailable: {e:#}"),
         }
+        let (total, visible) = crate::platform::window_counts();
+        tracing::info!(total, visible, "session ui opened");
         Ok(())
     }
 

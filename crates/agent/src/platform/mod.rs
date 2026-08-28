@@ -222,6 +222,21 @@ pub fn secure_attention() {
 }
 
 /// Whether screen capture is permitted (always true outside macOS).
+/// `(total, visible)` windows of this process (macOS only; `(0, 0)` elsewhere or without a UI loop).
+pub fn window_counts() -> (usize, usize) {
+    #[cfg(target_os = "macos")]
+    {
+        if main_loop_running() {
+            return macos::window_counts();
+        }
+        (0, 0)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        (0, 0)
+    }
+}
+
 pub fn screen_capture_allowed() -> bool {
     #[cfg(target_os = "macos")]
     {

@@ -66,6 +66,29 @@ pub fn run_on_main<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) ->
 // ─── console user & permissions ─────────────────────────────────────────────────────────
 
 /// (uid, name) of the user owning the console (`/dev/console`), if someone is logged in.
+/// `(total, visible)` windows owned by this process — diagnostics for window leaks.
+pub fn window_counts() -> (usize, usize) {
+    run_on_main(|| {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return (0, 0);
+        };
+        let app = NSApplication::sharedApplication(mtm);
+        let windows = app.windows();
+        let total = windows.len();
+        let visible = windows.iter().filter(|w| w.isVisible()).count();
+        for w in windows.iter() {
+            tracing::debug!(
+                class = %w.class().name().to_str().unwrap_or("?"),
+                title = %w.title(),
+                visible = w.isVisible(),
+                "window"
+            );
+        }
+        (total, visible)
+    })
+    .unwrap_or((0, 0))
+}
+
 pub fn console_user() -> Option<(u32, String)> {
     let path = c"/dev/console";
     // SAFETY: stat with a valid NUL terminated path and a zeroed out-struct.
@@ -165,9 +188,21 @@ pub fn approval_dialog(operator: &str, timeout: Duration) -> Result<ApprovalOutc
 }
 
 // ─── session indicator ──────────────────────────────────────────────────────────────────
+//
+// One banner panel per process: created on first use, re-pointed at each new session
+// (operator name + callback), hidden when the session ends. Never destroyed.
+
+/// Callback of the session currently attached to the banner (no-op between sessions).
+struct BannerShared {
+    on_disconnect: parking_lot::Mutex<Arc<dyn Fn() + Send + Sync>>,
+}
+
+fn detached_disconnect() -> Arc<dyn Fn() + Send + Sync> {
+    Arc::new(|| tracing::debug!("disconnect pressed but no session is attached"))
+}
 
 struct TargetIvars {
-    on_disconnect: Arc<dyn Fn() + Send + Sync>,
+    shared: Arc<BannerShared>,
 }
 
 define_class!(
@@ -181,7 +216,8 @@ define_class!(
     impl IndicatorTarget {
         #[unsafe(method(disconnect:))]
         fn disconnect(&self, _sender: Option<&AnyObject>) {
-            (self.ivars().on_disconnect)();
+            let cb = Arc::clone(&*self.ivars().shared.on_disconnect.lock());
+            cb();
         }
     }
 
@@ -189,24 +225,30 @@ define_class!(
 );
 
 impl IndicatorTarget {
-    fn new(mtm: MainThreadMarker, on_disconnect: Arc<dyn Fn() + Send + Sync>) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(TargetIvars { on_disconnect });
+    fn new(mtm: MainThreadMarker, shared: Arc<BannerShared>) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(TargetIvars { shared });
         // SAFETY: plain NSObject init on a freshly allocated instance.
         unsafe { msg_send![super(this), init] }
     }
 }
 
-/// Handle whose drop closes the indicator panel on the main thread.
-///
-/// The panel and its button target are AppKit objects (`!Send`), so we keep them as raw
-/// `Retained` pointers (stored as addresses) and only ever touch them on the main thread —
-/// where they were created and where drop dispatches their release.
-struct PanelHandle {
+/// The process-wide banner. Addresses are `Retained` pointers leaked on purpose (the banner
+/// lives as long as the process) and only dereferenced on the main thread.
+struct BannerSingleton {
     panel_addr: usize,
-    target_addr: usize,
+    label_addr: usize,
+    shared: Arc<BannerShared>,
 }
 
-// SAFETY: the addresses are only converted back to `Retained` on the main queue.
+static BANNER: parking_lot::Mutex<Option<BannerSingleton>> = parking_lot::Mutex::new(None);
+
+/// Session-scoped handle: dropping it detaches the session and hides the banner.
+struct PanelHandle {
+    panel_addr: usize,
+    shared: Arc<BannerShared>,
+}
+
+// SAFETY: the address is only dereferenced on the main queue.
 unsafe impl Send for PanelHandle {}
 unsafe impl Sync for PanelHandle {}
 
@@ -214,31 +256,53 @@ impl IndicatorHandle for PanelHandle {}
 
 impl Drop for PanelHandle {
     fn drop(&mut self) {
+        *self.shared.on_disconnect.lock() = detached_disconnect();
         let panel_addr = self.panel_addr;
-        let target_addr = self.target_addr;
         DispatchQueue::main().exec_async(move || {
-            // SAFETY: reclaims the +1 references created in `show_indicator`; runs on the main
-            // thread, and each address is turned back into a `Retained` exactly once.
-            unsafe {
-                if let Some(panel) = Retained::from_raw(panel_addr as *mut NSPanel) {
-                    let window: &NSWindow = &panel;
-                    window.close();
-                }
-                let _ = Retained::from_raw(target_addr as *mut IndicatorTarget);
-            }
+            // SAFETY: main thread; the banner panel lives for the whole process.
+            let panel: &NSPanel = unsafe { &*(panel_addr as *const NSPanel) };
+            panel.orderOut(None);
         });
     }
 }
 
-/// Create the banner. Returns a handle whose drop closes the panel.
+fn banner_text(operator: &str) -> String {
+    format!("{operator} is controlling this computer")
+}
+
+/// Show the banner for `operator`. Returns a handle whose drop hides the banner again.
 pub fn show_indicator(
     operator: &str,
     on_disconnect: Arc<dyn Fn() + Send + Sync>,
 ) -> Result<Box<dyn IndicatorHandle>> {
     let operator = operator.to_owned();
+    // Attach to the existing banner when there is one.
+    let existing = BANNER
+        .lock()
+        .as_ref()
+        .map(|b| (b.panel_addr, b.label_addr, Arc::clone(&b.shared)));
+    if let Some((panel_addr, label_addr, shared)) = existing {
+        *shared.on_disconnect.lock() = on_disconnect;
+        let text = banner_text(&operator);
+        run_on_main(move || {
+            // SAFETY: main thread; both objects live for the whole process.
+            unsafe {
+                let label: &NSTextField = &*(label_addr as *const NSTextField);
+                label.setStringValue(&NSString::from_str(&text));
+                let panel: &NSPanel = &*(panel_addr as *const NSPanel);
+                panel.orderFrontRegardless();
+            }
+        })?;
+        return Ok(Box::new(PanelHandle { panel_addr, shared }));
+    }
+
+    let shared = Arc::new(BannerShared {
+        on_disconnect: parking_lot::Mutex::new(on_disconnect),
+    });
+    let shared_for_main = Arc::clone(&shared);
     let (tx, rx) = mpsc::channel();
     run_on_main(move || {
-        let result = (|| -> Result<Banner> {
+        let result = (|| -> Result<(usize, usize)> {
             let mtm = MainThreadMarker::new().context("not on main thread")?;
             let width = 360.0;
             let height = 44.0;
@@ -266,18 +330,16 @@ pub fn show_indicator(
                     | NSWindowCollectionBehavior::Stationary,
             );
             panel.setHidesOnDeactivate(false);
-            // SAFETY: the panel is retained by us and released explicitly on close.
+            // SAFETY: the panel is retained by us for the whole process.
             unsafe { panel.setReleasedWhenClosed(false) };
             // Keep the banner out of the screen capture the operator sees.
             if std::env::var_os("REMOTE_AGENT_SHOW_WINDOWS").is_none() {
                 panel.setSharingType(NSWindowSharingType::None);
             }
 
-            let target = IndicatorTarget::new(mtm, on_disconnect);
-            let label = NSTextField::labelWithString(
-                &NSString::from_str(&format!("{operator} is controlling this computer")),
-                mtm,
-            );
+            let target = IndicatorTarget::new(mtm, shared_for_main);
+            let label =
+                NSTextField::labelWithString(&NSString::from_str(&banner_text(&operator)), mtm);
             label.setFrame(NSRect::new(
                 NSPoint::new(12.0, 12.0),
                 NSSize::new(width - 120.0, 20.0),
@@ -300,35 +362,32 @@ pub fn show_indicator(
                 content.addSubview(&button);
             }
             panel.orderFrontRegardless();
-            Ok(Banner { panel, target })
+            // Leak the +1 references on purpose: the banner lives as long as the process.
+            let _ = Retained::into_raw(target);
+            let label_addr = Retained::into_raw(label) as usize;
+            let panel_addr = Retained::into_raw(panel) as usize;
+            Ok((panel_addr, label_addr))
         })();
-        // Convert to raw addresses so they can cross the channel and later the main queue
-        // (Retained is !Send). Ownership passes to PanelHandle.
-        let sendable = result.map(|b| {
-            let panel_addr = Retained::into_raw(b.panel) as usize;
-            let target_addr = Retained::into_raw(b.target) as usize;
-            (panel_addr, target_addr)
-        });
-        let _ = tx.send(sendable);
+        let _ = tx.send(result);
     })?;
-    let (panel_addr, target_addr) = rx.recv().context("indicator task dropped")??;
-    Ok(Box::new(PanelHandle {
+    let (panel_addr, label_addr) = rx.recv().context("indicator task dropped")??;
+    *BANNER.lock() = Some(BannerSingleton {
         panel_addr,
-        target_addr,
-    }))
-}
-
-struct Banner {
-    panel: Retained<NSPanel>,
-    target: Retained<IndicatorTarget>,
+        label_addr,
+        shared: Arc::clone(&shared),
+    });
+    Ok(Box::new(PanelHandle { panel_addr, shared }))
 }
 
 // ─── chat window: a WKWebView hosting the messaging UI (see chat_assets.rs) ───────────────
 //
 // The window is an `NSPanel` whose content view is a `WKWebView`. IPC: JS posts to a
 // `WKScriptMessageHandler` named "agent"; Rust drives the page with `evaluateJavaScript`.
-// Closing the window HIDES it (the session keeps running); the local user re-opens it from the
-// menu-bar item or the banner. Remote-injected events are dropped app-wide by `install_input_guard`.
+// There is exactly ONE chat window per process: it is created hidden on the first session and
+// re-used afterwards (operator name swapped, transcript reset). Closing the window HIDES it
+// (the session keeps running); the local user re-opens it from the menu-bar item. When a
+// session ends the window shows "Session ended" and is hidden unless the user is looking at
+// it. Remote-injected events are dropped app-wide by `install_input_guard`.
 
 use crate::chat::{ChatHandle, ChatLine};
 use crate::platform::chat_assets::chat_html;
@@ -340,24 +399,59 @@ use objc2_web_kit::{
 };
 use protocol::channel::ChatParty;
 
+type SendCb = Arc<dyn Fn(String) + Send + Sync>;
+type DisconnectCb = Arc<dyn Fn() + Send + Sync>;
+
+/// Callbacks of the session currently attached to the window (no-ops between sessions).
+struct ChatCallbacks {
+    on_send: SendCb,
+    on_disconnect: DisconnectCb,
+}
+
+impl ChatCallbacks {
+    fn detached() -> Self {
+        Self {
+            on_send: Arc::new(|_| tracing::debug!("chat line typed but no session is attached")),
+            on_disconnect: detached_disconnect(),
+        }
+    }
+}
+
+/// State shared between the IPC delegate, the [`ChatHandle`]s and the singleton registry.
+///
+/// The page is only driven after it reported `ready` (scripts evaluated before the HTML
+/// finished loading are lost), so lines are buffered and replayed on the handshake.
+#[derive(Default)]
+struct ChatShared {
+    ready: std::sync::atomic::AtomicBool,
+    /// Whether a session is attached (drives the connected state shown in the page).
+    active: std::sync::atomic::AtomicBool,
+    /// JS snippets of the current session's transcript (replayed verbatim on `ready`).
+    lines: parking_lot::Mutex<Vec<String>>,
+    callbacks: parking_lot::Mutex<Option<ChatCallbacks>>,
+    /// Operator lines since the local user last replied or closed the window.
+    unread: std::sync::atomic::AtomicUsize,
+}
+
+impl ChatShared {
+    fn callbacks(&self) -> (SendCb, DisconnectCb) {
+        let guard = self.callbacks.lock();
+        match guard.as_ref() {
+            Some(c) => (Arc::clone(&c.on_send), Arc::clone(&c.on_disconnect)),
+            None => {
+                let d = ChatCallbacks::detached();
+                (d.on_send, d.on_disconnect)
+            }
+        }
+    }
+}
+
 struct ChatDelegateIvars {
-    on_send: Arc<dyn Fn(String) + Send + Sync>,
-    on_disconnect: Arc<dyn Fn() + Send + Sync>,
     /// Set once the panel exists so `windowShouldClose:` can hide it.
     panel_addr: std::sync::atomic::AtomicUsize,
     /// Set once the webview exists so the `ready` handshake can drive the page.
     webview_addr: std::sync::atomic::AtomicUsize,
     shared: Arc<ChatShared>,
-}
-
-/// State shared between the IPC delegate and the [`ChatHandle`]: the page is only driven
-/// after it reported `ready` (scripts evaluated before the HTML finished loading are lost),
-/// so lines are buffered and replayed on the handshake.
-#[derive(Default)]
-struct ChatShared {
-    ready: std::sync::atomic::AtomicBool,
-    /// JS snippets in transcript order (replayed verbatim on `ready`).
-    lines: parking_lot::Mutex<Vec<String>>,
 }
 
 define_class!(
@@ -385,11 +479,14 @@ define_class!(
                 return;
             };
             let json = s.to_string();
+            let iv = self.ivars();
             match serde_json::from_str::<IpcIn>(&json) {
-                Ok(IpcIn::Send { text }) => (self.ivars().on_send)(text),
-                Ok(IpcIn::Disconnect) => (self.ivars().on_disconnect)(),
+                Ok(IpcIn::Send { text }) => {
+                    iv.shared.unread.store(0, Ordering::SeqCst);
+                    (iv.shared.callbacks().0)(text)
+                }
+                Ok(IpcIn::Disconnect) => (iv.shared.callbacks().1)(),
                 Ok(IpcIn::Ready) => {
-                    let iv = self.ivars();
                     // The page reports ready twice (inline + load event); replay once.
                     if iv.shared.ready.swap(true, Ordering::SeqCst) {
                         return;
@@ -397,9 +494,12 @@ define_class!(
                     tracing::info!("chat window ready");
                     let wv = iv.webview_addr.load(Ordering::SeqCst);
                     if wv != 0 {
-                        let mut js = String::from(
-                            "window.__agent&&(window.__agent.setConnected(true),window.__agent.setStatus('Connected'));",
-                        );
+                        let mut js = String::new();
+                        if iv.shared.active.load(Ordering::SeqCst) {
+                            js.push_str(CONNECTED_JS);
+                        } else {
+                            js.push_str(ENDED_JS);
+                        }
                         for line in iv.shared.lines.lock().iter() {
                             js.push_str(line);
                         }
@@ -416,9 +516,10 @@ define_class!(
         #[unsafe(method(windowShouldClose:))]
         #[allow(non_snake_case)]
         fn windowShouldClose(&self, _sender: &NSWindow) -> bool {
+            self.ivars().shared.unread.store(0, Ordering::SeqCst);
             let addr = self.ivars().panel_addr.load(Ordering::SeqCst);
             if addr != 0 {
-                // SAFETY: panel_addr is a live NSPanel while the delegate exists.
+                // SAFETY: panel_addr is a live NSPanel (process lifetime).
                 let panel: &NSPanel = unsafe { &*(addr as *const NSPanel) };
                 panel.orderOut(None);
             }
@@ -428,15 +529,8 @@ define_class!(
 );
 
 impl ChatDelegate {
-    fn new(
-        mtm: MainThreadMarker,
-        on_send: Arc<dyn Fn(String) + Send + Sync>,
-        on_disconnect: Arc<dyn Fn() + Send + Sync>,
-        shared: Arc<ChatShared>,
-    ) -> Retained<Self> {
+    fn new(mtm: MainThreadMarker, shared: Arc<ChatShared>) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(ChatDelegateIvars {
-            on_send,
-            on_disconnect,
             panel_addr: std::sync::atomic::AtomicUsize::new(0),
             webview_addr: std::sync::atomic::AtomicUsize::new(0),
             shared,
@@ -454,15 +548,28 @@ enum IpcIn {
     Disconnect,
 }
 
-/// Handle whose drop closes the chat panel on the main thread.
-struct ChatWebHandle {
+const CONNECTED_JS: &str =
+    "window.__agent&&(window.__agent.setConnected(true),window.__agent.setStatus('Connected'));";
+const ENDED_JS: &str = "window.__agent&&(window.__agent.setConnected(false),window.__agent.setStatus('Session ended'));";
+
+/// The process-wide chat window. Addresses are `Retained` pointers leaked on purpose and only
+/// dereferenced on the main thread.
+struct ChatSingleton {
     panel_addr: usize,
     webview_addr: usize,
-    delegate_addr: usize,
     shared: Arc<ChatShared>,
 }
 
-// SAFETY: addresses are only reconstituted on the main queue.
+static CHAT: parking_lot::Mutex<Option<ChatSingleton>> = parking_lot::Mutex::new(None);
+
+/// Session-scoped handle: dropping it detaches the session from the window (which stays).
+struct ChatWebHandle {
+    panel_addr: usize,
+    webview_addr: usize,
+    shared: Arc<ChatShared>,
+}
+
+// SAFETY: addresses are only dereferenced on the main queue.
 unsafe impl Send for ChatWebHandle {}
 unsafe impl Sync for ChatWebHandle {}
 
@@ -479,8 +586,8 @@ impl ChatHandle for ChatWebHandle {
         if self.shared.ready.load(Ordering::SeqCst) {
             eval_js(self.webview_addr, js);
         }
-        let show = matches!(line.from, ChatParty::Operator);
-        if show {
+        if matches!(line.from, ChatParty::Operator) {
+            self.shared.unread.fetch_add(1, Ordering::SeqCst);
             self.set_visible(true);
         }
     }
@@ -488,7 +595,7 @@ impl ChatHandle for ChatWebHandle {
     fn set_visible(&self, visible: bool) {
         let panel_addr = self.panel_addr;
         DispatchQueue::main().exec_async(move || {
-            // SAFETY: main thread; panel alive while the handle exists.
+            // SAFETY: main thread; the panel lives for the whole process.
             unsafe {
                 let panel: &NSPanel = &*(panel_addr as *const NSPanel);
                 if visible {
@@ -503,28 +610,24 @@ impl ChatHandle for ChatWebHandle {
 
 impl Drop for ChatWebHandle {
     fn drop(&mut self) {
-        let (panel_addr, webview_addr, delegate_addr) =
-            (self.panel_addr, self.webview_addr, self.delegate_addr);
-        clear_menu_chat();
-        DispatchQueue::main().exec_async(move || {
-            // SAFETY: reclaims the +1 refs from `open_chat`; main thread; once each.
-            unsafe {
-                if let Some(panel) = Retained::from_raw(panel_addr as *mut NSPanel) {
-                    let window: &NSWindow = &panel;
-                    window.setDelegate(None);
-                    window.close();
-                }
-                let _ = Retained::from_raw(webview_addr as *mut WKWebView);
-                let _ = Retained::from_raw(delegate_addr as *mut ChatDelegate);
-            }
-        });
+        // Detach the session: typing/End session become no-ops, the page shows "Session ended".
+        self.shared.active.store(false, Ordering::SeqCst);
+        *self.shared.callbacks.lock() = None;
+        if self.shared.ready.load(Ordering::SeqCst) {
+            eval_js(self.webview_addr, ENDED_JS.to_owned());
+        }
+        // Keep the window on screen only when the operator wrote something the person at the
+        // device has neither answered nor dismissed; otherwise hide it until the next session.
+        if self.shared.unread.load(Ordering::SeqCst) == 0 {
+            self.set_visible(false);
+        }
     }
 }
 
 /// Evaluate `js` in the webview on the main thread (fire and forget).
 fn eval_js(webview_addr: usize, js: String) {
     DispatchQueue::main().exec_async(move || {
-        // SAFETY: main thread; the webview is alive while the handle exists.
+        // SAFETY: main thread; the webview lives for the whole process.
         unsafe {
             let wv: &WKWebView = &*(webview_addr as *const WKWebView);
             wv.evaluateJavaScript_completionHandler(&NSString::from_str(&js), None);
@@ -532,7 +635,11 @@ fn eval_js(webview_addr: usize, js: String) {
     });
 }
 
-/// Create the chat panel with an embedded WKWebView.
+fn chat_title(operator: &str) -> String {
+    format!("{operator} — Remote support")
+}
+
+/// Attach a session to the chat window, creating the window (hidden) on first use.
 pub fn open_chat(
     operator: &str,
     on_send: Arc<dyn Fn(String) + Send + Sync>,
@@ -540,9 +647,52 @@ pub fn open_chat(
 ) -> Result<Box<dyn ChatHandle>> {
     install_input_guard();
     let operator = operator.to_owned();
+    let callbacks = ChatCallbacks {
+        on_send,
+        on_disconnect,
+    };
+
+    // Re-use the existing window: new operator, empty transcript, connected state.
+    let existing = CHAT
+        .lock()
+        .as_ref()
+        .map(|c| (c.panel_addr, c.webview_addr, Arc::clone(&c.shared)));
+    if let Some((panel_addr, webview_addr, shared)) = existing {
+        shared.lines.lock().clear();
+        shared.unread.store(0, Ordering::SeqCst);
+        *shared.callbacks.lock() = Some(callbacks);
+        shared.active.store(true, Ordering::SeqCst);
+        let title = chat_title(&operator);
+        let reset = format!(
+            "window.__agent&&window.__agent.reset({});{CONNECTED_JS}",
+            serde_json::json!(operator)
+        );
+        let ready = shared.ready.load(Ordering::SeqCst);
+        run_on_main(move || {
+            // SAFETY: main thread; objects live for the whole process.
+            unsafe {
+                let panel: &NSPanel = &*(panel_addr as *const NSPanel);
+                panel.setTitle(&NSString::from_str(&title));
+                if ready {
+                    let wv: &WKWebView = &*(webview_addr as *const WKWebView);
+                    wv.evaluateJavaScript_completionHandler(&NSString::from_str(&reset), None);
+                }
+            }
+        })?;
+        return Ok(Box::new(ChatWebHandle {
+            panel_addr,
+            webview_addr,
+            shared,
+        }));
+    }
+
+    let shared = Arc::new(ChatShared::default());
+    *shared.callbacks.lock() = Some(callbacks);
+    shared.active.store(true, Ordering::SeqCst);
+    let shared_for_main = Arc::clone(&shared);
     let (tx, rx) = mpsc::channel();
     run_on_main(move || {
-        let result = (|| -> Result<(usize, usize, usize, Arc<ChatShared>)> {
+        let result = (|| -> Result<(usize, usize)> {
             let mtm = MainThreadMarker::new().context("not on main thread")?;
             let width = 380.0;
             let height = 460.0;
@@ -555,6 +705,7 @@ pub fn open_chat(
             let frame = NSRect::new(origin, NSSize::new(width, height));
             let style = NSWindowStyleMask::Titled
                 | NSWindowStyleMask::Closable
+                | NSWindowStyleMask::Miniaturizable
                 | NSWindowStyleMask::Resizable
                 | NSWindowStyleMask::NonactivatingPanel
                 | NSWindowStyleMask::UtilityWindow;
@@ -565,9 +716,8 @@ pub fn open_chat(
                 NSBackingStoreType::Buffered,
                 false,
             );
-            panel.setTitle(&NSString::from_str(&format!("{operator} — Remote support")));
-            // Floating: visible above normal windows but not maximally intrusive; the session
-            // scopes its lifetime, so it is only on top while a session is active.
+            panel.setTitle(&NSString::from_str(&chat_title(&operator)));
+            // Floating: visible above normal windows but not maximally intrusive.
             panel.setLevel(objc2_app_kit::NSFloatingWindowLevel);
             panel.setCollectionBehavior(
                 NSWindowCollectionBehavior::CanJoinAllSpaces
@@ -575,7 +725,7 @@ pub fn open_chat(
             );
             panel.setHidesOnDeactivate(false);
             panel.setMovableByWindowBackground(true);
-            // SAFETY: retained by us; released explicitly on close.
+            // SAFETY: retained by us for the whole process.
             unsafe { panel.setReleasedWhenClosed(false) };
             // The operator must never SEE the chat window: exclude it from all screen capture.
             // (Skippable only for local UI previews via REMOTE_AGENT_SHOW_WINDOWS.)
@@ -583,8 +733,7 @@ pub fn open_chat(
                 panel.setSharingType(NSWindowSharingType::None);
             }
 
-            let shared = Arc::new(ChatShared::default());
-            let delegate = ChatDelegate::new(mtm, on_send, on_disconnect, Arc::clone(&shared));
+            let delegate = ChatDelegate::new(mtm, shared_for_main);
 
             // WKWebView configuration + "agent" message handler.
             let config = unsafe { WKWebViewConfiguration::new(mtm) };
@@ -600,12 +749,6 @@ pub fn open_chat(
                     &config,
                 )
             };
-            // Wire window.__ipc → the "agent" handler.
-            let bootstrap =
-                "window.__ipc=function(s){window.webkit.messageHandlers.agent.postMessage(s);};";
-            unsafe {
-                webview.evaluateJavaScript_completionHandler(&NSString::from_str(bootstrap), None);
-            }
             webview.setAutoresizingMask(
                 objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable
                     | objc2_app_kit::NSAutoresizingMaskOptions::ViewHeightSizable,
@@ -626,27 +769,30 @@ pub fn open_chat(
             let win: &NSWindow = &panel;
             win.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
-            panel.orderFrontRegardless();
-
+            // Created hidden: the session shows it on the first operator message.
             let webview_addr = Retained::into_raw(webview) as usize;
             delegate
                 .ivars()
                 .webview_addr
                 .store(webview_addr, Ordering::SeqCst);
             let panel_addr = Retained::into_raw(panel) as usize;
-            let delegate_addr = Retained::into_raw(delegate) as usize;
-            // Let the menu-bar item re-open this window and disconnect the session.
+            // Leak the delegate on purpose (window delegate + script handler for the process).
+            let _ = Retained::into_raw(delegate);
+            // Let the menu-bar item re-open this window at any time.
             set_menu_chat(panel_addr);
-            Ok((panel_addr, webview_addr, delegate_addr, shared))
+            Ok((panel_addr, webview_addr))
         })();
         let _ = tx.send(result);
     })?;
-    let (panel_addr, webview_addr, delegate_addr, shared) =
-        rx.recv().context("chat task dropped")??;
+    let (panel_addr, webview_addr) = rx.recv().context("chat task dropped")??;
+    *CHAT.lock() = Some(ChatSingleton {
+        panel_addr,
+        webview_addr,
+        shared: Arc::clone(&shared),
+    });
     Ok(Box::new(ChatWebHandle {
         panel_addr,
         webview_addr,
-        delegate_addr,
         shared,
     }))
 }
@@ -730,7 +876,7 @@ define_class!(
         fn open_chat(&self, _sender: Option<&AnyObject>) {
             let addr = MENU_CHAT_PANEL.load(Ordering::SeqCst);
             if addr != 0 {
-                // SAFETY: only set to a live panel address while a chat exists; cleared on drop.
+                // SAFETY: only ever set to the process-wide chat panel, which is never freed.
                 let panel: &NSPanel = unsafe { &*(addr as *const NSPanel) };
                 panel.orderFrontRegardless();
             }
@@ -750,14 +896,11 @@ define_class!(
     unsafe impl NSObjectProtocol for MenuTarget {}
 );
 
-/// Address of the current chat panel, so the menu can re-open it; 0 when no session.
+/// Address of the (process-wide) chat panel, so the menu can re-open it; 0 until created.
 static MENU_CHAT_PANEL: AtomicUsize = AtomicUsize::new(0);
 
 fn set_menu_chat(panel_addr: usize) {
     MENU_CHAT_PANEL.store(panel_addr, Ordering::SeqCst);
-}
-fn clear_menu_chat() {
-    MENU_CHAT_PANEL.store(0, Ordering::SeqCst);
 }
 
 /// Install the menu-bar (status bar) item. Idempotent; `disconnect` ends the active session.
