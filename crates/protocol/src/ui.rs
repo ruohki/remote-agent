@@ -11,6 +11,28 @@ use crate::common::{
     SessionState, VideoCodec,
 };
 
+/// A device group the current user can see.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GroupRef {
+    pub id: String,
+    pub name: String,
+}
+
+/// The calling user's effective permission on a device (admins always `manage`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS, Default)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum DevicePermission {
+    /// Status and history only.
+    #[default]
+    View,
+    /// May open sessions, rename and tag.
+    Connect,
+    /// May change config, groups and delete (admins).
+    Manage,
+}
+
 /// Device row as shown in the console; also the payload of live updates.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export)]
@@ -40,6 +62,12 @@ pub struct DeviceSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub active_session_id: Option<String>,
+    /// Groups the device belongs to.
+    #[serde(default)]
+    pub groups: Vec<GroupRef>,
+    /// What the *requesting* user may do with this device (per-user; not broadcast state).
+    #[serde(default)]
+    pub permission: DevicePermission,
 }
 
 /// Session row as shown in the console.
