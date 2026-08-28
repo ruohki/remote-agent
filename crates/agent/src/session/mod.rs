@@ -85,6 +85,8 @@ pub struct SessionRequest {
 
 enum SessionCommand {
     AddIceCandidate(IceCandidate),
+    /// Live-apply a new effective config (console policy tightened by local overrides).
+    UpdateConfig(AgentConfig),
     End(EndReason),
 }
 
@@ -163,6 +165,14 @@ impl SessionManager {
             if s.id == session_id {
                 let _ = s.cmd_tx.send(SessionCommand::End(reason));
             }
+        }
+    }
+
+    /// Apply a new effective config to the running session (live policy change).
+    pub fn apply_overrides(&self, effective: AgentConfig) {
+        let active = self.active.lock();
+        if let Some(s) = active.as_ref() {
+            let _ = s.cmd_tx.send(SessionCommand::UpdateConfig(effective));
         }
     }
 
@@ -249,6 +259,8 @@ struct Session {
     cfg: AgentConfig,
     peer: Arc<Peer>,
     input: Arc<Mutex<Option<Box<dyn InputHandler>>>>,
+    /// Live input gate (mirrors `cfg.allow_input`; the reader task checks it every event).
+    input_allowed: Arc<AtomicBool>,
     control: Option<Arc<dyn DataChannel>>,
     media: Option<Media>,
     channel_tx: mpsc::UnboundedSender<ChannelEvent>,
@@ -387,6 +399,7 @@ async fn run_session(
 
     let (channel_tx, mut channel_rx) = mpsc::unbounded_channel();
     let (notices_tx, notices_rx) = mpsc::unbounded_channel();
+    let cfg_allow_input = cfg.allow_input;
     let mut session = Session {
         deps: deps.clone(),
         id: session_id.clone(),
@@ -394,6 +407,7 @@ async fn run_session(
         cfg,
         peer,
         input: Arc::new(Mutex::new(None)),
+        input_allowed: Arc::new(AtomicBool::new(cfg_allow_input)),
         control: None,
         media: None,
         channel_tx,
@@ -443,6 +457,7 @@ async fn run_session(
         tokio::select! {
             cmd = cmd_rx.recv() => match cmd {
                 Some(SessionCommand::AddIceCandidate(c)) => session.add_candidate(&c).await,
+                Some(SessionCommand::UpdateConfig(new)) => session.apply_config(new).await,
                 Some(SessionCommand::End(reason)) => break reason,
                 None => break EndReason::Error,
             },
@@ -558,6 +573,9 @@ async fn drain_until_end(
     loop {
         match cmd_rx.recv().await {
             Some(SessionCommand::AddIceCandidate(c)) => pending.push(c),
+            // A policy change before the session is up is picked up from the shared config when
+            // the session builds; ignore it here.
+            Some(SessionCommand::UpdateConfig(_)) => {}
             Some(SessionCommand::End(reason)) => return reason,
             None => return EndReason::Error,
         }
@@ -569,6 +587,32 @@ impl Session {
         if let Err(e) = self.peer.add_ice_candidate(c).await {
             tracing::debug!(session = %self.id, "add_ice_candidate: {e:#}");
         }
+    }
+
+    /// Live-apply a new effective config: tighten input/audio/clipboard immediately.
+    async fn apply_config(&mut self, new: AgentConfig) {
+        let old = self.cfg.clone();
+        self.cfg = new.clone();
+        self.input_allowed.store(new.allow_input, Ordering::Relaxed);
+        if old.allow_input && !new.allow_input {
+            tracing::info!(session = %self.id, "input disabled by the device user");
+            if let Some(h) = self.input.lock().as_mut() {
+                h.release_all();
+            }
+            // Notice to the browser: refresh display info (also carries the audio state). The
+            // operator's injected input now has no effect.
+            self.send_display_info().await;
+        }
+        if !new.allow_audio {
+            self.set_audio(false).await;
+        }
+        if old.allow_clipboard && !new.allow_clipboard {
+            if let Some(c) = self.clipboard.take() {
+                c.stop();
+            }
+            self.pending_clipboard = None;
+        }
+        self.send_display_info().await;
     }
 
     /// Report an in-session event to the console.
@@ -636,15 +680,15 @@ impl Session {
                     .start_watch(self.cfg.allow_file_transfer),
             );
         }
-        if self.cfg.show_session_indicator {
-            match self
-                .deps
-                .indicator
-                .show(&self.operator, self.disconnect_callback())
-            {
-                Ok(handle) => self.indicator = Some(handle),
-                Err(e) => tracing::warn!("session indicator unavailable: {e:#}"),
-            }
+        // The branded session banner is always shown (the person at the device must always see
+        // and be able to end the session).
+        match self
+            .deps
+            .indicator
+            .show(&self.operator, self.disconnect_callback())
+        {
+            Ok(handle) => self.indicator = Some(handle),
+            Err(e) => tracing::warn!("session indicator unavailable: {e:#}"),
         }
         // Chat window: created now, shown on the first message.
         let on_send: Arc<dyn Fn(String) + Send + Sync> = {
@@ -943,13 +987,13 @@ impl Session {
                     }
                 }
                 let input = Arc::clone(&self.input);
-                let allow = self.cfg.allow_input;
+                let allow = Arc::clone(&self.input_allowed);
                 let sid = self.id.clone();
                 self.readers.push(tokio::spawn(async move {
                     while let Some(ev) = dc.poll().await {
                         match ev {
                             DataChannelEvent::OnMessage(msg) => {
-                                if !allow {
+                                if !allow.load(Ordering::Relaxed) {
                                     continue;
                                 }
                                 match serde_json::from_slice::<InputEvent>(&msg.data) {

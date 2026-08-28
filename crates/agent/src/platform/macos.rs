@@ -210,6 +210,11 @@ define_class!(
             let cb = Arc::clone(&*self.ivars().shared.on_disconnect.lock());
             cb();
         }
+        // Clicking the banner body opens the branded app window.
+        #[unsafe(method(openApp:))]
+        fn open_app(&self, _sender: Option<&AnyObject>) {
+            crate::app::post(crate::app::AppEvent::Show { chat: false });
+        }
     }
 
     unsafe impl NSObjectProtocol for IndicatorTarget {}
@@ -258,7 +263,8 @@ impl Drop for PanelHandle {
 }
 
 fn banner_text(operator: &str) -> String {
-    format!("{operator} is controlling this computer")
+    let product = crate::baked::product_name();
+    format!("{product} · {operator} is controlling this computer")
 }
 
 /// Show the banner for `operator`. Returns a handle whose drop hides the banner again.
@@ -351,6 +357,15 @@ pub fn show_indicator(
             if let Some(content) = panel.contentView() {
                 content.addSubview(&label);
                 content.addSubview(&button);
+                // Clicking the banner (outside the button) opens the app window.
+                let gesture = unsafe {
+                    objc2_app_kit::NSClickGestureRecognizer::initWithTarget_action(
+                        objc2_app_kit::NSClickGestureRecognizer::alloc(mtm),
+                        Some(&target),
+                        Some(sel!(openApp:)),
+                    )
+                };
+                content.addGestureRecognizer(&gesture);
             }
             panel.orderFrontRegardless();
             // Leak the +1 references on purpose: the banner lives as long as the process.

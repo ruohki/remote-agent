@@ -19,7 +19,7 @@ use futures_util::{SinkExt, StreamExt};
 use parking_lot::RwLock;
 use protocol::agent::{AgentCapabilities, AgentToConsole, ConsoleToAgent};
 use protocol::common::{DisplayInfo, EndReason};
-use protocol::config::AgentConfig;
+use protocol::config::{AgentConfig, LocalOverrides};
 use protocol::PROTOCOL_VERSION;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -50,26 +50,77 @@ impl HubSink {
 
 /// Shared runtime state driven by the hub and read by heartbeats/sessions.
 struct AgentState {
+    /// Effective config sessions run with = `overrides.apply(console_config)`.
     config: Arc<RwLock<AgentConfig>>,
+    /// The console's policy, before local restrictions.
+    console_config: RwLock<AgentConfig>,
+    /// Local restrictions set by the person at the device.
+    overrides: RwLock<LocalOverrides>,
+    /// Last overrides reported in a heartbeat (to send only on change).
+    last_overrides: RwLock<LocalOverrides>,
     media: Arc<SystemMedia>,
     start: Instant,
     last_displays: RwLock<Vec<DisplayInfo>>,
 }
 
+impl AgentState {
+    /// Recompute the effective config from the console policy and local overrides, store it, and
+    /// return it.
+    fn recompute(&self) -> AgentConfig {
+        let eff = self
+            .overrides
+            .read()
+            .apply(self.console_config.read().clone());
+        *self.config.write() = eff.clone();
+        eff
+    }
+
+    /// JSON policy blob for the app Settings screen: console policy, local overrides, effective.
+    fn policy_json(&self) -> String {
+        let console = self.console_config.read().clone();
+        let overrides = self.overrides.read().clone();
+        let effective = self.config.read().clone();
+        serde_json::json!({
+            "console": {
+                "mode": console.mode,
+                "allow_input": console.allow_input,
+                "allow_audio": console.allow_audio,
+                "allow_clipboard": console.allow_clipboard,
+                "allow_file_transfer": console.allow_file_transfer,
+            },
+            "overrides": overrides,
+            "effective": {
+                "mode": effective.mode,
+                "allow_input": effective.allow_input,
+                "allow_audio": effective.allow_audio,
+                "allow_clipboard": effective.allow_clipboard,
+                "allow_file_transfer": effective.allow_file_transfer,
+            },
+        })
+        .to_string()
+    }
+}
+
 pub async fn run_agent(paths: Paths) -> Result<()> {
     let local = LocalConfig::load_required(&paths)?;
-    let config = Arc::new(RwLock::new(local.effective()));
+    let console_config = local.console_config();
+    let overrides = local.overrides.clone();
+    let config = Arc::new(RwLock::new(overrides.apply(console_config.clone())));
     tracing::info!(
         server = %local.server_url,
         device = %local.device_id,
         version = crate::AGENT_VERSION,
         mode = ?config.read().mode,
+        overrides = ?overrides,
         "starting agent"
     );
 
     let media = Arc::new(SystemMedia);
     let state = Arc::new(AgentState {
         config: Arc::clone(&config),
+        console_config: RwLock::new(console_config),
+        overrides: RwLock::new(overrides.clone()),
+        last_overrides: RwLock::new(overrides),
         media,
         start: Instant::now(),
         last_displays: RwLock::new(Vec::new()),
@@ -137,6 +188,30 @@ pub async fn run_agent(paths: Paths) -> Result<()> {
         );
     }
 
+    // The app Settings screen changes the local restrictions: persist them, recompute the
+    // effective config, apply it live to any running session, and refresh the policy shown.
+    if crate::app::is_running() {
+        let ov_state = Arc::clone(&state);
+        let ov_sessions = Arc::clone(&sessions);
+        let ov_paths = paths.clone();
+        crate::app::set_overrides_handler(Arc::new(move |ov: LocalOverrides| {
+            // Persist onto the latest on-disk config so we don't clobber a concurrent update.
+            let mut lc = LocalConfig::load(&ov_paths)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            lc.overrides = ov.clone();
+            if let Err(e) = lc.save(&ov_paths) {
+                tracing::warn!("persisting overrides: {e:#}");
+            }
+            *ov_state.overrides.write() = ov;
+            let eff = ov_state.recompute();
+            ov_sessions.apply_overrides(eff);
+            crate::app::set_policy(&ov_state.policy_json());
+        }));
+        crate::app::set_policy(&state.policy_json());
+    }
+
     // Buffer of messages waiting for a live socket (bounded so we don't grow unbounded while
     // offline; signaling is time-sensitive so old entries are dropped).
     let pending: Arc<parking_lot::Mutex<std::collections::VecDeque<AgentToConsole>>> =
@@ -199,7 +274,9 @@ async fn connect_once(
             clipboard: true,
         },
         logged_in_user: crate::platform::logged_in_user(),
+        local_overrides: state.overrides.read().clone(),
     };
+    *state.last_overrides.write() = state.overrides.read().clone();
     write
         .send(Message::text(serde_json::to_string(&hello)?))
         .await
@@ -227,6 +304,7 @@ async fn connect_once(
             apply_config(paths, local, state, config);
             tracing::info!("connected");
             crate::app::set_console_status(true);
+            crate::app::set_policy(&state.policy_json());
         }
         Some(ConsoleToAgent::Goodbye { reason }) => {
             return Err(anyhow!("console rejected connection: {reason}"));
@@ -306,6 +384,7 @@ where
         ConsoleToAgent::HelloAck { .. } => {} // ignored after handshake
         ConsoleToAgent::ConfigUpdate { config } => {
             apply_config(paths, local, state, config);
+            sessions.apply_overrides(state.config.read().clone());
         }
         ConsoleToAgent::SessionRequest {
             session_id,
@@ -371,6 +450,17 @@ where
 
 fn build_heartbeat(state: &Arc<AgentState>) -> AgentToConsole {
     let (cpu, mem) = system_usage();
+    // Report local overrides only when they changed since last time.
+    let ov_now = state.overrides.read().clone();
+    let ov_changed = {
+        let mut last = state.last_overrides.write();
+        if *last != ov_now {
+            *last = ov_now.clone();
+            true
+        } else {
+            false
+        }
+    };
     // Report displays only when they changed since last time.
     let displays = state.media.list_displays().ok();
     let changed = match &displays {
@@ -391,6 +481,7 @@ fn build_heartbeat(state: &Arc<AgentState>) -> AgentToConsole {
         cpu_percent: cpu,
         mem_percent: mem,
         displays: if changed { displays } else { None },
+        local_overrides: if ov_changed { Some(ov_now) } else { None },
     }
 }
 
@@ -415,16 +506,21 @@ fn system_usage() -> (Option<f32>, Option<f32>) {
     (cpu, mem)
 }
 
-/// Apply a new config: update shared state and persist it to disk.
-fn apply_config(paths: &Paths, local: &LocalConfig, state: &Arc<AgentState>, config: AgentConfig) {
+/// Apply a new console config: store it, recompute the effective config (with local overrides),
+/// persist, and push the policy to the app.
+fn apply_config(paths: &Paths, _local: &LocalConfig, state: &Arc<AgentState>, config: AgentConfig) {
     let mode = config.mode;
-    *state.config.write() = config.clone();
-    let mut persisted = local.clone();
-    persisted.cached = Some(config);
-    if let Err(e) = persisted.save(paths) {
-        tracing::warn!("persisting config: {e:#}");
+    *state.console_config.write() = config.clone();
+    let eff = state.recompute();
+    // Persist onto the latest on-disk config (preserves device id/secret and current overrides).
+    if let Ok(Some(mut persisted)) = LocalConfig::load(paths) {
+        persisted.cached = Some(config);
+        if let Err(e) = persisted.save(paths) {
+            tracing::warn!("persisting config: {e:#}");
+        }
     }
-    tracing::info!(?mode, "config applied");
+    crate::app::set_policy(&state.policy_json());
+    tracing::info!(?mode, effective_mode = ?eff.mode, "config applied");
 }
 
 fn ws_url(server_url: &str) -> Result<String> {

@@ -1228,3 +1228,79 @@ async fn help_me_denial_ends_session() {
 
 #[allow(dead_code)]
 fn _keep(_: &Path, _: Bytes) {}
+
+/// The person at the device blocks keyboard/mouse mid-session: further injected input is
+/// dropped and the browser gets a control-channel notice (a fresh `display_info`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_override_blocks_input_live() {
+    use protocol::config::AgentConfig;
+
+    let mut h = Harness::connect(Options {
+        config: AgentConfig {
+            max_fps: 30,
+            allow_input: true,
+            ..AgentConfig::default()
+        },
+        ..Default::default()
+    })
+    .await;
+
+    // Wait for the input channel to be wired (first display_info means the session is up).
+    next_control(&mut h.control_rx, |m| {
+        matches!(m, ControlMessage::DisplayInfo { .. })
+    })
+    .await;
+
+    // Baseline: a mouse-down reaches the injector.
+    send_bytes(
+        &h.input_dc,
+        &serde_json::to_vec(&InputEvent::MouseDown {
+            button: MouseButton::Left,
+        })
+        .unwrap(),
+    )
+    .await;
+    let reached = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if !h.input_events.lock().unwrap().is_empty() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(reached, "input should reach the injector before the block");
+
+    // The local user blocks input; the effective config now forbids it.
+    h.sessions.apply_overrides(AgentConfig {
+        max_fps: 30,
+        allow_input: false,
+        ..AgentConfig::default()
+    });
+    // Notice to the browser: a fresh display_info arrives after the policy change.
+    next_control(&mut h.control_rx, |m| {
+        matches!(m, ControlMessage::DisplayInfo { .. })
+    })
+    .await;
+
+    let before = h.input_events.lock().unwrap().len();
+    for _ in 0..5 {
+        send_bytes(
+            &h.input_dc,
+            &serde_json::to_vec(&InputEvent::MouseDown {
+                button: MouseButton::Right,
+            })
+            .unwrap(),
+        )
+        .await;
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let after = h.input_events.lock().unwrap().len();
+    assert_eq!(
+        before, after,
+        "input injected after the local block must be dropped ({before} -> {after})"
+    );
+
+    h.end().await;
+}

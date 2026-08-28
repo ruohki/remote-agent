@@ -20,6 +20,7 @@ use crate::chat::{ChatHandle, ChatLine, ChatUi};
 use anyhow::Result;
 use protocol::channel::ChatParty;
 use protocol::common::OperatorInfo;
+use protocol::config::LocalOverrides;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -62,6 +63,8 @@ pub enum AppEvent {
         ok: bool,
         message: String,
     },
+    /// JSON policy blob for the Settings screen: { console, overrides, effective }.
+    Policy(String),
     Quit,
     /// Internal: the page finished loading and is ready to receive JS.
     #[doc(hidden)]
@@ -80,6 +83,9 @@ struct Callbacks {
 static CALLBACKS: parking_lot::Mutex<Option<Callbacks>> = parking_lot::Mutex::new(None);
 /// End the active session regardless of which one — set by the hub; used by the tray.
 static GLOBAL_DISCONNECT: parking_lot::Mutex<Option<DisconnectCb>> = parking_lot::Mutex::new(None);
+/// Applies device-side restriction changes (persist + recompute + apply live). Set by the hub.
+type OverridesCb = Arc<dyn Fn(LocalOverrides) + Send + Sync>;
+static OVERRIDES_CB: parking_lot::Mutex<Option<OverridesCb>> = parking_lot::Mutex::new(None);
 static PROXY: OnceLock<parking_lot::Mutex<Option<Proxy>>> = OnceLock::new();
 
 struct Proxy(tao::event_loop::EventLoopProxy<AppEvent>);
@@ -108,6 +114,24 @@ pub fn is_running() -> bool {
 /// Set the process-wide "end the active session" action (used by the tray "End session").
 pub fn set_global_disconnect(cb: DisconnectCb) {
     *GLOBAL_DISCONNECT.lock() = Some(cb);
+}
+
+/// Register the handler the Settings screen calls when the local restrictions change.
+pub fn set_overrides_handler(cb: OverridesCb) {
+    *OVERRIDES_CB.lock() = Some(cb);
+}
+
+/// Called from the webview IPC when the local user changes the restrictions.
+fn dispatch_overrides(ov: LocalOverrides) {
+    let cb = OVERRIDES_CB.lock().clone();
+    if let Some(cb) = cb {
+        cb(ov);
+    }
+}
+
+/// Push the current policy (console vs. local restrictions vs. effective) to the Settings screen.
+pub fn set_policy(policy_json: &str) {
+    post(AppEvent::Policy(policy_json.to_string()));
 }
 
 /// Update the console connection status shown in the UI and tray tooltip.

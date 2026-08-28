@@ -68,6 +68,7 @@ fn main() {
             logo_png_base64: logo,
             support_text: get("support"),
             organization: get("org"),
+            ..Default::default()
         },
         issued_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -16,11 +16,21 @@ use std::io::{Read, Seek, SeekFrom};
 use std::sync::OnceLock;
 
 /// The verified baked configuration of this process, if any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BakedSource {
+    /// Trailer appended to the executable.
+    Trailer,
+    /// `Contents/Resources/baked.json` sidecar inside a signed `.app` bundle.
+    BundleSidecar,
+}
+
 #[derive(Debug, Clone)]
 pub struct Baked {
     pub config: BakedConfig,
     /// ed25519 public key (base64) the trailer was signed with; pinned at enrollment.
     pub public_key: String,
+    /// Where the payload was read from.
+    pub source: BakedSource,
 }
 
 impl Baked {
@@ -54,7 +64,45 @@ pub fn product_name() -> String {
 
 /// Only read the tail of the file: last 12 bytes give the payload length + magic, then the
 /// payload itself. This avoids loading a multi-hundred-MB binary into memory.
+/// If the executable lives inside `…/<App>.app/Contents/MacOS/<bin>`, the signed payload is
+/// carried as a `Contents/Resources/baked.json` sidecar (appending a trailer would break the
+/// bundle's code signature). Returns the parsed, verified payload if present.
+fn load_from_bundle_sidecar() -> anyhow::Result<Option<Baked>> {
+    let exe = std::env::current_exe()?;
+    // …/Contents/MacOS/<bin> → …/Contents/Resources/baked.json
+    let Some(macos_dir) = exe.parent() else {
+        return Ok(None);
+    };
+    if macos_dir.file_name().and_then(|n| n.to_str()) != Some("MacOS") {
+        return Ok(None);
+    }
+    let Some(contents) = macos_dir.parent() else {
+        return Ok(None);
+    };
+    let sidecar = contents.join("Resources").join("baked.json");
+    if !sidecar.exists() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(&sidecar)?;
+    let payload: protocol::bakery::BakedPayload =
+        serde_json::from_slice(&bytes).map_err(|e| anyhow::anyhow!("bundle baked.json: {e}"))?;
+    match verify_payload(&payload) {
+        Ok(_) => Ok(Some(Baked {
+            config: payload.config,
+            public_key: payload.public_key,
+            source: BakedSource::BundleSidecar,
+        })),
+        Err(e) => {
+            tracing::error!("bundle baked.json signature invalid ({e}); ignoring");
+            Ok(None)
+        }
+    }
+}
+
 fn load_from_current_exe() -> anyhow::Result<Option<Baked>> {
+    if let Some(b) = load_from_bundle_sidecar()? {
+        return Ok(Some(b));
+    }
     let path = std::env::current_exe()?;
     let mut f = std::fs::File::open(&path)?;
     let len = f.metadata()?.len();
@@ -87,6 +135,7 @@ fn load_from_current_exe() -> anyhow::Result<Option<Baked>> {
         Ok(_) => Ok(Some(Baked {
             config: payload.config,
             public_key: payload.public_key,
+            source: BakedSource::Trailer,
         })),
         Err(e) => {
             tracing::error!("baked trailer signature invalid ({e}); ignoring branding/config");
@@ -112,7 +161,11 @@ pub fn print_info() -> anyhow::Result<()> {
         }
         Some(b) => {
             let c = &b.config;
-            println!("baked trailer:");
+            let source = match b.source {
+                BakedSource::Trailer => "executable trailer",
+                BakedSource::BundleSidecar => "app bundle sidecar (Contents/Resources/baked.json)",
+            };
+            println!("baked configuration (source: {source}):");
             println!("  version      : {}", c.version);
             println!("  server url   : {}", c.server_url);
             println!(
@@ -167,9 +220,9 @@ mod tests {
             branding: Branding {
                 product_name: "Acme".into(),
                 accent: "#112233".into(),
-                logo_png_base64: None,
                 support_text: "help".into(),
                 organization: "Acme Inc".into(),
+                ..Default::default()
             },
             issued_at: 42,
         };
@@ -220,9 +273,45 @@ mod tests {
             device_id: "d".into(),
             device_secret: "s".into(),
             cached: None,
+            overrides: Default::default(),
             console_public_key: None,
         };
         assert!(!should_auto_enroll(Some(&enrolled)));
+    }
+
+    #[test]
+    fn bundle_sidecar_is_parsed_and_verified() {
+        use ed25519_dalek::SigningKey;
+        use protocol::bakery::{sign_payload, BakedConfig};
+        let dir = tempfile::tempdir().unwrap();
+        // …/Foo.app/Contents/{MacOS,Resources}
+        let resources = dir.path().join("Foo.app/Contents/Resources");
+        std::fs::create_dir_all(&resources).unwrap();
+        let key = SigningKey::from_bytes(&[5u8; 32]);
+        let cfg = BakedConfig {
+            version: protocol::bakery::BAKED_VERSION,
+            server_url: "https://c.example".into(),
+            enroll_token: None,
+            quick_support: false,
+            branding: Branding {
+                product_name: "Bundle".into(),
+                accent: "#010203".into(),
+                ..Default::default()
+            },
+            issued_at: 1,
+        };
+        let payload = sign_payload(cfg, &key);
+        std::fs::write(
+            resources.join("baked.json"),
+            serde_json::to_vec(&payload).unwrap(),
+        )
+        .unwrap();
+        // The loader keys off the MacOS dir name; parse the sidecar directly here (current_exe
+        // cannot be relocated in a unit test) to prove the format + verification path.
+        let bytes = std::fs::read(resources.join("baked.json")).unwrap();
+        let parsed: protocol::bakery::BakedPayload = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed.config.branding.product_name, "Bundle");
+        verify_payload(&parsed).unwrap();
     }
 
     #[test]

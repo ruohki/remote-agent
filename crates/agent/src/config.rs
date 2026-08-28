@@ -7,7 +7,7 @@
 //! The file is written with owner-only permissions because it holds the device secret.
 
 use anyhow::{Context, Result};
-use protocol::config::AgentConfig;
+use protocol::config::{AgentConfig, LocalOverrides};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -64,6 +64,9 @@ pub struct LocalConfig {
     pub device_secret: String,
     #[serde(default)]
     pub cached: Option<AgentConfig>,
+    /// Restrictions applied locally by the person at the device (restrict-only over `cached`).
+    #[serde(default)]
+    pub overrides: LocalOverrides,
     /// ed25519 public key (base64) of the console this agent was enrolled with, from the bakery
     /// trailer. Pinned so a later re-baked binary presenting a different key is refused.
     #[serde(default)]
@@ -102,8 +105,9 @@ impl LocalConfig {
         !self.server_url.is_empty() && !self.device_id.is_empty() && !self.device_secret.is_empty()
     }
 
-    /// Effective agent config: the cached one from the console, else defaults.
-    pub fn effective(&self) -> AgentConfig {
+    /// The console's config (cached), with a hostname display-name default. This is the policy
+    /// the console set, *before* any local restrictions.
+    pub fn console_config(&self) -> AgentConfig {
         let mut cfg = self.cached.clone().unwrap_or_default();
         if cfg.display_name.is_empty() {
             cfg.display_name = hostname::get()
@@ -111,6 +115,17 @@ impl LocalConfig {
                 .unwrap_or_else(|_| "unknown".into());
         }
         cfg
+    }
+
+    /// Backwards-compatible alias for [`console_config`].
+    pub fn effective(&self) -> AgentConfig {
+        self.console_config()
+    }
+
+    /// The config sessions actually run with: the console config tightened by the local
+    /// restrictions the person at the device set.
+    pub fn effective_with_overrides(&self) -> AgentConfig {
+        self.overrides.apply(self.console_config())
     }
 }
 
@@ -189,6 +204,7 @@ mod tests {
             device_id: "dev".into(),
             device_secret: "sec".into(),
             cached: Some(AgentConfig::default()),
+            overrides: LocalOverrides::default(),
             console_public_key: None,
         };
         cfg.save(&paths).unwrap();
@@ -197,5 +213,46 @@ mod tests {
         assert_eq!(back.device_secret, "sec");
         assert!(back.is_enrolled());
         assert_eq!(back.effective().max_fps, 60);
+    }
+
+    #[test]
+    fn overrides_persist_and_tighten_only() {
+        use protocol::common::DeviceMode;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            dir: tmp.path().join("cfg"),
+        };
+        // Console allows everything, unattended.
+        let console = AgentConfig {
+            mode: DeviceMode::Unattended,
+            allow_input: true,
+            allow_audio: true,
+            ..AgentConfig::default()
+        };
+        let cfg = LocalConfig {
+            server_url: "https://c".into(),
+            device_id: "d".into(),
+            device_secret: "s".into(),
+            cached: Some(console),
+            overrides: LocalOverrides {
+                mode: Some(DeviceMode::HelpMe),
+                allow_input: Some(false),
+                ..Default::default()
+            },
+            console_public_key: None,
+        };
+        cfg.save(&paths).unwrap();
+        let back = LocalConfig::load(&paths).unwrap().unwrap();
+        // Console config is unchanged; the effective one is tightened.
+        assert_eq!(back.console_config().mode, DeviceMode::Unattended);
+        assert!(back.console_config().allow_input);
+        let eff = back.effective_with_overrides();
+        assert_eq!(eff.mode, DeviceMode::HelpMe);
+        assert!(!eff.allow_input);
+        // Overrides cannot loosen: an "allow" override on a console-forbidden capability stays off.
+        let mut c2 = back.clone();
+        c2.cached.as_mut().unwrap().allow_audio = false;
+        c2.overrides.allow_audio = None; // "follow console"
+        assert!(!c2.effective_with_overrides().allow_audio);
     }
 }

@@ -8,6 +8,8 @@ use crate::baked;
 use anyhow::{Context, Result};
 use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use protocol::channel::ChatParty;
+use protocol::common::DeviceMode;
+use protocol::config::LocalOverrides;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tao::event::{Event, WindowEvent};
@@ -52,6 +54,8 @@ struct Controller {
     transcript: Vec<(ChatParty, String, u64)>,
     console_connected: bool,
     device: (String, String),
+    /// Last policy JSON pushed from the hub (replayed to the page on ready).
+    policy: String,
     opts: AppOptions,
     end_item: MenuItem,
     tray: tray_icon::TrayIcon,
@@ -106,6 +110,9 @@ impl Controller {
             }
         } else {
             js.push_str("window.__app.endSession();");
+        }
+        if !self.policy.is_empty() {
+            js.push_str(&format!("window.__app.setPolicy({});", self.policy));
         }
         // Flush anything buffered before ready.
         let pending = std::mem::take(&mut self.pending);
@@ -178,6 +185,10 @@ impl Controller {
                     ok,
                     serde_json::json!(message)
                 ));
+            }
+            AppEvent::Policy(json) => {
+                self.policy = json.clone();
+                self.eval(format!("window.__app.setPolicy({json});"));
             }
             AppEvent::Quit => { /* handled by caller (control flow) */ }
             AppEvent::__Ready => self.on_ready(),
@@ -257,6 +268,9 @@ fn build_and_run(work: impl FnOnce() -> i32 + Send + 'static, opts: AppOptions) 
             Ok(IpcIn::Send { text }) => dispatch_send(text),
             Ok(IpcIn::Disconnect) => dispatch_disconnect(),
             Ok(IpcIn::OpenScreen { .. }) => {}
+            Ok(IpcIn::SetOverrides { overrides }) => {
+                super::dispatch_overrides(overrides.into_local());
+            }
             Ok(IpcIn::Install) => spawn_install(),
             Err(e) => tracing::debug!("app IPC parse error: {e}"),
         }
@@ -309,6 +323,7 @@ fn build_and_run(work: impl FnOnce() -> i32 + Send + 'static, opts: AppOptions) 
         transcript: Vec::new(),
         console_connected: false,
         device: (String::new(), String::new()),
+        policy: String::new(),
         opts,
         end_item,
         tray,
@@ -381,7 +396,40 @@ enum IpcIn {
         #[allow(dead_code)]
         screen: String,
     },
+    SetOverrides {
+        overrides: UiOverrides,
+    },
     Install,
+}
+
+/// The Settings toggles as the page reports them: each value is the *effective local choice*.
+/// `require_approval = true` forces help-me; the `allow_*` values are the local allow decision.
+/// Converted to a restrict-only [`LocalOverrides`] (a value that matches the console default
+/// becomes `None`, since the local user can only tighten, never loosen).
+#[derive(serde::Deserialize)]
+struct UiOverrides {
+    require_approval: bool,
+    allow_input: bool,
+    allow_audio: bool,
+    allow_clipboard: bool,
+    allow_file_transfer: bool,
+}
+
+impl UiOverrides {
+    fn into_local(self) -> LocalOverrides {
+        let restrict = |allow: bool| if allow { None } else { Some(false) };
+        LocalOverrides {
+            mode: if self.require_approval {
+                Some(DeviceMode::HelpMe)
+            } else {
+                None
+            },
+            allow_input: restrict(self.allow_input),
+            allow_audio: restrict(self.allow_audio),
+            allow_clipboard: restrict(self.allow_clipboard),
+            allow_file_transfer: restrict(self.allow_file_transfer),
+        }
+    }
 }
 
 /// Elevate and install the service on a worker thread, reporting the result back to the UI.

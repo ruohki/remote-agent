@@ -25,6 +25,9 @@
         <button class="tab" data-screen="install" id="tab-install" hidden>
           <span class="tab-ico">⤓</span><span>Install</span>
         </button>
+        <button class="tab" data-screen="settings" id="tab-settings">
+          <span class="tab-ico">⚙</span><span>Settings</span>
+        </button>
         <button class="tab" data-screen="about" id="tab-about">
           <span class="tab-ico">ⓘ</span><span>About</span>
         </button>
@@ -123,6 +126,53 @@
             <button class="btn primary" id="installBtn">Install as a service</button>
             <span class="install-status" id="installStatus"></span>
           </div>
+        </section>
+
+        <!-- SETTINGS -->
+        <section class="screen" id="screen-settings" hidden>
+          <header class="hero"><div>
+            <h1>Privacy &amp; control</h1>
+            <p class="muted">You decide what an operator may do. These settings can only make things
+              stricter than your administrator allows — never looser — and apply immediately, even
+              during a session.</p>
+          </div></header>
+          <ul class="settings-list" id="settingsList">
+            <li class="setting" data-key="require_approval">
+              <div class="setting-text">
+                <div class="setting-title">Ask me before every session</div>
+                <div class="setting-sub" data-policy></div>
+              </div>
+              <button class="switch" role="switch" aria-checked="false" data-key="require_approval"></button>
+            </li>
+            <li class="setting" data-key="allow_input">
+              <div class="setting-text">
+                <div class="setting-title">Allow keyboard &amp; mouse control</div>
+                <div class="setting-sub" data-policy></div>
+              </div>
+              <button class="switch" role="switch" aria-checked="true" data-key="allow_input"></button>
+            </li>
+            <li class="setting" data-key="allow_audio">
+              <div class="setting-text">
+                <div class="setting-title">Allow streaming this computer's audio</div>
+                <div class="setting-sub" data-policy></div>
+              </div>
+              <button class="switch" role="switch" aria-checked="true" data-key="allow_audio"></button>
+            </li>
+            <li class="setting" data-key="allow_clipboard">
+              <div class="setting-text">
+                <div class="setting-title">Allow clipboard sync</div>
+                <div class="setting-sub" data-policy></div>
+              </div>
+              <button class="switch" role="switch" aria-checked="true" data-key="allow_clipboard"></button>
+            </li>
+            <li class="setting" data-key="allow_file_transfer">
+              <div class="setting-text">
+                <div class="setting-title">Allow file transfer &amp; browsing</div>
+                <div class="setting-sub" data-policy></div>
+              </div>
+              <button class="switch" role="switch" aria-checked="true" data-key="allow_file_transfer"></button>
+            </li>
+          </ul>
         </section>
 
         <!-- ABOUT -->

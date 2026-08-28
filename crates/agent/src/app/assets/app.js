@@ -21,7 +21,7 @@
   var current = 'home';
   function show(screen) {
     current = screen;
-    ['home', 'chat', 'install', 'about'].forEach(function (s) {
+    ['home', 'chat', 'install', 'settings', 'about'].forEach(function (s) {
       var el = $('screen-' + s); if (el) el.hidden = s !== screen;
       var tab = $('tab-' + s); if (tab) tab.classList.toggle('active', s === screen);
     });
@@ -115,6 +115,73 @@
   }
   function setStatus2(el, text, cls) { el.textContent = text; el.className = 'install-status' + (cls ? ' ' + cls : ''); }
 
+
+  // ---- settings (privacy & control) ----
+  // policy: { console:{mode,allow_input,...}, overrides:{...}, effective:{...} }
+  var policy = null;
+  var SWITCH_KEYS = ['require_approval', 'allow_input', 'allow_audio', 'allow_clipboard', 'allow_file_transfer'];
+
+  function consoleAllows(key) {
+    if (!policy) return true;
+    var c = policy.console || {};
+    if (key === 'require_approval') return true; // console can only *require* it; never forces "no approval"
+    return c[key] !== false;
+  }
+  // Current local checked-state of a switch (true = allowed / not-restricted; for require_approval true = required).
+  function switchState(key) {
+    var el = document.querySelector('.switch[data-key="' + key + '"]');
+    return el ? el.getAttribute('aria-checked') === 'true' : (key !== 'require_approval');
+  }
+  function renderPolicy() {
+    if (!policy) return;
+    var c = policy.console || {}, eff = policy.effective || {};
+    SWITCH_KEYS.forEach(function (key) {
+      var sw = document.querySelector('.switch[data-key="' + key + '"]');
+      var sub = document.querySelector('.setting[data-key="' + key + '"] [data-policy]');
+      if (!sw) return;
+      var locked, checked, note;
+      if (key === 'require_approval') {
+        var consoleRequires = c.mode === 'help_me';
+        checked = consoleRequires || eff.mode === 'help_me';
+        locked = consoleRequires; // administrator already requires approval
+        note = consoleRequires ? 'Required by your administrator' : 'Administrator lets operators connect without asking';
+      } else {
+        var consoleBlocks = c[key] === false;
+        checked = !consoleBlocks && eff[key] !== false; // allowed only if console allows AND not locally blocked
+        locked = consoleBlocks; // cannot loosen what the administrator blocked
+        note = consoleBlocks ? 'Blocked by your administrator' : 'Allowed by your administrator';
+      }
+      sw.setAttribute('aria-checked', checked ? 'true' : 'false');
+      sw.classList.toggle('locked', !!locked);
+      sw.disabled = !!locked;
+      if (sub) sub.textContent = note;
+    });
+  }
+  function pushOverrides() {
+    ipc({
+      type: 'set_overrides',
+      overrides: {
+        require_approval: switchState('require_approval'),
+        allow_input: switchState('allow_input'),
+        allow_audio: switchState('allow_audio'),
+        allow_clipboard: switchState('allow_clipboard'),
+        allow_file_transfer: switchState('allow_file_transfer')
+      }
+    });
+  }
+  document.querySelectorAll('.switch').forEach(function (sw) {
+    function toggle() {
+      if (sw.disabled) return;
+      var now = sw.getAttribute('aria-checked') === 'true';
+      sw.setAttribute('aria-checked', now ? 'false' : 'true');
+      pushOverrides();
+    }
+    sw.addEventListener('click', toggle);
+    sw.addEventListener('keydown', function (e) {
+      if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); toggle(); }
+    });
+  });
+
   // ---- Rust → JS API ----
   window.__app = {
     // Session lifecycle
@@ -161,6 +228,8 @@
       $('installBtn').disabled = ok;
       setStatus2($('installStatus'), message, ok ? 'ok' : 'err');
     },
+    // Privacy & control policy
+    setPolicy: function (p) { policy = p; renderPolicy(); },
     // Navigation from Rust (tray "open chat")
     show: show,
   };

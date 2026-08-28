@@ -97,6 +97,7 @@ pub async fn enroll(paths: &Paths, server: &str, token: &str, name: Option<Strin
         device_id: enrolled.device_id.clone(),
         device_secret: enrolled.device_secret,
         cached: Some(enrolled.config),
+        overrides: Default::default(),
         // Pin the console key from the bakery trailer (if this is a baked binary).
         console_public_key: crate::baked::get().map(|b| b.public_key.clone()),
     };
