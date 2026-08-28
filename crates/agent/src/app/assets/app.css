@@ -70,7 +70,7 @@ body {
 .main { overflow: auto; padding: 20px; min-height: 0; }
 .screen { max-width: 620px; margin: 0 auto; }
 /* The chat is not a card: it fills the whole content pane edge to edge. */
-.main:has(#screen-chat:not([hidden])) { padding: 0; overflow: hidden; display: flex; }
+.main.chat-mode { padding: 0; overflow: hidden; display: flex; }
 #screen-chat { max-width: none; margin: 0; flex: 1; min-height: 0; display: flex; }
 .hero { display: flex; align-items: center; gap: 14px; margin-bottom: 18px; }
 .hero h1 { font-size: 18px; margin: 0 0 2px; }

@@ -24,6 +24,7 @@
     ['home', 'chat', 'install', 'settings', 'about'].forEach(function (s) {
       var el = $('screen-' + s); if (el) el.hidden = s !== screen;
       var tab = $('tab-' + s); if (tab) tab.classList.toggle('active', s === screen);
+      var main = document.querySelector('.main'); if (main) main.classList.toggle('chat-mode', screen === 'chat');
     });
     if (screen === 'chat') { unread = 0; renderBadge(); $('composer').focus(); scrollDown(); }
     ipc({ type: 'open_screen', screen: screen });
