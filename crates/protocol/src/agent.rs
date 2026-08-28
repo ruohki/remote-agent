@@ -65,6 +65,10 @@ pub enum SessionEvent {
         observer: crate::common::OperatorInfo,
         session_id: String,
     },
+    /// Device user paused / resumed remote control during the session.
+    ControlPaused {
+        paused: bool,
+    },
 }
 
 fn default_true() -> bool {

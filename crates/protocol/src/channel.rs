@@ -159,4 +159,10 @@ pub enum ControlMessage {
     ObserverLeft {
         name: String,
     },
+    /// The person at the device paused / resumed remote keyboard & mouse control (the
+    /// session bar's emergency switch). While paused the agent drops every input event; the
+    /// operator cannot lift it — only the device user can.
+    ControlPaused {
+        paused: bool,
+    },
 }

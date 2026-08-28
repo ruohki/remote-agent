@@ -28,4 +28,4 @@ names: Array<string>, total_bytes: bigint, } | { "t": "clipboard_changed", text:
 /**
  * Capture→encode→send latency estimate in milliseconds.
  */
-pipeline_ms: number, hardware: boolean, } | { "t": "session_ended_by_user" } | { "t": "observer_joined", name: string, } | { "t": "observer_left", name: string, };
+pipeline_ms: number, hardware: boolean, } | { "t": "session_ended_by_user" } | { "t": "observer_joined", name: string, } | { "t": "observer_left", name: string, } | { "t": "control_paused", paused: boolean, };
