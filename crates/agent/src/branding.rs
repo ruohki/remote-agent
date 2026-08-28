@@ -309,8 +309,6 @@ impl Rgba {
         let i = ((y * self.width + x) * 4) as usize;
         self.data[i..i + 4].copy_from_slice(&p);
     }
-
-    /// Fraction of pixels that are (partially) transparent.
 }
 
 /// Decode a PNG of any colour type / bit depth to RGBA8.
@@ -650,7 +648,6 @@ mod tests {
         assert_eq!((fitted.width, fitted.height), (8, 8));
         assert_eq!(fitted.px(0, 0)[3], 0); // padding stays transparent
     }
-
 
     #[test]
     fn accent_is_validated() {
