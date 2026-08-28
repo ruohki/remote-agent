@@ -34,3 +34,7 @@ pub const INPUT_CHANNEL_LABEL: &str = "input";
 pub const CONTROL_CHANNEL_LABEL: &str = "control";
 /// Label of the WebRTC data channel carrying [`files::FileMessage`]s and binary file chunks.
 pub const FILES_CHANNEL_LABEL: &str = "files";
+/// Label of the optional **unordered, unreliable** data channel (`maxRetransmits: 0`) carrying
+/// only [`channel::InputEvent::MouseMove`]: the agent applies the newest position and drops
+/// stale ones. Buttons and keys always use the reliable `input` channel.
+pub const FAST_INPUT_CHANNEL_LABEL: &str = "input-fast";

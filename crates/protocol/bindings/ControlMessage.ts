@@ -24,7 +24,19 @@ audio: boolean, } | { "t": "clipboard_available", kind: ClipboardKind,
 /**
  * File names (or a single generated name for images).
  */
-names: Array<string>, total_bytes: bigint, } | { "t": "clipboard_changed", text: string, } | { "t": "stats", display: number, codec: VideoCodec, fps: number, bitrate_kbps: number, width: number, height: number, 
+names: Array<string>, total_bytes: bigint, } | { "t": "clipboard_changed", text: string, } | { "t": "stats", display: number, codec: VideoCodec, 
+/**
+ * Encoded picture size (may be smaller than the display when viewport scaling is on).
+ */
+encoded_width: number, encoded_height: number, 
+/**
+ * Capture → encoded latency and encode duration, milliseconds (averages over the window).
+ */
+capture_to_encoded_ms: number, encode_ms: number, 
+/**
+ * Keyframes sent in the window and current GOP policy (0 = keyframes only on demand).
+ */
+keyframes: number, frames_skipped_idle: number, fps: number, bitrate_kbps: number, width: number, height: number, 
 /**
  * Capture→encode→send latency estimate in milliseconds.
  */
@@ -32,4 +44,4 @@ pipeline_ms: number, hardware: boolean, } | { "t": "session_ended_by_user" } | {
 /**
  * Width in physical pixels.
  */
-width: number, points: Array<[number, number]>, } | { "t": "annotate_end", id: number, } | { "t": "annotate_pointer", display: number, point?: [number, number], color: string, } | { "t": "annotate_clear" } | { "t": "annotations_disabled" };
+width: number, points: Array<[number, number]>, } | { "t": "annotate_end", id: number, } | { "t": "annotate_pointer", display: number, point?: [number, number], color: string, } | { "t": "annotate_clear" } | { "t": "annotations_disabled" } | { "t": "set_viewport", display: number, width?: number, height?: number, } | { "t": "cursor_shape", id: number, png_base64: string, hotspot_x: number, hotspot_y: number, width: number, height: number, } | { "t": "cursor_position", display: number, x: number, y: number, shape_id: number, visible: boolean, };

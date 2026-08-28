@@ -141,6 +141,21 @@ pub enum ControlMessage {
         #[serde(default)]
         display: u32,
         codec: VideoCodec,
+        /// Encoded picture size (may be smaller than the display when viewport scaling is on).
+        #[serde(default)]
+        encoded_width: u32,
+        #[serde(default)]
+        encoded_height: u32,
+        /// Capture → encoded latency and encode duration, milliseconds (averages over the window).
+        #[serde(default)]
+        capture_to_encoded_ms: f32,
+        #[serde(default)]
+        encode_ms: f32,
+        /// Keyframes sent in the window and current GOP policy (0 = keyframes only on demand).
+        #[serde(default)]
+        keyframes: u32,
+        #[serde(default)]
+        frames_skipped_idle: u32,
         fps: f32,
         bitrate_kbps: u32,
         width: u32,
@@ -192,4 +207,38 @@ pub enum ControlMessage {
     AnnotateClear,
     /// Agent → browser: annotations are not allowed on this device (policy or local override).
     AnnotationsDisabled,
+
+    // ── performance (browser → agent) ───────────────────────────────────────────
+    /// Size at which the browser renders `display` (CSS px × devicePixelRatio). The agent
+    /// encodes at `min(display size, viewport)` to save bandwidth; `None` = full resolution.
+    SetViewport {
+        display: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        width: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        height: Option<u32>,
+    },
+
+    // ── cursor (agent → browser; the capture omits the system cursor) ───────────
+    /// New cursor image (PNG, base64) with its hotspot in physical pixels; sent when the
+    /// shape changes. Browsers draw it locally so the cursor never lags the stream.
+    CursorShape {
+        id: u32,
+        png_base64: String,
+        hotspot_x: u32,
+        hotspot_y: u32,
+        width: u32,
+        height: u32,
+    },
+    /// Cursor position in physical pixels of `display` (≤ 60 Hz, only on change);
+    /// `visible = false` hides it (e.g. cursor hidden by the OS).
+    CursorPosition {
+        display: u32,
+        x: i32,
+        y: i32,
+        shape_id: u32,
+        visible: bool,
+    },
 }
