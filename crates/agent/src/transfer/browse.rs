@@ -16,11 +16,12 @@ pub fn roots(transfer_dir: &Path) -> Vec<FileEntry> {
     let mut push = |name: &str, p: PathBuf| {
         if p.is_dir() {
             out.push(FileEntry {
-                name: format!("{name}|{}", p.display()),
+                name: name.to_string(),
                 is_dir: true,
                 size: 0,
                 modified_ms: None,
                 hidden: false,
+                path: Some(p.display().to_string()),
             });
         }
     };
@@ -101,6 +102,7 @@ pub fn list(path: &Path) -> Result<Vec<FileEntry>> {
             is_dir: meta.is_dir(),
             size: if meta.is_dir() { 0 } else { meta.len() },
             modified_ms,
+            path: None,
         });
     }
     entries.sort_by(|a, b| {

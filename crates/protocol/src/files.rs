@@ -89,6 +89,12 @@ pub struct FileEntry {
     pub modified_ms: Option<u64>,
     #[serde(default)]
     pub hidden: bool,
+    /// Absolute path of the entry. Set for the well-known roots returned by `list { path: None }`
+    /// (where `name` is a display label such as "Home"); regular listings leave it `None`
+    /// and clients join `Listing.path` with `name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]

@@ -7,4 +7,10 @@ export type FileEntry = { name: string, is_dir: boolean, size: bigint,
 /**
  * Unix epoch milliseconds.
  */
-modified_ms?: bigint, hidden: boolean, };
+modified_ms?: bigint, hidden: boolean, 
+/**
+ * Absolute path of the entry. Set for the well-known roots returned by `list { path: None }`
+ * (where `name` is a display label such as "Home"); regular listings leave it `None`
+ * and clients join `Listing.path` with `name`.
+ */
+path?: string, };

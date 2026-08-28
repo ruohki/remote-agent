@@ -783,7 +783,7 @@ async fn file_download_with_resume_and_browser_ops() {
         unreachable!()
     };
     assert!(error.is_none());
-    assert!(entries.iter().any(|e| e.name.starts_with("Transfers|")));
+    assert!(entries.iter().any(|e| e.name == "Transfers" && e.path.is_some()));
 
     h.files(&FileMessage::List {
         path: Some(dir.display().to_string()),
