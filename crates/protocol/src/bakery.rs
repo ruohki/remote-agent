@@ -50,6 +50,13 @@ pub struct Branding {
     /// Organisation name shown in the About section.
     #[serde(default)]
     pub organization: String,
+    /// Also apply name/logo/accent to the web console UI (the agent always uses them).
+    #[serde(default = "default_true")]
+    pub apply_to_console: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// What a baked binary knows about its console.
@@ -189,6 +196,7 @@ mod tests {
                 logo_png_base64: None,
                 support_text: "Call +49 123".into(),
                 organization: "Acme".into(),
+                apply_to_console: true,
             },
             issued_at: 1_700_000_000,
         }

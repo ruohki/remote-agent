@@ -23,4 +23,8 @@ support_text: string,
 /**
  * Organisation name shown in the About section.
  */
-organization: string, };
+organization: string, 
+/**
+ * Also apply name/logo/accent to the web console UI (the agent always uses them).
+ */
+apply_to_console: boolean, };
