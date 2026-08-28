@@ -64,6 +64,10 @@ pub struct EnrollRequest {
     pub os: crate::common::Os,
     pub arch: crate::common::Arch,
     pub agent_version: String,
+    /// Optional operator-facing name (`remote-agent enroll --name`); defaults to the hostname.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub display_name: Option<String>,
 }
 
 /// Response of `POST /api/enroll`.

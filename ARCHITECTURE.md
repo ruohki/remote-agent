@@ -5,7 +5,7 @@ Two repositories:
 | Repo | What | Stack |
 |------|------|-------|
 | `remote-agent` | The agent installed on Windows / macOS machines, plus the shared `protocol` crate | Rust |
-| `remote-console` | Management server (device registry, enrollment, signaling hub, TURN credentials) with the embedded web UI | Rust (axum, sqlx/SQLite or Postgres) + React/Vite/Tailwind SPA |
+| `remote-console` | Management server (device registry, enrollment, signaling hub, TURN credentials) with the embedded web UI | Rust (axum, sqlx/SQLite) + React/Vite/Tailwind SPA |
 
 ```
 ┌───────────────┐   HTTPS + WSS (/ws/ui)    ┌───────────────────────┐   WSS (/ws/agent)   ┌──────────────┐

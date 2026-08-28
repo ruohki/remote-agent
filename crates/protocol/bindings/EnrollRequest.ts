@@ -9,4 +9,8 @@ export type EnrollRequest = {
 /**
  * One-time / limited-use enrollment token issued by the console.
  */
-token: string, hostname: string, os: Os, arch: Arch, agent_version: string, };
+token: string, hostname: string, os: Os, arch: Arch, agent_version: string, 
+/**
+ * Optional operator-facing name (`remote-agent enroll --name`); defaults to the hostname.
+ */
+display_name?: string, };

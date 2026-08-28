@@ -31,6 +31,10 @@ pub async fn enroll(paths: &Paths, server: &str, token: &str, name: Option<Strin
         os: protocol::common::Os::current(),
         arch: protocol::common::Arch::current(),
         agent_version: crate::AGENT_VERSION.to_string(),
+        display_name: name
+            .clone()
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty()),
     };
 
     let client = reqwest::Client::builder()
