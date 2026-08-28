@@ -68,6 +68,9 @@ pub struct DeviceSummary {
     /// What the *requesting* user may do with this device (per-user; not broadcast state).
     #[serde(default)]
     pub permission: DevicePermission,
+    /// Restrictions the person at the device applied locally (tighten-only).
+    #[serde(default)]
+    pub local_overrides: crate::config::LocalOverrides,
 }
 
 /// Session row as shown in the console.

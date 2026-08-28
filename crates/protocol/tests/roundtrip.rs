@@ -1,7 +1,7 @@
 use protocol::agent::{AgentCapabilities, AgentToConsole, ConsoleToAgent};
 use protocol::channel::{ControlMessage, InputEvent, MouseButton};
 use protocol::common::*;
-use protocol::config::AgentConfig;
+use protocol::config::{AgentConfig, LocalOverrides};
 use protocol::ui::{ConsoleToUi, UiToConsole};
 
 #[test]
@@ -31,6 +31,7 @@ fn agent_hello_roundtrip() {
             clipboard: true,
         },
         logged_in_user: None,
+        local_overrides: LocalOverrides::default(),
     };
     let json = serde_json::to_string(&msg).unwrap();
     assert!(json.contains("\"type\":\"hello\""));

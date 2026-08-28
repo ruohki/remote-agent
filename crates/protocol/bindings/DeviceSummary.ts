@@ -4,6 +4,7 @@ import type { DeviceMode } from "./DeviceMode";
 import type { DevicePermission } from "./DevicePermission";
 import type { DisplayInfo } from "./DisplayInfo";
 import type { GroupRef } from "./GroupRef";
+import type { LocalOverrides } from "./LocalOverrides";
 import type { Os } from "./Os";
 import type { VideoCodec } from "./VideoCodec";
 
@@ -26,4 +27,8 @@ groups: Array<GroupRef>,
 /**
  * What the *requesting* user may do with this device (per-user; not broadcast state).
  */
-permission: DevicePermission, };
+permission: DevicePermission, 
+/**
+ * Restrictions the person at the device applied locally (tighten-only).
+ */
+local_overrides: LocalOverrides, };

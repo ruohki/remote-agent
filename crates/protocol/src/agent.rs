@@ -11,7 +11,7 @@ use crate::common::{
     Arch, DeviceMode, DisplayInfo, EndReason, IceCandidate, IceServer, OperatorInfo, Os,
     SessionDescription, VideoCodec,
 };
-use crate::config::AgentConfig;
+use crate::config::{AgentConfig, LocalOverrides};
 use crate::files::{TransferDirection, TransferKind};
 
 /// Something noteworthy that happened inside a session; persisted by the console
@@ -101,6 +101,9 @@ pub enum AgentToConsole {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         logged_in_user: Option<String>,
+        /// Restrictions set locally by the person at the device.
+        #[serde(default, skip_serializing_if = "LocalOverrides::is_empty")]
+        local_overrides: LocalOverrides,
     },
     Heartbeat {
         uptime_s: u64,
@@ -117,6 +120,10 @@ pub enum AgentToConsole {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         displays: Option<Vec<DisplayInfo>>,
+        /// Present only when the local restrictions changed since the last report.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        local_overrides: Option<LocalOverrides>,
     },
     /// Result of the help-me approval prompt (only sent in help-me mode).
     ApprovalResult { session_id: String, approved: bool },

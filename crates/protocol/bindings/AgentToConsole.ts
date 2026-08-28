@@ -5,6 +5,7 @@ import type { DeviceMode } from "./DeviceMode";
 import type { DisplayInfo } from "./DisplayInfo";
 import type { EndReason } from "./EndReason";
 import type { IceCandidate } from "./IceCandidate";
+import type { LocalOverrides } from "./LocalOverrides";
 import type { Os } from "./Os";
 import type { SessionDescription } from "./SessionDescription";
 import type { SessionEvent } from "./SessionEvent";
@@ -19,11 +20,19 @@ mode: DeviceMode, capabilities: AgentCapabilities,
 /**
  * User currently logged in at the console session, if known.
  */
-logged_in_user?: string, } | { "type": "heartbeat", uptime_s: bigint, logged_in_user?: string, cpu_percent?: number, mem_percent?: number, 
+logged_in_user?: string, 
+/**
+ * Restrictions set locally by the person at the device.
+ */
+local_overrides?: LocalOverrides, } | { "type": "heartbeat", uptime_s: bigint, logged_in_user?: string, cpu_percent?: number, mem_percent?: number, 
 /**
  * Present only when displays changed since the last report.
  */
-displays?: Array<DisplayInfo>, } | { "type": "approval_result", session_id: string, approved: boolean, } | { "type": "session_answer", session_id: string, answer: SessionDescription, 
+displays?: Array<DisplayInfo>, 
+/**
+ * Present only when the local restrictions changed since the last report.
+ */
+local_overrides?: LocalOverrides, } | { "type": "approval_result", session_id: string, approved: boolean, } | { "type": "session_answer", session_id: string, answer: SessionDescription, 
 /**
  * Codec the agent will encode with after negotiation.
  */

@@ -28,8 +28,6 @@ pub struct AgentConfig {
     pub allow_clipboard: bool,
     /// Help-me mode: seconds the approval prompt stays open before auto-deny.
     pub approval_timeout_s: u32,
-    /// Show an on-screen indicator while a session is active.
-    pub show_session_indicator: bool,
     /// Whether operators may send/receive files and browse the device file system.
     #[serde(default = "default_true")]
     pub allow_file_transfer: bool,
@@ -63,11 +61,62 @@ impl Default for AgentConfig {
             allow_input: true,
             allow_clipboard: true,
             approval_timeout_s: 60,
-            show_session_indicator: true,
             allow_file_transfer: true,
             transfer_dir: None,
             allow_audio: true,
         }
+    }
+}
+
+/// Restrictions the person at the device applies locally in the agent app. They can only
+/// **tighten** the console's [`AgentConfig`] (require approval, block input/audio/clipboard/
+/// files); `None` = follow the console. Reported to the console so admins see the effective
+/// policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, Default)]
+#[ts(export)]
+pub struct LocalOverrides {
+    /// `Some(HelpMe)` forces approval even when the console says unattended (`Some(Unattended)`
+    /// is ignored — it cannot loosen policy).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub mode: Option<DeviceMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub allow_input: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub allow_audio: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub allow_clipboard: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub allow_file_transfer: Option<bool>,
+}
+
+impl LocalOverrides {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Console config combined with the local restrictions (restrict-only).
+    pub fn apply(&self, mut cfg: AgentConfig) -> AgentConfig {
+        if self.mode == Some(DeviceMode::HelpMe) {
+            cfg.mode = DeviceMode::HelpMe;
+        }
+        if self.allow_input == Some(false) {
+            cfg.allow_input = false;
+        }
+        if self.allow_audio == Some(false) {
+            cfg.allow_audio = false;
+        }
+        if self.allow_clipboard == Some(false) {
+            cfg.allow_clipboard = false;
+        }
+        if self.allow_file_transfer == Some(false) {
+            cfg.allow_file_transfer = false;
+        }
+        cfg
     }
 }
 

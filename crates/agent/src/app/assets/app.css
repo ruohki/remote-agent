@@ -67,8 +67,11 @@ body {
 .statusdot.warn { background: #d97706; }
 
 /* main */
-.main { overflow: auto; padding: 20px; }
+.main { overflow: auto; padding: 20px; min-height: 0; }
 .screen { max-width: 620px; margin: 0 auto; }
+/* The chat is not a card: it fills the whole content pane edge to edge. */
+.main:has(#screen-chat:not([hidden])) { padding: 0; overflow: hidden; display: flex; }
+#screen-chat { max-width: none; margin: 0; flex: 1; min-height: 0; display: flex; }
 .hero { display: flex; align-items: center; gap: 14px; margin-bottom: 18px; }
 .hero h1 { font-size: 18px; margin: 0 0 2px; }
 .hero p { margin: 0; }
@@ -115,11 +118,11 @@ body {
 .about dd { margin: 0; word-break: break-all; }
 
 /* chat */
-.chat { display: flex; flex-direction: column; height: calc(100vh - 40px); background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; box-shadow: var(--shadow); }
-.chat-head { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--border); }
+.chat { display: flex; flex-direction: column; flex: 1; min-height: 0; height: 100%; background: var(--bg); }
+.chat-head { display: flex; align-items: center; gap: 10px; padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--panel); }
 .chat-head-text { flex: 1; min-width: 0; }
 .chat-title { font-weight: 650; }
-.transcript { flex: 1; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 2px; }
+.transcript { flex: 1; overflow-y: auto; padding: 16px 16px 8px; display: flex; flex-direction: column; gap: 2px; }
 .transcript .empty { margin: auto; color: var(--muted); }
 .daysep { align-self: center; color: var(--muted); font-size: 11px; margin: 10px 0 6px; }
 .row { display: flex; margin-top: 2px; }
@@ -132,7 +135,7 @@ body {
 .row.grouped.me .bubble { border-top-right-radius: 5px; }
 .time { font-size: 10px; color: var(--muted); align-self: flex-end; margin: 0 6px; }
 .row.me .time { order: -1; }
-.composer { display: flex; align-items: flex-end; gap: 8px; padding: 10px; border-top: 1px solid var(--border); }
+.composer { display: flex; align-items: flex-end; gap: 8px; padding: 10px 12px; border-top: 1px solid var(--border); background: var(--panel); }
 .composer textarea { flex: 1; resize: none; border: 1px solid var(--border); border-radius: 18px; padding: 8px 14px; font: inherit; font-size: 13px; background: var(--panel-2); color: var(--text); max-height: 120px; -webkit-user-select: text; user-select: text; outline: none; }
 .composer textarea:focus { border-color: var(--accent); }
 .send {

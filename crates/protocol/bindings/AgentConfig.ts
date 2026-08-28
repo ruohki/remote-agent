@@ -46,10 +46,6 @@ allow_clipboard: boolean,
  */
 approval_timeout_s: number, 
 /**
- * Show an on-screen indicator while a session is active.
- */
-show_session_indicator: boolean, 
-/**
  * Whether operators may send/receive files and browse the device file system.
  */
 allow_file_transfer: boolean, 
