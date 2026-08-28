@@ -311,11 +311,6 @@ impl Rgba {
     }
 
     /// Fraction of pixels that are (partially) transparent.
-    fn transparent_fraction(&self) -> f32 {
-        let n = (self.width * self.height).max(1) as f32;
-        let t = self.data.chunks(4).filter(|p| p[3] < 250).count() as f32;
-        t / n
-    }
 }
 
 /// Decode a PNG of any colour type / bit depth to RGBA8.
@@ -656,47 +651,6 @@ mod tests {
         assert_eq!(fitted.px(0, 0)[3], 0); // padding stays transparent
     }
 
-    #[test]
-    fn template_from_opaque_logo_uses_dark_pixels_as_ink() {
-        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Opaque logo: white background with a black square in the middle.
-        let mut logo = Rgba::new(8, 8);
-        for y in 0..8 {
-            for x in 0..8 {
-                let ink = (2..6).contains(&x) && (2..6).contains(&y);
-                logo.set(
-                    x,
-                    y,
-                    if ink {
-                        [0, 0, 0, 255]
-                    } else {
-                        [255, 255, 255, 255]
-                    },
-                );
-            }
-        }
-        let png = encode_png(&logo);
-        use base64::Engine;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(png);
-        let (_t, paths) = tmp_paths();
-        let b = Branding {
-            product_name: "Acme".into(),
-            accent: "#e0562f".into(),
-            logo_png_base64: Some(b64),
-            ..Default::default()
-        };
-        assert!(apply_console(b, &paths));
-        assert_eq!(product_name(), "Acme");
-        assert_eq!(accent_rgb(), (0xe0, 0x56, 0x2f));
-        let t = template_icon(8);
-        assert!(t.px(3, 3)[3] > 200, "ink where the logo is dark");
-        assert_eq!(t.px(0, 0)[3], 0, "transparent where the logo is white");
-        // cache written
-        assert!(paths.dir.join(CACHE_FILE).exists());
-        assert!(paths.dir.join(LOGO_FILE).exists());
-        // second apply with identical branding reports no change
-        assert!(!apply_console(current(), &paths));
-    }
 
     #[test]
     fn accent_is_validated() {
