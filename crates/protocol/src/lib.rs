@@ -14,6 +14,7 @@
 //! TypeScript bindings are generated with `cargo test -p protocol` into `bindings/`.
 
 pub mod agent;
+pub mod bakery;
 pub mod channel;
 pub mod common;
 pub mod config;
