@@ -66,19 +66,43 @@ pub fn run() -> Result<()> {
     init_logging(&cli.log, &paths);
 
     match cli.command {
+        // `run` needs the platform UI loop on the main thread (macOS approval dialogs /
+        // indicator); `run_main_loop` pumps it and drives the agent on a worker thread.
         Command::Run => {
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(crate::hub::run_agent(paths))
+            let paths = paths.clone();
+            let code = crate::platform::run_main_loop(move || match run_agent_blocking(&paths) {
+                Ok(()) => 0,
+                Err(e) => {
+                    tracing::error!("agent exited: {e:#}");
+                    1
+                }
+            });
+            if code == 0 {
+                Ok(())
+            } else {
+                anyhow::bail!("agent exited with code {code}")
+            }
         }
-        Command::Enroll { server, token, name } => {
+        Command::Enroll {
+            server,
+            token,
+            name,
+        } => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(crate::enroll::enroll(&paths, &server, &token, name))
         }
         Command::Service { action } => crate::service::handle(&paths, action),
         Command::Status => crate::config::print_status(&paths),
-        Command::Doctor => crate::platform::doctor(),
+        Command::Doctor => crate::platform::doctor(&paths),
         Command::Reset => crate::config::reset(&paths),
     }
+}
+
+/// Run the agent event loop to completion on the current thread (used by `run` and by the
+/// service managers). Builds its own tokio runtime.
+pub fn run_agent_blocking(paths: &crate::config::Paths) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(crate::hub::run_agent(paths.clone()))
 }
 
 fn init_logging(filter: &str, paths: &crate::config::Paths) {
@@ -90,13 +114,19 @@ fn init_logging(filter: &str, paths: &crate::config::Paths) {
     // Also log to a rolling file inside the config dir when we can create it.
     if let Ok(()) = std::fs::create_dir_all(paths.log_dir()) {
         let appender = tracing_appender::rolling::daily(paths.log_dir(), "remote-agent.log");
-        let file_layer = fmt::layer().with_ansi(false).with_target(false).with_writer(appender);
+        let file_layer = fmt::layer()
+            .with_ansi(false)
+            .with_target(false)
+            .with_writer(appender);
         tracing_subscriber::registry()
             .with(env_filter)
             .with(stderr_layer)
             .with(file_layer)
             .init();
     } else {
-        tracing_subscriber::registry().with(env_filter).with(stderr_layer).init();
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(stderr_layer)
+            .init();
     }
 }

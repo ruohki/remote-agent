@@ -11,6 +11,16 @@ default-run = "remote-agent"
 name = "remote-agent"
 path = "src/main.rs"
 
+[features]
+# Enabled on Windows release builds to compile the SCM service dispatcher and the
+# active-session process launcher. Off by default so `cargo test` on a dev box is lean.
+default = []
+winservice = []
+
+[lib]
+name = "remote_agent"
+path = "src/lib.rs"
+
 [dependencies]
 protocol.workspace = true
 serde.workspace = true
@@ -36,6 +46,8 @@ bytes = "1.12"
 
 # WebRTC (sans-io core `rtc` re-exported by `webrtc`)
 webrtc = { version = "0.20.3", default-features = false, features = ["runtime-tokio"] }
+# Sans-io protocol core re-used by webrtc; needed directly for Sample, RTCP feedback and codec types.
+rtc = "0.20.3"
 async-trait = "0.1"
 
 # misc
@@ -81,6 +93,7 @@ windows-service = "0.8"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D10",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",

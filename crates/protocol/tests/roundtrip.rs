@@ -44,8 +44,14 @@ fn agent_hello_roundtrip() {
 fn console_session_request_roundtrip() {
     let msg = ConsoleToAgent::SessionRequest {
         session_id: "sess".into(),
-        operator: OperatorInfo { id: "u1".into(), name: "Alice".into() },
-        offer: SessionDescription { kind: "offer".into(), sdp: "v=0...".into() },
+        operator: OperatorInfo {
+            id: "u1".into(),
+            name: "Alice".into(),
+        },
+        offer: SessionDescription {
+            kind: "offer".into(),
+            sdp: "v=0...".into(),
+        },
         ice_servers: vec![IceServer {
             urls: vec!["turn:turn.example.com:3478".into()],
             username: Some("1700000000:u1".into()),
@@ -62,26 +68,44 @@ fn console_session_request_roundtrip() {
 fn input_events_use_short_tags() {
     let mm = serde_json::to_string(&InputEvent::MouseMove { x: 10, y: 20 }).unwrap();
     assert_eq!(mm, r#"{"t":"mm","x":10,"y":20}"#);
-    let md = serde_json::to_string(&InputEvent::MouseDown { button: MouseButton::Left }).unwrap();
+    let md = serde_json::to_string(&InputEvent::MouseDown {
+        button: MouseButton::Left,
+    })
+    .unwrap();
     assert_eq!(md, r#"{"t":"md","button":"left"}"#);
     let kd: InputEvent = serde_json::from_str(r#"{"t":"kd","code":"KeyA"}"#).unwrap();
-    assert_eq!(kd, InputEvent::KeyDown { code: "KeyA".into() });
+    assert_eq!(
+        kd,
+        InputEvent::KeyDown {
+            code: "KeyA".into()
+        }
+    );
 }
 
 #[test]
 fn control_and_ui_roundtrip() {
-    let c = ControlMessage::SetQuality { max_fps: Some(30), max_bitrate_kbps: None };
+    let c = ControlMessage::SetQuality {
+        max_fps: Some(30),
+        max_bitrate_kbps: None,
+    };
     let json = serde_json::to_string(&c).unwrap();
     assert_eq!(json, r#"{"t":"set_quality","max_fps":30}"#);
 
     let ui = UiToConsole::SessionOffer {
         device_id: "d".into(),
-        offer: SessionDescription { kind: "offer".into(), sdp: "x".into() },
+        offer: SessionDescription {
+            kind: "offer".into(),
+            sdp: "x".into(),
+        },
     };
     let back: UiToConsole = serde_json::from_str(&serde_json::to_string(&ui).unwrap()).unwrap();
     assert_eq!(back, ui);
 
-    let err = ConsoleToUi::Error { session_id: None, code: "offline".into(), message: "m".into() };
+    let err = ConsoleToUi::Error {
+        session_id: None,
+        code: "offline".into(),
+        message: "m".into(),
+    };
     assert_eq!(
         serde_json::to_string(&err).unwrap(),
         r#"{"type":"error","code":"offline","message":"m"}"#

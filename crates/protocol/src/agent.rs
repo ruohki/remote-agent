@@ -60,10 +60,7 @@ pub enum AgentToConsole {
         displays: Option<Vec<DisplayInfo>>,
     },
     /// Result of the help-me approval prompt (only sent in help-me mode).
-    ApprovalResult {
-        session_id: String,
-        approved: bool,
-    },
+    ApprovalResult { session_id: String, approved: bool },
     /// SDP answer to the operator's offer.
     SessionAnswer {
         session_id: String,
@@ -83,14 +80,9 @@ pub enum AgentToConsole {
         reason: Option<EndReason>,
     },
     /// Reply to [`ConsoleToAgent::Ping`].
-    Pong {
-        nonce: u64,
-    },
+    Pong { nonce: u64 },
     /// Free-form log line forwarded to the console (kept short; rate limited by the agent).
-    Log {
-        level: String,
-        message: String,
-    },
+    Log { level: String, message: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]

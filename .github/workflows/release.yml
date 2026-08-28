@@ -1,0 +1,131 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── macOS universal binary ──────────────────────────────────────────────────────────
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (arm64 + x86_64)
+        run: |
+          cargo build --release --target aarch64-apple-darwin -p remote-agent
+          cargo build --release --target x86_64-apple-darwin -p remote-agent
+
+      - name: Make universal binary
+        run: |
+          mkdir -p dist
+          lipo -create -output dist/remote-agent-macos-universal \
+            target/aarch64-apple-darwin/release/remote-agent \
+            target/x86_64-apple-darwin/release/remote-agent
+          chmod +x dist/remote-agent-macos-universal
+
+      # Optional codesign + notarization, only when signing secrets are configured.
+      - name: Codesign & notarize
+        if: ${{ env.MACOS_CERT_P12 != '' }}
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
+          AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
+          AC_API_KEY_P8: ${{ secrets.AC_API_KEY_P8 }}
+        run: |
+          echo "$MACOS_CERT_P12" | base64 --decode > cert.p12
+          security create-keychain -p ci build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p ci build.keychain
+          security import cert.p12 -k build.keychain -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k ci build.keychain
+          codesign --force --options runtime --timestamp \
+            --sign "$MACOS_SIGN_IDENTITY" dist/remote-agent-macos-universal
+          # Notarize (zip, submit, staple is not applicable to a bare binary; ship the signed binary)
+          echo "$AC_API_KEY_P8" | base64 --decode > key.p8
+          ditto -c -k dist/remote-agent-macos-universal notarize.zip
+          xcrun notarytool submit notarize.zip \
+            --key key.p8 --key-id "$AC_API_KEY_ID" --issuer "$AC_API_ISSUER_ID" --wait || true
+          rm -f cert.p12 key.p8
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/remote-agent-macos-universal
+
+  # ── Windows binaries ────────────────────────────────────────────────────────────────
+  windows:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            name: remote-agent-windows-x86_64.exe
+          - target: aarch64-pc-windows-msvc
+            name: remote-agent-windows-aarch64.exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --features winservice --target ${{ matrix.target }} -p remote-agent
+
+      - name: Sign (optional)
+        if: ${{ env.WINDOWS_CERT_PFX != '' }}
+        shell: pwsh
+        env:
+          WINDOWS_CERT_PFX: ${{ secrets.WINDOWS_CERT_PFX }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          [IO.File]::WriteAllBytes("cert.pfx", [Convert]::FromBase64String($env:WINDOWS_CERT_PFX))
+          $bin = "target/${{ matrix.target }}/release/remote-agent.exe"
+          & "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" sign `
+            /f cert.pfx /p $env:WINDOWS_CERT_PASSWORD /fd sha256 /tr http://timestamp.digicert.com /td sha256 $bin
+          Remove-Item cert.pfx
+
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/remote-agent.exe" "dist/${{ matrix.name }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/${{ matrix.name }}
+
+  # ── Assemble the release ────────────────────────────────────────────────────────────
+  release:
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Collect + checksums
+        run: |
+          mkdir -p dist
+          find artifacts -type f -exec cp {} dist/ \;
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

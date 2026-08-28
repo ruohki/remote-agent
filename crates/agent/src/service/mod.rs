@@ -1,20 +1,26 @@
-//! Background service integration.
-//!
-//! TODO(builder-core):
-//! * macOS: install a **LaunchAgent** (`/Library/LaunchAgents/com.remoteagent.agent.plist`,
-//!   `RunAtLoad`, `KeepAlive`, runs `remote-agent run` in every GUI login session so screen
-//!   recording / accessibility permissions apply). `launchctl bootstrap gui/<uid>` for the
-//!   current console user after install; `bootout` on uninstall.
-//! * Windows: register a service (`windows-service` crate, `SERVICE_AUTO_START`,
-//!   LocalSystem). `service run` is the SCM entry point; it supervises a child
-//!   `remote-agent run` started in the active console session via `WTSQueryUserToken` +
-//!   `CreateProcessAsUserW` (desktop `winsta0\default`) and restarts it on exit / session change
-//!   (`SERVICE_CONTROL_SESSIONCHANGE`).
+//! Background service integration (launchd on macOS, Windows service on Windows).
 
 use crate::cli::ServiceAction;
 use crate::config::Paths;
 use anyhow::Result;
 
-pub fn handle(_paths: &Paths, action: ServiceAction) -> Result<()> {
-    anyhow::bail!("service action {action:?} not implemented yet")
+#[cfg(target_os = "macos")]
+mod launchd;
+#[cfg(target_os = "windows")]
+mod windows_service_impl;
+
+pub fn handle(paths: &Paths, action: ServiceAction) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        launchd::handle(paths, action)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows_service_impl::handle(paths, action)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (paths, action);
+        anyhow::bail!("service management is not supported on this platform")
+    }
 }

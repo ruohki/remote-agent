@@ -159,10 +159,18 @@ pub struct IceCandidate {
     #[serde(default, rename = "sdpMid", skip_serializing_if = "Option::is_none")]
     #[ts(optional, rename = "sdpMid")]
     pub sdp_mid: Option<String>,
-    #[serde(default, rename = "sdpMLineIndex", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "sdpMLineIndex",
+        skip_serializing_if = "Option::is_none"
+    )]
     #[ts(optional, rename = "sdpMLineIndex")]
     pub sdp_mline_index: Option<u16>,
-    #[serde(default, rename = "usernameFragment", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "usernameFragment",
+        skip_serializing_if = "Option::is_none"
+    )]
     #[ts(optional, rename = "usernameFragment")]
     pub username_fragment: Option<String>,
 }

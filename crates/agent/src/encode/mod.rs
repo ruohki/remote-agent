@@ -20,9 +20,9 @@ use bytes::Bytes;
 use protocol::common::VideoCodec;
 use std::time::Duration;
 
-pub mod software;
 #[cfg(target_os = "windows")]
 pub mod mediafoundation;
+pub mod software;
 #[cfg(target_os = "macos")]
 pub mod videotoolbox;
 
@@ -48,6 +48,13 @@ pub trait Encoder: Send {
     fn set_bitrate(&mut self, kbps: u32) -> Result<()>;
     fn codec(&self) -> VideoCodec;
     fn is_hardware(&self) -> bool;
+    /// Size of the encoded picture. Differs from the input size when the encoder had to
+    /// downscale (e.g. hardware H.264 limited to 4096×2304). The session must rescale
+    /// browser mouse coordinates (which are in encoded-picture pixels) by
+    /// `display_size / output_size` before injecting them.
+    fn output_size(&self) -> Option<(u32, u32)> {
+        None
+    }
 }
 
 /// Codecs this machine can encode, best first. Cached after the first probe.

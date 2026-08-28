@@ -140,7 +140,14 @@ pub fn print_status(paths: &Paths) -> Result<()> {
     match LocalConfig::load(paths)? {
         None => println!("enrolled   : no"),
         Some(cfg) => {
-            println!("enrolled   : {}", if cfg.is_enrolled() { "yes" } else { "incomplete" });
+            println!(
+                "enrolled   : {}",
+                if cfg.is_enrolled() {
+                    "yes"
+                } else {
+                    "incomplete"
+                }
+            );
             println!("server     : {}", cfg.server_url);
             println!("device id  : {}", cfg.device_id);
             let eff = cfg.effective();
@@ -170,7 +177,9 @@ mod tests {
     #[test]
     fn save_and_load_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
-        let paths = Paths { dir: tmp.path().join("cfg") };
+        let paths = Paths {
+            dir: tmp.path().join("cfg"),
+        };
         let cfg = LocalConfig {
             server_url: "https://console.example".into(),
             device_id: "dev".into(),

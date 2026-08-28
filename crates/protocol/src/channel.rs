@@ -10,7 +10,7 @@ use ts_rs::TS;
 
 use crate::common::{DisplayInfo, VideoCodec};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
 pub enum MouseButton {
