@@ -7,6 +7,9 @@ Remote desktop agent for Windows and macOS. Pairs with
 * Hardware **H.265** encoding with automatic **H.264** fallback (VideoToolbox, Media Foundation, OpenH264)
 * WebRTC (DTLS-SRTP) straight to the operator's browser; TURN relay only when needed
 * Two modes: **unattended** and **help-me** (the local user must approve each session)
+* Multi-display streaming (one track per display), system audio (Opus)
+* Resumable, hash-verified file transfer in both directions, remote file browser, image/file clipboard
+* Built-in chat with the person at the device; every session reports an event timeline to the console
 * One binary, installs as a launchd agent / Windows service, enrolls with a single command
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and the wire protocol.
