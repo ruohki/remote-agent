@@ -12,14 +12,17 @@ pub struct Cli {
     #[arg(long, global = true, env = "REMOTE_AGENT_LOG", default_value = "info")]
     pub log: String,
 
+    /// No subcommand launches the branded application window (double-click).
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Run the agent in the foreground (what the service / launch agent executes).
     Run,
+    /// Print the baked (branding / config) trailer of this binary, if any.
+    BakeInfo,
     /// Enroll this machine with a management console using an enrollment token.
     Enroll {
         /// Console base URL, e.g. https://remote.example.com
@@ -66,35 +69,50 @@ pub fn run() -> Result<()> {
     init_logging(&cli.log, &paths);
 
     match cli.command {
-        // `run` needs the platform UI loop on the main thread (macOS approval dialogs /
-        // indicator); `run_main_loop` pumps it and drives the agent on a worker thread.
-        Command::Run => {
-            let paths = paths.clone();
-            let code = crate::platform::run_main_loop(move || match run_agent_blocking(&paths) {
-                Ok(()) => 0,
-                Err(e) => {
-                    tracing::error!("agent exited: {e:#}");
-                    1
-                }
-            });
-            if code == 0 {
-                Ok(())
-            } else {
-                anyhow::bail!("agent exited with code {code}")
-            }
-        }
-        Command::Enroll {
+        // Service mode: the launch agent / service runs the agent behind the app loop, but the
+        // window stays in the tray until a session shows it.
+        Some(Command::Run) => run_in_app(&paths, false),
+        // No subcommand: the branded application (double-click). Window shown, install offered
+        // when not yet installed as a service.
+        None => run_in_app(&paths, true),
+        Some(Command::BakeInfo) => crate::baked::print_info(),
+        Some(Command::Enroll {
             server,
             token,
             name,
-        } => {
+        }) => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(crate::enroll::enroll(&paths, &server, &token, name))
         }
-        Command::Service { action } => crate::service::handle(&paths, action),
-        Command::Status => crate::config::print_status(&paths),
-        Command::Doctor => crate::platform::doctor(&paths),
-        Command::Reset => crate::config::reset(&paths),
+        Some(Command::Service { action }) => crate::service::handle(&paths, action),
+        Some(Command::Status) => crate::config::print_status(&paths),
+        Some(Command::Doctor) => crate::platform::doctor(&paths),
+        Some(Command::Reset) => crate::config::reset(&paths),
+    }
+}
+
+/// Run the agent behind the application UI loop (window + tray). `app_mode` shows the window at
+/// launch and offers the install action; service mode keeps it in the tray.
+fn run_in_app(paths: &crate::config::Paths, app_mode: bool) -> Result<()> {
+    let opts = crate::app::AppOptions {
+        show_on_start: app_mode,
+        installable: app_mode && !crate::service::is_installed(),
+    };
+    let paths = paths.clone();
+    let code = crate::app::run(
+        move || match run_agent_blocking(&paths) {
+            Ok(()) => 0,
+            Err(e) => {
+                tracing::error!("agent exited: {e:#}");
+                1
+            }
+        },
+        opts,
+    );
+    if code == 0 {
+        Ok(())
+    } else {
+        anyhow::bail!("agent exited with code {code}")
     }
 }
 
@@ -102,7 +120,13 @@ pub fn run() -> Result<()> {
 /// service managers). Builds its own tokio runtime.
 pub fn run_agent_blocking(paths: &crate::config::Paths) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(crate::hub::run_agent(paths.clone()))
+    rt.block_on(async move {
+        // Baked binaries with an enrollment token enroll themselves on first run.
+        if let Err(e) = crate::enroll::auto_enroll_if_baked(paths).await {
+            tracing::error!("auto-enrollment failed: {e:#}");
+        }
+        crate::hub::run_agent(paths.clone()).await
+    })
 }
 
 fn init_logging(filter: &str, paths: &crate::config::Paths) {

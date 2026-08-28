@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Remote Support</title>
+    <link rel="stylesheet" href="app://assets/app.css" />
+  </head>
+  <body>
+    <div id="app" class="app">
+      <!-- Sidebar -->
+      <nav class="rail" id="rail">
+        <div class="brand">
+          <div class="logo" id="logo" aria-hidden="true"></div>
+          <div class="brand-name" id="brandName">Remote Support</div>
+        </div>
+        <button class="tab" data-screen="home" id="tab-home">
+          <span class="tab-ico">◎</span><span>Status</span>
+        </button>
+        <button class="tab" data-screen="chat" id="tab-chat">
+          <span class="tab-ico">💬</span><span>Chat</span>
+          <span class="badge" id="chatBadge" hidden>0</span>
+        </button>
+        <button class="tab" data-screen="install" id="tab-install" hidden>
+          <span class="tab-ico">⤓</span><span>Install</span>
+        </button>
+        <button class="tab" data-screen="about" id="tab-about">
+          <span class="tab-ico">ⓘ</span><span>About</span>
+        </button>
+        <div class="rail-foot">
+          <span class="statusdot" id="railDot"></span>
+          <span id="railStatus">Connecting…</span>
+        </div>
+      </nav>
+
+      <!-- Main -->
+      <main class="main">
+        <!-- HOME -->
+        <section class="screen" id="screen-home">
+          <header class="hero">
+            <div class="hero-logo" id="heroLogo" aria-hidden="true"></div>
+            <div>
+              <h1 id="heroName">Remote Support</h1>
+              <p class="muted" id="supportText"></p>
+            </div>
+          </header>
+          <div class="cards">
+            <div class="card">
+              <div class="card-label">Console</div>
+              <div class="card-value" id="consoleUrl">—</div>
+              <div class="card-sub"><span class="statusdot" id="consoleDot"></span><span id="consoleState">Connecting…</span></div>
+            </div>
+            <div class="card">
+              <div class="card-label">This device</div>
+              <div class="card-value" id="deviceName">—</div>
+              <div class="card-sub mono" id="deviceId">—</div>
+            </div>
+          </div>
+
+          <div class="session-panel" id="sessionPanel">
+            <div class="session-none" id="sessionNone">
+              <div class="pulse"></div>
+              <div>
+                <div class="session-title">No active session</div>
+                <div class="muted">You're in control. An operator can request to connect; you decide.</div>
+              </div>
+            </div>
+            <div class="session-active" id="sessionActive" hidden>
+              <div class="op">
+                <div class="op-avatar" id="opAvatar">?</div>
+                <div>
+                  <div class="session-title"><span id="opName">Operator</span> is connected</div>
+                  <div class="muted" id="sessionMeta">Viewing and controlling your screen</div>
+                </div>
+              </div>
+              <div class="session-actions">
+                <button class="btn ghost" id="openChatBtn">Open chat</button>
+                <button class="btn danger" id="endBtn">End session</button>
+              </div>
+            </div>
+          </div>
+          <p class="tip muted">You can close or minimize this window at any time — the session keeps running and this window stays reachable from the menu bar icon. Ending the session is always your choice.</p>
+        </section>
+
+        <!-- CHAT -->
+        <section class="screen" id="screen-chat" hidden>
+          <div class="chat">
+            <div class="chat-head">
+              <div class="op-avatar sm" id="chatAvatar">?</div>
+              <div class="chat-head-text">
+                <div class="chat-title" id="chatWith">Chat</div>
+                <div class="muted sm"><span class="statusdot" id="chatDot"></span><span id="chatStatus">Not connected</span></div>
+              </div>
+              <button class="btn danger sm" id="chatEndBtn" hidden>End</button>
+            </div>
+            <div class="transcript" id="transcript">
+              <div class="empty" id="chatEmpty">No messages yet.</div>
+            </div>
+            <div class="composer">
+              <textarea id="composer" rows="1" placeholder="Message…" disabled></textarea>
+              <button id="send" class="send" aria-label="Send" disabled>
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4 20-7z"/></svg>
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <!-- INSTALL -->
+        <section class="screen" id="screen-install" hidden>
+          <header class="hero">
+            <div>
+              <h1>Install on this computer</h1>
+              <p class="muted">Set up <span id="installProduct">Remote Support</span> to start automatically so it's ready whenever help is needed.</p>
+            </div>
+          </header>
+          <ul class="checklist">
+            <li>Starts automatically when you sign in</li>
+            <li>Runs in the background with a menu-bar icon</li>
+            <li>You keep full control — every session is shown, and you can end it at any time</li>
+          </ul>
+          <div class="install-actions">
+            <button class="btn primary" id="installBtn">Install as a service</button>
+            <span class="install-status" id="installStatus"></span>
+          </div>
+        </section>
+
+        <!-- ABOUT -->
+        <section class="screen" id="screen-about" hidden>
+          <header class="hero"><div><h1>About</h1></div></header>
+          <dl class="about">
+            <dt>Product</dt><dd id="aboutProduct">—</dd>
+            <dt>Organization</dt><dd id="aboutOrg">—</dd>
+            <dt>Version</dt><dd id="aboutVersion" class="mono">—</dd>
+            <dt>Console</dt><dd id="aboutConsole" class="mono">—</dd>
+            <dt>Console key</dt><dd id="aboutKey" class="mono">—</dd>
+          </dl>
+        </section>
+      </main>
+    </div>
+    <script src="app://assets/app.js"></script>
+  </body>
+</html>

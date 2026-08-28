@@ -229,3 +229,43 @@ fn run_service(_paths: &Paths) -> Result<()> {
         bail!("this binary was built without the `winservice` feature");
     }
 }
+
+/// Whether the `RemoteAgent` service exists in the SCM.
+pub fn is_installed() -> bool {
+    let Ok(manager) = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+    else {
+        return false;
+    };
+    manager
+        .open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS)
+        .is_ok()
+}
+
+/// Re-launch `remote-agent service install` with a UAC elevation prompt.
+pub fn install_elevated(exe: &std::path::Path) -> Result<String> {
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+
+    let verb = HSTRING::from("runas");
+    let file = HSTRING::from(exe.as_os_str());
+    let params = HSTRING::from("service install");
+    // SAFETY: valid wide strings; ShellExecuteW returns an HINSTANCE-sized status (>32 = ok).
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(verb.as_ptr()),
+            PCWSTR(file.as_ptr()),
+            PCWSTR(params.as_ptr()),
+            PCWSTR::null(),
+            SW_HIDE,
+        )
+    };
+    if result.0 as isize > 32 {
+        Ok("Installed. It will start automatically at boot.".to_string())
+    } else if result.0 as isize == 1223 {
+        bail!("cancelled")
+    } else {
+        bail!("elevation failed (code {})", result.0 as isize)
+    }
+}

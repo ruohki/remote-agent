@@ -8,41 +8,32 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSApplication, NSApplicationActivationPolicy,
-    NSBackingStoreType, NSButton, NSPanel, NSScreen, NSStatusWindowLevel, NSTextField, NSWindow,
-    NSWindowCollectionBehavior, NSWindowSharingType, NSWindowStyleMask,
+    NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSApplication, NSBackingStoreType, NSButton,
+    NSPanel, NSScreen, NSStatusWindowLevel, NSTextField, NSWindow, NSWindowCollectionBehavior,
+    NSWindowSharingType, NSWindowStyleMask,
 };
 use objc2_core_graphics::{CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess};
 use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
-use std::ffi::CStr;
+use std::ffi::{c_void, CStr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
-// ─── main loop ──────────────────────────────────────────────────────────────────────────
+// ─── capture exclusion ────────────────────────────────────────────────────────────────────
 
-/// Pump `NSApplication` on the current (main) thread while `work` runs on a worker thread.
-/// The process exits with the worker's code when it finishes.
-pub fn run_app_loop(work: impl FnOnce() -> i32 + Send + 'static) -> i32 {
-    let Some(mtm) = MainThreadMarker::new() else {
-        tracing::error!("run_app_loop must be called on the main thread");
-        return 1;
-    };
-    let app = NSApplication::sharedApplication(mtm);
-    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
-    let spawned = std::thread::Builder::new()
-        .name("agent".into())
-        .spawn(move || {
-            let code = work();
-            tracing::info!("agent finished with code {code}");
-            std::process::exit(code);
-        });
-    if let Err(e) = spawned {
-        tracing::error!("spawning agent thread: {e}");
-        return 1;
+/// Exclude an `NSWindow` (e.g. the app window created by tao/wry) from every screen capture, so
+/// the operator never sees it. `ns_window` is the pointer returned by tao's `WindowExtMacOS`.
+pub fn exclude_ns_window_from_capture(ns_window: *mut c_void) {
+    if ns_window.is_null() {
+        return;
     }
-    app.run();
-    0
+    let addr = ns_window as usize;
+    let _ = run_on_main(move || {
+        // SAFETY: `addr` is a live `NSWindow` created by tao for the process lifetime; the call
+        // happens on the main thread.
+        let window: &NSWindow = unsafe { &*(addr as *const NSWindow) };
+        window.setSharingType(NSWindowSharingType::None);
+    });
 }
 
 /// Run `f` on the main thread. Runs inline when already there; otherwise dispatches to the

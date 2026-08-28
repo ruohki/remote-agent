@@ -1,0 +1,255 @@
+//! The branded agent application: a `tao` window hosting a `wry` webview (the UI in
+//! `assets/`), plus a tray / menu-bar icon. It is the device-side face of the agent — status,
+//! chat, "install as a service" and about — themed from the bakery trailer branding.
+//!
+//! Threading: the window and webview live on the process main thread inside [`run`]'s event
+//! loop. Other threads (the session task, the hub) drive the UI by posting [`AppEvent`]s
+//! through an [`tao::event_loop::EventLoopProxy`]; the loop applies them to the [`Controller`]
+//! (which calls `evaluate_script`). JS → Rust messages arrive on the webview IPC handler
+//! (also main thread) and are dispatched to the current session's callbacks.
+//!
+//! The chat presentation is wired through the [`crate::chat::ChatUi`] trait ([`AppChatUi`]),
+//! so the session code is unchanged. Closing the window hides it (the session keeps running);
+//! it is reopened from the tray. Every window we create is excluded from the screen capture
+//! and ignores remote-injected input.
+
+mod controller;
+
+use crate::baked;
+use crate::chat::{ChatHandle, ChatLine, ChatUi};
+use anyhow::Result;
+use protocol::channel::ChatParty;
+use protocol::common::OperatorInfo;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+
+pub use controller::run;
+
+/// Options controlling how the app presents itself for a given launch.
+#[derive(Debug, Clone, Copy)]
+pub struct AppOptions {
+    /// Show the window immediately (app / double-click mode) vs. stay in the tray (service mode).
+    pub show_on_start: bool,
+    /// Offer the "Install as a service" screen (only when not already installed).
+    pub installable: bool,
+}
+
+/// Events posted to the UI thread from elsewhere.
+#[derive(Debug, Clone)]
+pub enum AppEvent {
+    SessionStarted {
+        operator: String,
+    },
+    SessionEnded,
+    Chat {
+        from: ChatParty,
+        text: String,
+        ts_ms: u64,
+    },
+    /// Bring the window forward (optionally to the chat screen).
+    Show {
+        chat: bool,
+    },
+    Hide,
+    ConsoleStatus {
+        connected: bool,
+    },
+    DeviceInfo {
+        name: String,
+        id: String,
+    },
+    InstallResult {
+        ok: bool,
+        message: String,
+    },
+    Quit,
+    /// Internal: the page finished loading and is ready to receive JS.
+    #[doc(hidden)]
+    __Ready,
+}
+
+type SendCb = Arc<dyn Fn(String) + Send + Sync>;
+type DisconnectCb = Arc<dyn Fn() + Send + Sync>;
+
+struct Callbacks {
+    on_send: SendCb,
+    on_disconnect: DisconnectCb,
+}
+
+/// Per-session callbacks (None between sessions).
+static CALLBACKS: parking_lot::Mutex<Option<Callbacks>> = parking_lot::Mutex::new(None);
+/// End the active session regardless of which one — set by the hub; used by the tray.
+static GLOBAL_DISCONNECT: parking_lot::Mutex<Option<DisconnectCb>> = parking_lot::Mutex::new(None);
+static PROXY: OnceLock<parking_lot::Mutex<Option<Proxy>>> = OnceLock::new();
+
+struct Proxy(tao::event_loop::EventLoopProxy<AppEvent>);
+// SAFETY: EventLoopProxy is Send + Sync on the platforms we target; wrapper keeps it in a static.
+unsafe impl Send for Proxy {}
+unsafe impl Sync for Proxy {}
+
+fn set_proxy(p: tao::event_loop::EventLoopProxy<AppEvent>) {
+    *PROXY.get_or_init(|| parking_lot::Mutex::new(None)).lock() = Some(Proxy(p));
+}
+
+/// Post an event to the UI thread. No-op when the app loop is not running.
+pub fn post(ev: AppEvent) {
+    if let Some(cell) = PROXY.get() {
+        if let Some(p) = cell.lock().as_ref() {
+            let _ = p.0.send_event(ev);
+        }
+    }
+}
+
+/// Whether the app event loop is running (window/tray available).
+pub fn is_running() -> bool {
+    PROXY.get().map(|c| c.lock().is_some()).unwrap_or(false)
+}
+
+/// Set the process-wide "end the active session" action (used by the tray "End session").
+pub fn set_global_disconnect(cb: DisconnectCb) {
+    *GLOBAL_DISCONNECT.lock() = Some(cb);
+}
+
+/// Update the console connection status shown in the UI and tray tooltip.
+pub fn set_console_status(connected: bool) {
+    post(AppEvent::ConsoleStatus { connected });
+}
+
+/// Update the device name / id shown on the status screen.
+pub fn set_device_info(name: &str, id: &str) {
+    post(AppEvent::DeviceInfo {
+        name: name.to_string(),
+        id: id.to_string(),
+    });
+}
+
+fn current_callbacks() -> (Option<SendCb>, Option<DisconnectCb>) {
+    let g = CALLBACKS.lock();
+    match g.as_ref() {
+        Some(c) => (
+            Some(Arc::clone(&c.on_send)),
+            Some(Arc::clone(&c.on_disconnect)),
+        ),
+        None => (None, None),
+    }
+}
+
+fn dispatch_send(text: String) {
+    if let (Some(on_send), _) = current_callbacks() {
+        on_send(text);
+    }
+}
+
+fn dispatch_disconnect() {
+    let (_, on_disc) = current_callbacks();
+    if let Some(cb) = on_disc {
+        cb();
+    } else if let Some(cb) = GLOBAL_DISCONNECT.lock().as_ref() {
+        cb();
+    }
+}
+
+// ── ChatUi implementation ─────────────────────────────────────────────────────────────────
+
+/// [`ChatUi`] backed by the app window. Opening a session swaps in its callbacks and tells the
+/// window; dropping the handle detaches the session (the window stays, showing "Session ended").
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AppChatUi;
+
+impl ChatUi for AppChatUi {
+    fn open(
+        &self,
+        operator: &OperatorInfo,
+        on_send: SendCb,
+        on_disconnect: DisconnectCb,
+    ) -> Result<Box<dyn ChatHandle>> {
+        *CALLBACKS.lock() = Some(Callbacks {
+            on_send,
+            on_disconnect,
+        });
+        post(AppEvent::SessionStarted {
+            operator: operator.name.clone(),
+        });
+        Ok(Box::new(AppChatHandle {
+            unread: Arc::new(AtomicUsize::new(0)),
+        }))
+    }
+}
+
+struct AppChatHandle {
+    unread: Arc<AtomicUsize>,
+}
+
+impl ChatHandle for AppChatHandle {
+    fn push_line(&self, line: &ChatLine) {
+        if matches!(line.from, ChatParty::Operator) {
+            self.unread.fetch_add(1, Ordering::SeqCst);
+        }
+        post(AppEvent::Chat {
+            from: line.from,
+            text: line.text.clone(),
+            ts_ms: line.ts_ms,
+        });
+    }
+
+    fn set_visible(&self, visible: bool) {
+        if visible {
+            post(AppEvent::Show { chat: false });
+        }
+        // We never hide the window from under the local user mid-session.
+    }
+}
+
+impl Drop for AppChatHandle {
+    fn drop(&mut self) {
+        *CALLBACKS.lock() = None;
+        post(AppEvent::SessionEnded);
+    }
+}
+
+/// One or two initials for the branding logo fallback / operator avatar.
+fn key_fingerprint(pubkey_b64: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(pubkey_b64.as_bytes());
+    let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    hex.as_bytes()
+        .chunks(4)
+        .map(|c| std::str::from_utf8(c).unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Branding JSON handed to the page (`window.__app.setBranding`).
+fn branding_json() -> String {
+    let b = baked::get()
+        .map(|b| b.branding().clone())
+        .unwrap_or_default();
+    serde_json::json!({
+        "product_name": if b.product_name.is_empty() { "Remote Support" } else { &b.product_name },
+        "accent": if b.accent.is_empty() { "#3b82f6" } else { &b.accent },
+        "organization": b.organization,
+        "support_text": b.support_text,
+        "logo": b.logo_png_base64,
+    })
+    .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_fingerprint_is_grouped_hex() {
+        // 8 bytes → 16 hex chars grouped in 4s → 4 groups.
+        let fp = key_fingerprint("AAAA");
+        assert_eq!(fp.split(' ').count(), 4);
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit() || c == ' '));
+    }
+
+    #[test]
+    fn branding_json_has_defaults_without_trailer() {
+        let j: serde_json::Value = serde_json::from_str(&branding_json()).unwrap();
+        assert_eq!(j["product_name"], "Remote Support");
+        assert_eq!(j["accent"], "#3b82f6");
+    }
+}

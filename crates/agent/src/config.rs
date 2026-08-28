@@ -64,6 +64,10 @@ pub struct LocalConfig {
     pub device_secret: String,
     #[serde(default)]
     pub cached: Option<AgentConfig>,
+    /// ed25519 public key (base64) of the console this agent was enrolled with, from the bakery
+    /// trailer. Pinned so a later re-baked binary presenting a different key is refused.
+    #[serde(default)]
+    pub console_public_key: Option<String>,
 }
 
 impl LocalConfig {
@@ -185,6 +189,7 @@ mod tests {
             device_id: "dev".into(),
             device_secret: "sec".into(),
             cached: Some(AgentConfig::default()),
+            console_public_key: None,
         };
         cfg.save(&paths).unwrap();
         let back = LocalConfig::load(&paths).unwrap().unwrap();

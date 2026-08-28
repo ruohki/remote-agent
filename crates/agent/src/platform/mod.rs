@@ -24,26 +24,15 @@ pub mod windows;
 
 static MAIN_LOOP_RUNNING: AtomicBool = AtomicBool::new(false);
 
-/// Whether [`run_main_loop`] is pumping the platform event loop (macOS only).
+/// Whether the platform UI event loop (the [`crate::app`] tao loop) is pumping. When true the
+/// native helpers below (`run_on_main`, approval dialog, banner) can use the main thread.
 pub fn main_loop_running() -> bool {
     MAIN_LOOP_RUNNING.load(Ordering::Relaxed)
 }
 
-/// Run `work` (the agent) while the platform's UI loop is served on the calling thread.
-///
-/// Must be called from the process main thread. On macOS `work` runs on a worker thread and
-/// the process exits with its return code when it finishes; elsewhere `work` runs inline and
-/// its code is returned.
-pub fn run_main_loop(work: impl FnOnce() -> i32 + Send + 'static) -> i32 {
-    #[cfg(target_os = "macos")]
-    {
-        MAIN_LOOP_RUNNING.store(true, Ordering::Relaxed);
-        macos::run_app_loop(work)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        work()
-    }
+/// Marks the UI event loop as running. Called by [`crate::app::run`] once the loop is live.
+pub fn mark_main_loop_running() {
+    MAIN_LOOP_RUNNING.store(true, Ordering::Relaxed);
 }
 
 /// Run `f` on the main thread and wait for its result.

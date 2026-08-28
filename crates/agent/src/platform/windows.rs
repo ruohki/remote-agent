@@ -113,6 +113,19 @@ pub fn show_indicator(
     Ok(Box::new(NoBanner))
 }
 
+/// Exclude a window (e.g. the tao/wry app window) from every screen capture that honours it
+/// (DXGI desktop duplication on Windows 10 2004+). `hwnd` is tao's `WindowExtWindows::hwnd()`.
+pub fn exclude_hwnd_from_capture(hwnd: isize) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE,
+    };
+    if hwnd == 0 {
+        return;
+    }
+    // SAFETY: `hwnd` is a valid top-level window handle owned by this process.
+    let _ = unsafe { SetWindowDisplayAffinity(HWND(hwnd as *mut _), WDA_EXCLUDEFROMCAPTURE) };
+}
+
 /// Trigger the secure attention sequence (Ctrl+Alt+Del) via `SendSAS`.
 ///
 /// Requires the `SoftwareSASGeneration` policy to allow services, and that the agent runs as

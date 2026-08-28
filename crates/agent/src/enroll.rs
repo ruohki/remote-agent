@@ -18,6 +18,27 @@ struct ApiErrorBody {
     message: String,
 }
 
+/// Auto-enroll from the bakery trailer when the agent is not enrolled yet and a token is baked
+/// in. Returns `Ok(true)` when an enrollment happened. No-op (returns `Ok(false)`) for plain
+/// binaries or an already-enrolled agent.
+pub async fn auto_enroll_if_baked(paths: &Paths) -> Result<bool> {
+    let already = LocalConfig::load(paths)?
+        .map(|c| c.is_enrolled())
+        .unwrap_or(false);
+    if already {
+        return Ok(false);
+    }
+    let Some(baked) = crate::baked::get() else {
+        return Ok(false);
+    };
+    let Some(token) = baked.config.enroll_token.clone() else {
+        return Ok(false);
+    };
+    tracing::info!(server = %baked.config.server_url, "auto-enrolling from baked configuration");
+    enroll(paths, &baked.config.server_url, &token, None).await?;
+    Ok(true)
+}
+
 pub async fn enroll(paths: &Paths, server: &str, token: &str, name: Option<String>) -> Result<()> {
     let server = server.trim_end_matches('/');
     let url = format!("{server}/api/enroll");
@@ -76,6 +97,8 @@ pub async fn enroll(paths: &Paths, server: &str, token: &str, name: Option<Strin
         device_id: enrolled.device_id.clone(),
         device_secret: enrolled.device_secret,
         cached: Some(enrolled.config),
+        // Pin the console key from the bakery trailer (if this is a baked binary).
+        console_public_key: crate::baked::get().map(|b| b.public_key.clone()),
     };
     if let Some(name) = name {
         if let Some(c) = cfg.cached.as_mut() {

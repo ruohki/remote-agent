@@ -92,7 +92,10 @@ pub async fn run_agent(paths: Paths) -> Result<()> {
     } else {
         Arc::new(NoIndicator)
     };
-    let chat: Arc<dyn ChatUi> = if interactive {
+    let chat: Arc<dyn ChatUi> = if crate::app::is_running() {
+        // The branded application window hosts chat, status and controls.
+        Arc::new(crate::app::AppChatUi)
+    } else if interactive {
         Arc::new(NativeChatUi)
     } else {
         Arc::new(NoChatUi)
@@ -112,10 +115,20 @@ pub async fn run_agent(paths: Paths) -> Result<()> {
     };
     let sessions = SessionManager::new(deps);
 
-    // Menu-bar / tray item so the person at the device can always reach Open chat / Disconnect
-    // / Quit, and remote input can never operate our own windows. Only in an interactive loop.
+    // Remote input must never operate our own windows.
     if interactive {
         crate::platform::install_input_guard();
+    }
+    // Wire the app window / tray to this device: the "End session" action, plus device identity
+    // on the status screen. Console connection status is posted from `connect_once`.
+    if crate::app::is_running() {
+        let sessions_for_menu = Arc::clone(&sessions);
+        crate::app::set_global_disconnect(Arc::new(move || {
+            sessions_for_menu.end_all(EndReason::DeviceUserClosed)
+        }));
+        crate::app::set_device_info(&config.read().display_name, &local.device_id);
+    } else if interactive {
+        // Fallback menu-bar item when the app window is not available.
         let sessions_for_menu = Arc::clone(&sessions);
         let status = format!("Remote support — connected to {}", local.server_url);
         crate::platform::install_menu_bar(
@@ -142,6 +155,7 @@ pub async fn run_agent(paths: Paths) -> Result<()> {
         }
         // End any active session on disconnect (its ICE relay is gone).
         sessions.end_all(EndReason::AgentOffline);
+        crate::app::set_console_status(false);
         let jitter = Duration::from_millis(rand::random::<u64>() % 500);
         tokio::time::sleep(backoff + jitter).await;
         backoff = (backoff * 2).min(Duration::from_secs(60));
@@ -212,6 +226,7 @@ async fn connect_once(
             }
             apply_config(paths, local, state, config);
             tracing::info!("connected");
+            crate::app::set_console_status(true);
         }
         Some(ConsoleToAgent::Goodbye { reason }) => {
             return Err(anyhow!("console rejected connection: {reason}"));

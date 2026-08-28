@@ -618,6 +618,24 @@ async fn audio_track_negotiation() {
     h.end().await;
 }
 
+/// The default single-display session must push `Stats { display: 0 }` on the control channel
+/// (the browser overlay depends on it). Regression guard: stats used to be gated behind an
+/// unmet condition after the multi-display refactor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stats_arrive_for_each_active_display() {
+    let mut h = Harness::connect(Options::default()).await;
+    // Default: only display 0 streams; a Stats frame for it arrives within ~3 s.
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        next_control(&mut h.control_rx, |m| {
+            matches!(m, ControlMessage::Stats { display: 0, .. })
+        })
+        .await
+    })
+    .await
+    .expect("no Stats{display:0} within 3s");
+    h.end().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn file_upload_resumes_across_sessions() {
     let tmp = tempfile::tempdir().unwrap();
