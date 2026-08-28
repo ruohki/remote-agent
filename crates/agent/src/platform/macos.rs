@@ -390,7 +390,11 @@ define_class!(
                 Ok(IpcIn::Disconnect) => (self.ivars().on_disconnect)(),
                 Ok(IpcIn::Ready) => {
                     let iv = self.ivars();
-                    iv.shared.ready.store(true, Ordering::SeqCst);
+                    // The page reports ready twice (inline + load event); replay once.
+                    if iv.shared.ready.swap(true, Ordering::SeqCst) {
+                        return;
+                    }
+                    tracing::info!("chat window ready");
                     let wv = iv.webview_addr.load(Ordering::SeqCst);
                     if wv != 0 {
                         let mut js = String::from(
