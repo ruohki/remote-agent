@@ -725,10 +725,10 @@ fn apply_tray_icon(tray: &tray_icon::TrayIcon) {
 
 /// Dock icon (macOS) / window + taskbar icon (Windows) from the branding logo or the default mark.
 fn apply_app_icons(window: &tao::window::Window) {
-    let icon = branding::app_icon(256);
+    let icon = branding::dock_icon(256);
     #[cfg(target_os = "macos")]
     {
-        let png = branding::encode_png(&branding::app_icon(512));
+        let png = branding::encode_png(&branding::dock_icon(512));
         crate::platform::set_dock_icon(&png);
         let _ = (window, icon);
     }

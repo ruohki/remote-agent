@@ -529,6 +529,50 @@ pub fn app_icon(size: u32) -> Rgba {
     }
 }
 
+/// Dock / application icon in the macOS style: transparent margins around a rounded-rect
+/// tile (radius ≈ 22 % of the tile) — a full-bleed square renders with a hard dark seam.
+pub fn dock_icon(size: u32) -> Rgba {
+    let margin = (size as f32 * 0.09).round() as u32;
+    let tile = size.saturating_sub(margin * 2).max(1);
+    let content = app_icon(tile);
+    let radius = tile as f32 * 0.225;
+    let mut out = Rgba::new(size, size);
+    for y in 0..size {
+        for x in 0..size {
+            let (ix, iy) = (x as i64 - margin as i64, y as i64 - margin as i64);
+            if ix < 0 || iy < 0 || ix >= tile as i64 || iy >= tile as i64 {
+                continue;
+            }
+            // Coverage of the rounded-rect mask, anti-aliased with a 4×4 supersample.
+            let mut inside = 0u32;
+            for sy in 0..4 {
+                for sx in 0..4 {
+                    let px = ix as f32 + (sx as f32 + 0.5) / 4.0;
+                    let py = iy as f32 + (sy as f32 + 0.5) / 4.0;
+                    let dx = (px - radius)
+                        .min(0.0)
+                        .abs()
+                        .max((px - (tile as f32 - radius)).max(0.0));
+                    let dy = (py - radius)
+                        .min(0.0)
+                        .abs()
+                        .max((py - (tile as f32 - radius)).max(0.0));
+                    if dx * dx + dy * dy <= radius * radius {
+                        inside += 1;
+                    }
+                }
+            }
+            if inside == 0 {
+                continue;
+            }
+            let cov = inside as f32 / 16.0;
+            let p = content.px(ix as u32, iy as u32);
+            out.set(x, y, [p[0], p[1], p[2], (p[3] as f32 * cov).round() as u8]);
+        }
+    }
+    out
+}
+
 /// Monochrome "template" image (black glyph + alpha) for the macOS menu bar: the system tints it
 /// for light/dark appearance. Derived from the logo when there is one — its alpha channel when
 /// the logo has transparency, otherwise dark pixels count as ink — else the default mark.
@@ -574,6 +618,19 @@ pub fn tray_icon_colored(size: u32, dark_theme: bool) -> Rgba {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dock_icon_has_transparent_margins_and_rounded_corners() {
+        let icon = dock_icon(128);
+        assert_eq!(icon.px(0, 0)[3], 0, "corner must be transparent");
+        assert_eq!(icon.px(64, 5)[3], 0, "margin must be transparent");
+        assert_eq!(icon.px(13, 13)[3], 0, "tile corner is rounded");
+        assert!(icon.px(64, 64)[3] > 200, "centre is opaque");
+        assert!(
+            icon.px(64, 12)[3] > 200,
+            "tile edge inside the margin is opaque"
+        );
+    }
 
     /// The branding state is process-global; tests that touch it run one at a time.
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
