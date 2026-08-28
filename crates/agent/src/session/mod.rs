@@ -69,6 +69,8 @@ pub struct SessionDeps {
     pub clipboard: Arc<dyn ClipboardBackend>,
     pub hub: HubSink,
     pub config: Arc<RwLock<AgentConfig>>,
+    /// Where operator screen annotations are drawn (overlay windows in app mode).
+    pub annotations: crate::annotate::SharedSink,
 }
 
 /// Incoming `session_request`.
@@ -297,6 +299,10 @@ struct Session {
     input_allowed: Arc<AtomicBool>,
     /// Device user pressed "Pause control" on the session bar.
     control_paused: bool,
+    /// `AnnotationsDisabled` was already sent to this operator (once per session).
+    annotations_disabled_sent: bool,
+    /// An annotation was forwarded to the overlay (so teardown must remove overlays).
+    annotations_used: bool,
     control: Option<Arc<dyn DataChannel>>,
     media: Option<Media>,
     channel_tx: mpsc::UnboundedSender<ChannelEvent>,
@@ -446,6 +452,8 @@ async fn run_session(
         input: Arc::new(Mutex::new(None)),
         input_allowed: Arc::new(AtomicBool::new(cfg_allow_input)),
         control_paused: false,
+        annotations_disabled_sent: false,
+        annotations_used: false,
         control: None,
         media: None,
         channel_tx,
@@ -670,7 +678,40 @@ impl Session {
             }
             self.pending_clipboard = None;
         }
+        if old.allow_annotations && !new.allow_annotations {
+            tracing::info!(session = %self.id, "annotations disabled by the device user");
+            self.deps.annotations.session_ended();
+            self.annotations_used = false;
+            self.annotations_disabled_sent = false;
+            self.reject_annotation().await;
+        }
         self.send_display_info().await;
+    }
+
+    /// Screen annotations are independent of the input permission and of the pause switch:
+    /// they only need `allow_annotations` and a UI able to draw.
+    async fn on_annotation(&mut self, ev: crate::annotate::AnnotateEvent) {
+        if !self.cfg.allow_annotations || !self.deps.annotations.available() {
+            self.reject_annotation().await;
+            return;
+        }
+        self.annotations_used = true;
+        self.deps.annotations.apply(ev);
+    }
+
+    /// Tell the operator once that annotations cannot be shown here.
+    async fn reject_annotation(&mut self) {
+        if self.annotations_disabled_sent {
+            return;
+        }
+        self.annotations_disabled_sent = true;
+        tracing::info!(
+            session = %self.id,
+            allowed = self.cfg.allow_annotations,
+            ui = self.deps.annotations.available(),
+            "annotations not available; telling the operator"
+        );
+        self.send_control(ControlMessage::AnnotationsDisabled).await;
     }
 
     /// Device-side emergency switch: pause / resume remote keyboard & mouse control. Screen
@@ -1521,6 +1562,42 @@ impl Session {
                     Err(e) => tracing::warn!("clipboard task: {e}"),
                 }
             }
+            ControlMessage::AnnotateStroke {
+                id,
+                display,
+                color,
+                width,
+                points,
+            } => {
+                self.on_annotation(crate::annotate::AnnotateEvent::Stroke {
+                    id,
+                    display,
+                    color,
+                    width,
+                    points,
+                })
+                .await
+            }
+            ControlMessage::AnnotateEnd { id } => {
+                self.on_annotation(crate::annotate::AnnotateEvent::End { id })
+                    .await
+            }
+            ControlMessage::AnnotatePointer {
+                display,
+                point,
+                color,
+            } => {
+                self.on_annotation(crate::annotate::AnnotateEvent::Pointer {
+                    display,
+                    point,
+                    color,
+                })
+                .await
+            }
+            ControlMessage::AnnotateClear => {
+                self.on_annotation(crate::annotate::AnnotateEvent::Clear)
+                    .await
+            }
             // agent → browser messages are never expected inbound
             ControlMessage::DisplayInfo { .. }
             | ControlMessage::ClipboardChanged { .. }
@@ -1646,6 +1723,9 @@ impl Session {
     async fn teardown(&mut self) {
         if let Some(h) = self.input.lock().as_mut() {
             h.release_all();
+        }
+        if self.annotations_used {
+            self.deps.annotations.session_ended();
         }
         self.indicator = None;
         self.chat_ui = None;

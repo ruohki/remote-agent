@@ -29,6 +29,7 @@
 }
 * { box-sizing: border-box; }
 .paused-note { margin-top: 6px; color: #b45309; font-weight: 600; }
+.annot-note { margin-top: 6px; font-size: 12px; }
 @media (prefers-color-scheme: dark) { .paused-note { color: #fbbf24; } }
 .btn.warn { border-color: #f59e0b; color: #b45309; }
 .btn.warn.solid { background: #f59e0b; border-color: #f59e0b; color: #1a1200; }

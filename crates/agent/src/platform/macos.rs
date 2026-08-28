@@ -36,6 +36,30 @@ pub fn exclude_ns_window_from_capture(ns_window: *mut c_void) {
     });
 }
 
+/// Make an overlay `NSWindow` (tao/wry) float above everything on every Space, including over
+/// full-screen apps, and ignore mouse events (click-through).
+pub fn configure_overlay_ns_window(ns_window: *mut c_void) {
+    use objc2_app_kit::NSWindowCollectionBehavior;
+    if ns_window.is_null() {
+        return;
+    }
+    let addr = ns_window as usize;
+    let _ = run_on_main(move || {
+        // SAFETY: `addr` is a live `NSWindow` created by tao for the process lifetime; main thread.
+        let window: &NSWindow = unsafe { &*(addr as *const NSWindow) };
+        window.setCollectionBehavior(
+            NSWindowCollectionBehavior::CanJoinAllSpaces
+                | NSWindowCollectionBehavior::FullScreenAuxiliary
+                | NSWindowCollectionBehavior::Stationary
+                | NSWindowCollectionBehavior::IgnoresCycle,
+        );
+        // Above floating panels and the session bar, below the screen saver.
+        window.setLevel(objc2_app_kit::NSScreenSaverWindowLevel - 1);
+        window.setIgnoresMouseEvents(true);
+        window.setHasShadow(false);
+    });
+}
+
 /// Run `f` on the main thread. Runs inline when already there; otherwise dispatches to the
 /// main queue, which requires [`run_app_loop`] to be pumping events.
 pub fn run_on_main<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T> {

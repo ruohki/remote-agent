@@ -87,6 +87,7 @@ impl AgentState {
                 "allow_audio": console.allow_audio,
                 "allow_clipboard": console.allow_clipboard,
                 "allow_file_transfer": console.allow_file_transfer,
+                "allow_annotations": console.allow_annotations,
             },
             "overrides": overrides,
             "effective": {
@@ -95,6 +96,7 @@ impl AgentState {
                 "allow_audio": effective.allow_audio,
                 "allow_clipboard": effective.allow_clipboard,
                 "allow_file_transfer": effective.allow_file_transfer,
+                "allow_annotations": effective.allow_annotations,
             },
         })
         .to_string()
@@ -166,6 +168,11 @@ pub async fn run_agent(paths: Paths) -> Result<()> {
         clipboard: Arc::new(crate::clipboard::SystemClipboard),
         hub: hub_sink.clone(),
         config: Arc::clone(&config),
+        annotations: if crate::app::is_running() {
+            Arc::new(crate::app::AppAnnotations)
+        } else {
+            Arc::new(crate::annotate::NoAnnotations)
+        },
     };
     let sessions = SessionManager::new(deps);
 

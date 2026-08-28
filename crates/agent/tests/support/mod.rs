@@ -263,6 +263,39 @@ impl Approver for RecordingApprover {
     }
 }
 
+/// Records every annotation instruction the session forwards; `available` mirrors whether a
+/// UI could draw them (false = headless service mode).
+#[derive(Clone)]
+pub struct RecordingAnnotations {
+    pub available: bool,
+    pub events: Arc<Mutex<Vec<remote_agent::annotate::AnnotateEvent>>>,
+    pub ended: Arc<AtomicU64>,
+}
+
+impl Default for RecordingAnnotations {
+    fn default() -> Self {
+        Self {
+            available: true,
+            events: Arc::new(Mutex::new(Vec::new())),
+            ended: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+impl remote_agent::annotate::AnnotationSink for RecordingAnnotations {
+    fn available(&self) -> bool {
+        self.available
+    }
+
+    fn apply(&self, event: remote_agent::annotate::AnnotateEvent) {
+        self.events.lock().unwrap().push(event);
+    }
+
+    fn session_ended(&self) {
+        self.ended.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 pub struct NoopIndicator;
 struct NoopHandle;
 impl IndicatorHandle for NoopHandle {}

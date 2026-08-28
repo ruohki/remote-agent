@@ -1,5 +1,6 @@
 //! The main-thread event loop that owns the tao window, the wry webview and the tray icon.
 
+use super::annotate::OverlayManager;
 use super::bar::{BarIpc, SessionBar};
 use super::{
     branding_json, dispatch_disconnect, dispatch_send, key_fingerprint, set_proxy, AppEvent,
@@ -68,6 +69,8 @@ struct Controller {
     permissions: Option<(bool, bool)>,
     /// Branded session bar (created on the first session).
     bar: Option<SessionBar>,
+    /// Operator annotation overlays (one per display, lazily created).
+    overlays: OverlayManager,
     location: crate::platform::ExeLocation,
     end_item: MenuItem,
     chat_item: MenuItem,
@@ -177,6 +180,9 @@ impl Controller {
             AppEvent::SessionEnded => {
                 self.session_active = false;
                 self.control_paused = false;
+                if self.overlays.clear_all() {
+                    self.eval("window.__app.setAnnotations(false);".into());
+                }
                 self.end_item.set_enabled(false);
                 self.chat_item.set_enabled(false);
                 self.refresh_tooltip();
@@ -249,6 +255,20 @@ impl Controller {
                     super::dispatch_pause(!self.control_paused);
                 }
             }
+            AppEvent::Annotate(ev) => {
+                if self.overlays.apply(target, ev) {
+                    self.eval(format!(
+                        "window.__app.setAnnotations({});",
+                        self.overlays.is_active()
+                    ));
+                }
+            }
+            AppEvent::AnnotationsEnded => {
+                if self.overlays.clear_all() {
+                    self.eval("window.__app.setAnnotations(false);".into());
+                }
+            }
+            AppEvent::OverlayReady => { /* routed per window below */ }
             AppEvent::MoveResult { ok, message } => {
                 self.eval(format!(
                     "window.__app.moveResult({},{});",
@@ -571,6 +591,7 @@ fn build_and_run(work: impl FnOnce() -> i32 + Send + 'static, opts: AppOptions) 
             .unwrap_or_default(),
         permissions: None,
         bar: None,
+        overlays: OverlayManager::default(),
         location: crate::platform::exe_location(),
         end_item,
         chat_item,
@@ -618,6 +639,7 @@ fn build_and_run(work: impl FnOnce() -> i32 + Send + 'static, opts: AppOptions) 
 
         match event {
             Event::UserEvent(AppEvent::__Ready) => controller.on_ready(),
+            Event::UserEvent(AppEvent::OverlayReady) => controller.overlays.mark_ready(),
             Event::UserEvent(AppEvent::Quit) => *control_flow = ControlFlow::Exit,
             Event::UserEvent(ev) => controller.handle(ev, target),
             Event::WindowEvent {
@@ -626,8 +648,8 @@ fn build_and_run(work: impl FnOnce() -> i32 + Send + 'static, opts: AppOptions) 
                 ..
             } => {
                 let is_bar = controller.bar.as_ref().map(|b| b.window_id()) == Some(window_id);
-                if is_bar {
-                    // The bar has no close control; ignore.
+                if is_bar || controller.overlays.owns(window_id) {
+                    // The bar and the overlays have no close control; ignore.
                 } else {
                     // Close hides the window; the session keeps running.
                     controller.hide(target);
@@ -690,6 +712,12 @@ struct UiOverrides {
     allow_audio: bool,
     allow_clipboard: bool,
     allow_file_transfer: bool,
+    #[serde(default = "default_true")]
+    allow_annotations: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl UiOverrides {
@@ -705,6 +733,7 @@ impl UiOverrides {
             allow_audio: restrict(self.allow_audio),
             allow_clipboard: restrict(self.allow_clipboard),
             allow_file_transfer: restrict(self.allow_file_transfer),
+            allow_annotations: restrict(self.allow_annotations),
         }
     }
 }

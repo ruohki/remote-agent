@@ -134,6 +134,8 @@ struct Options {
     audio: bool,
     config: AgentConfig,
     media: FakeMedia,
+    /// Whether a UI exists that can draw annotations (false = headless service mode).
+    annotations_available: bool,
 }
 
 impl Default for Options {
@@ -146,6 +148,7 @@ impl Default for Options {
                 ..AgentConfig::default()
             },
             media: FakeMedia::default(),
+            annotations_available: true,
         }
     }
 }
@@ -166,6 +169,7 @@ struct Harness {
     releases: Arc<AtomicU64>,
     chat: RecordingChat,
     clipboard: FakeClipboard,
+    annotations: RecordingAnnotations,
 }
 
 impl Harness {
@@ -184,6 +188,10 @@ impl Harness {
         let (hub, mut hub_rx) = HubSink::channel();
         let chat = RecordingChat::default();
         let clipboard = FakeClipboard::default();
+        let annotations = RecordingAnnotations {
+            available: opts.annotations_available,
+            ..Default::default()
+        };
         let deps = SessionDeps {
             media: Arc::new(opts.media),
             input: input_factory,
@@ -195,6 +203,7 @@ impl Harness {
             clipboard: Arc::new(clipboard.clone()),
             hub,
             config: Arc::new(RwLock::new(opts.config)),
+            annotations: Arc::new(annotations.clone()),
         };
         let sessions = SessionManager::new(deps);
 
@@ -367,6 +376,7 @@ impl Harness {
             releases,
             chat,
             clipboard,
+            annotations,
         }
     }
 
@@ -1172,6 +1182,7 @@ async fn help_me_denial_ends_session() {
         chat: Arc::new(RecordingChat::default()),
         clipboard: Arc::new(FakeClipboard::default()),
         hub,
+        annotations: Arc::new(remote_agent::annotate::NoAnnotations),
         config: Arc::new(RwLock::new(AgentConfig {
             mode: DeviceMode::HelpMe,
             ..AgentConfig::default()
@@ -1483,4 +1494,192 @@ async fn device_end_button_ends_session() {
         started.elapsed() < Duration::from_secs(10),
         "session task must finish promptly after the device user ended it"
     );
+}
+
+/// Annotations flow to the overlay sink independently of the input permission and of the
+/// device-side pause; the session removes overlays when it ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn annotations_reach_the_overlay_even_while_control_is_paused() {
+    use remote_agent::annotate::AnnotateEvent;
+
+    let mut h = Harness::connect(Options {
+        config: AgentConfig {
+            max_fps: 30,
+            allow_input: false, // guidance must work without input permission
+            ..AgentConfig::default()
+        },
+        ..Default::default()
+    })
+    .await;
+    next_control(&mut h.control_rx, |m| {
+        matches!(m, ControlMessage::DisplayInfo { .. })
+    })
+    .await;
+    // …and while the device user paused control.
+    h.sessions.set_control_paused(true);
+    next_control(&mut h.control_rx, |m| {
+        matches!(m, ControlMessage::ControlPaused { paused: true })
+    })
+    .await;
+
+    send_json(
+        &h.control_dc,
+        &ControlMessage::AnnotateStroke {
+            id: 7,
+            display: 0,
+            color: "#ff0000".into(),
+            width: 6.0,
+            points: vec![(10.0, 10.0), (20.0, 25.0)],
+        },
+    )
+    .await;
+    send_json(
+        &h.control_dc,
+        &ControlMessage::AnnotateStroke {
+            id: 7,
+            display: 0,
+            color: "#ff0000".into(),
+            width: 6.0,
+            points: vec![(30.0, 40.0)],
+        },
+    )
+    .await;
+    send_json(&h.control_dc, &ControlMessage::AnnotateEnd { id: 7 }).await;
+    send_json(
+        &h.control_dc,
+        &ControlMessage::AnnotatePointer {
+            display: 0,
+            point: Some((100.0, 120.0)),
+            color: "#00ff00".into(),
+        },
+    )
+    .await;
+    send_json(&h.control_dc, &ControlMessage::AnnotateClear).await;
+
+    let got = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if h.annotations.events.lock().unwrap().len() >= 5 {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(got, "all five annotation messages must reach the sink");
+    let events = h.annotations.events.lock().unwrap().clone();
+    assert_eq!(
+        events[0],
+        AnnotateEvent::Stroke {
+            id: 7,
+            display: 0,
+            color: "#ff0000".into(),
+            width: 6.0,
+            points: vec![(10.0, 10.0), (20.0, 25.0)],
+        }
+    );
+    assert!(
+        matches!(&events[1], AnnotateEvent::Stroke { id: 7, points, .. } if points == &vec![(30.0, 40.0)])
+    );
+    assert_eq!(events[2], AnnotateEvent::End { id: 7 });
+    assert!(matches!(
+        &events[3],
+        AnnotateEvent::Pointer { display: 0, point: Some((x, y)), .. } if *x == 100.0 && *y == 120.0
+    ));
+    assert_eq!(events[4], AnnotateEvent::Clear);
+
+    // The session ends → overlays are removed.
+    h.sessions
+        .end_all(protocol::common::EndReason::OperatorClosed);
+    let ended = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if h.annotations.ended.load(Ordering::SeqCst) > 0 {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(ended, "session teardown must remove the overlays");
+}
+
+/// Locally disabled (or no UI): the operator is told once, nothing reaches the sink.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn annotations_disabled_locally_reply_once() {
+    let mut h = Harness::connect(Options::default()).await;
+    next_control(&mut h.control_rx, |m| {
+        matches!(m, ControlMessage::DisplayInfo { .. })
+    })
+    .await;
+    // Device user blocks annotations (restrict-only override applied live).
+    h.sessions.apply_overrides(AgentConfig {
+        max_fps: 30,
+        allow_annotations: false,
+        ..AgentConfig::default()
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    for i in 0..3u32 {
+        send_json(
+            &h.control_dc,
+            &ControlMessage::AnnotateStroke {
+                id: i,
+                display: 0,
+                color: "#ff0000".into(),
+                width: 4.0,
+                points: vec![(1.0, 1.0)],
+            },
+        )
+        .await;
+    }
+    next_control(&mut h.control_rx, |m| {
+        matches!(m, ControlMessage::AnnotationsDisabled)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        h.annotations.events.lock().unwrap().is_empty(),
+        "nothing may reach the overlay while annotations are disabled"
+    );
+    // Only one AnnotationsDisabled per session even for repeated attempts.
+    let extra = tokio::time::timeout(Duration::from_millis(500), async {
+        next_control(&mut h.control_rx, |m| {
+            matches!(m, ControlMessage::AnnotationsDisabled)
+        })
+        .await
+    })
+    .await;
+    assert!(
+        extra.is_err(),
+        "AnnotationsDisabled must be sent once per session"
+    );
+}
+
+/// Headless service mode has no overlay: the operator is told.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn annotations_without_ui_reply_disabled() {
+    let mut h = Harness::connect(Options {
+        annotations_available: false,
+        ..Default::default()
+    })
+    .await;
+    next_control(&mut h.control_rx, |m| {
+        matches!(m, ControlMessage::DisplayInfo { .. })
+    })
+    .await;
+    send_json(
+        &h.control_dc,
+        &ControlMessage::AnnotatePointer {
+            display: 0,
+            point: Some((5.0, 5.0)),
+            color: "#ff0000".into(),
+        },
+    )
+    .await;
+    next_control(&mut h.control_rx, |m| {
+        matches!(m, ControlMessage::AnnotationsDisabled)
+    })
+    .await;
+    assert!(h.annotations.events.lock().unwrap().is_empty());
 }

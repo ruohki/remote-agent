@@ -5,6 +5,10 @@
 (function () {
   var OPERATOR = 'Support technician';
   var controlPaused = false;
+  var annotationsActive = false;
+  function renderAnnotations() {
+    var n = $('annotNote'); if (n) n.hidden = !annotationsActive;
+  }
   function renderPaused() {
     var note = $('pausedNote'); if (note) note.hidden = !controlPaused;
     var meta = $('sessionMeta'); if (meta) meta.textContent = controlPaused ? 'Screen sharing in progress — remote control paused' : 'Screen sharing and remote control in progress';
@@ -169,7 +173,7 @@
   // ---- settings (privacy & control) ----
   // policy: { console:{mode,allow_input,...}, overrides:{...}, effective:{...} }
   var policy = null;
-  var SWITCH_KEYS = ['require_approval', 'allow_input', 'allow_audio', 'allow_clipboard', 'allow_file_transfer'];
+  var SWITCH_KEYS = ['require_approval', 'allow_input', 'allow_audio', 'allow_clipboard', 'allow_file_transfer', 'allow_annotations'];
 
   function consoleAllows(key) {
     if (!policy) return true;
@@ -219,7 +223,8 @@
         allow_input: switchState('allow_input'),
         allow_audio: switchState('allow_audio'),
         allow_clipboard: switchState('allow_clipboard'),
-        allow_file_transfer: switchState('allow_file_transfer')
+        allow_file_transfer: switchState('allow_file_transfer'),
+        allow_annotations: switchState('allow_annotations')
       }
     });
   }
@@ -250,6 +255,7 @@
     },
     endSession: function () { controlPaused = false; renderPaused(); setConnected(false); },
     setControlPaused: function (on) { controlPaused = !!on; renderPaused(); },
+    setAnnotations: function (on) { annotationsActive = !!on; renderAnnotations(); },
     push: push,
     // Console / device status
     setConsole: function (url, connectedToConsole) {

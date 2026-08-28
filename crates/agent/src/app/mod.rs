@@ -13,6 +13,7 @@
 //! it is reopened from the tray. Every window we create is excluded from the screen capture
 //! and ignores remote-injected input.
 
+mod annotate;
 mod bar;
 mod controller;
 
@@ -93,6 +94,13 @@ pub enum AppEvent {
     },
     /// Global shortcut (⌥⌘P): toggle the pause while a session is active.
     TogglePause,
+    /// Operator screen annotation (drawn on the transparent overlay of a display).
+    Annotate(crate::annotate::AnnotateEvent),
+    /// Remove every annotation overlay (session ended / annotations disabled).
+    AnnotationsEnded,
+    /// Internal: an overlay page finished loading.
+    #[doc(hidden)]
+    OverlayReady,
     Quit,
     /// Internal: the page finished loading and is ready to receive JS.
     #[doc(hidden)]
@@ -247,6 +255,26 @@ fn dispatch_disconnect() {
         cb();
     } else if let Some(cb) = GLOBAL_DISCONNECT.lock().as_ref() {
         cb();
+    }
+}
+
+// ── AnnotationSink implementation ─────────────────────────────────────────────────────────
+
+/// [`crate::annotate::AnnotationSink`] backed by the overlay windows of the app loop.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AppAnnotations;
+
+impl crate::annotate::AnnotationSink for AppAnnotations {
+    fn available(&self) -> bool {
+        is_running()
+    }
+
+    fn apply(&self, event: crate::annotate::AnnotateEvent) {
+        post(AppEvent::Annotate(event));
+    }
+
+    fn session_ended(&self) {
+        post(AppEvent::AnnotationsEnded);
     }
 }
 

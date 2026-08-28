@@ -1,0 +1,200 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: transparent; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  // Coordinates arrive in *physical* pixels of this display; the canvas backing store is sized
+  // to physical pixels so points map 1:1 without any scaling.
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var strokes = {};     // id -> { color, width, pts:[[x,y]...], group }
+  var order = [];       // stroke ids in draw order
+  var groups = {};      // group id -> { fadeAt: ms|null, members: n }
+  var groupSeq = 0;
+  var currentGroup = null;
+  var lastEndAt = 0;
+  var pointer = null;   // { x, y, color, at, trail:[{x,y,at}] }
+  var raf = null;
+
+  var FADE_AFTER_MS = 4000;   // stroke stays fully visible this long after its end
+  var FADE_MS = 900;          // then fades out over this long
+  var LINK_MS = 1500;         // a stroke starting within this after an end joins the group
+  var POINTER_HIDE_MS = 1000;
+  var POINTER_TRAIL_MS = 350;
+
+  function resize() {
+    var dpr = window.devicePixelRatio || 1;
+    var w = Math.round(window.innerWidth * dpr), h = Math.round(window.innerHeight * dpr);
+    if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+  }
+  window.addEventListener('resize', function () { resize(); schedule(); });
+  resize();
+
+  function schedule() { if (raf === null) raf = requestAnimationFrame(frame); }
+
+  function groupFor(now) {
+    if (currentGroup !== null && groups[currentGroup] && groups[currentGroup].fadeAt === null) return currentGroup;
+    if (currentGroup !== null && groups[currentGroup] && now - lastEndAt <= LINK_MS) {
+      groups[currentGroup].fadeAt = null; // re-open the group: they fade together later
+      return currentGroup;
+    }
+    currentGroup = 'g' + (++groupSeq);
+    groups[currentGroup] = { fadeAt: null };
+    return currentGroup;
+  }
+
+  function stroke(msg) {
+    var now = performance.now();
+    var s = strokes[msg.id];
+    if (!s) {
+      s = strokes[msg.id] = { color: msg.color || '#ff3b30', width: Math.max(1, msg.width || 4), pts: [], group: groupFor(now), ended: false };
+      order.push(msg.id);
+    }
+    var pts = msg.points || [];
+    for (var i = 0; i < pts.length; i++) s.pts.push([pts[i][0], pts[i][1]]);
+    schedule();
+  }
+
+  function end(id) {
+    var s = strokes[id];
+    if (!s || s.ended) return;
+    s.ended = true;
+    lastEndAt = performance.now();
+    var g = groups[s.group];
+    if (g) g.fadeAt = lastEndAt + FADE_AFTER_MS;
+    schedule();
+  }
+
+  function setPointer(msg) {
+    var now = performance.now();
+    if (!msg.point) { pointer = null; schedule(); return; }
+    if (!pointer) pointer = { trail: [] };
+    pointer.x = msg.point[0]; pointer.y = msg.point[1]; pointer.color = msg.color || '#ff3b30'; pointer.at = now;
+    pointer.trail.push({ x: pointer.x, y: pointer.y, at: now });
+    if (pointer.trail.length > 24) pointer.trail.shift();
+    schedule();
+  }
+
+  function clear() { strokes = {}; order = []; groups = {}; currentGroup = null; pointer = null; schedule(); }
+
+  function alphaFor(s, now) {
+    var g = groups[s.group];
+    if (!g || g.fadeAt === null) return 1;
+    if (now < g.fadeAt) return 1;
+    var t = (now - g.fadeAt) / FADE_MS;
+    return t >= 1 ? 0 : 1 - t;
+  }
+
+  function drawStroke(s, alpha) {
+    var pts = s.pts;
+    if (!pts.length) return;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.strokeStyle = s.color;
+    ctx.lineWidth = s.width;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.shadowColor = 'rgba(0,0,0,0.35)';
+    ctx.shadowBlur = Math.max(2, s.width * 0.6);
+    ctx.beginPath();
+    if (pts.length === 1) {
+      ctx.arc(pts[0][0], pts[0][1], s.width / 2, 0, Math.PI * 2);
+      ctx.fillStyle = s.color;
+      ctx.fill();
+      ctx.restore();
+      return;
+    }
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (var i = 1; i < pts.length - 1; i++) {
+      var mx = (pts[i][0] + pts[i + 1][0]) / 2, my = (pts[i][1] + pts[i + 1][1]) / 2;
+      ctx.quadraticCurveTo(pts[i][0], pts[i][1], mx, my);
+    }
+    var last = pts[pts.length - 1];
+    ctx.lineTo(last[0], last[1]);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawPointer(now) {
+    if (!pointer) return false;
+    if (now - pointer.at > POINTER_HIDE_MS) { pointer = null; return false; }
+    var dpr = window.devicePixelRatio || 1;
+    var r = 7 * dpr;
+    // trail
+    for (var i = 0; i < pointer.trail.length; i++) {
+      var t = pointer.trail[i];
+      var age = now - t.at;
+      if (age > POINTER_TRAIL_MS) continue;
+      var a = 0.45 * (1 - age / POINTER_TRAIL_MS);
+      ctx.save();
+      ctx.globalAlpha = a;
+      ctx.fillStyle = pointer.color;
+      ctx.beginPath();
+      ctx.arc(t.x, t.y, r * (0.5 + 0.5 * (1 - age / POINTER_TRAIL_MS)), 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+    // glow + dot
+    ctx.save();
+    var g = ctx.createRadialGradient(pointer.x, pointer.y, r * 0.4, pointer.x, pointer.y, r * 3);
+    g.addColorStop(0, pointer.color);
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.globalAlpha = 0.35;
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(pointer.x, pointer.y, r * 3, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = pointer.color;
+    ctx.beginPath();
+    ctx.arc(pointer.x, pointer.y, r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.lineWidth = 1.5 * dpr;
+    ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+    ctx.stroke();
+    ctx.restore();
+    return true;
+  }
+
+  function frame() {
+    raf = null;
+    var now = performance.now();
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    var live = false;
+    var keep = [];
+    for (var i = 0; i < order.length; i++) {
+      var id = order[i], s = strokes[id];
+      if (!s) continue;
+      var a = alphaFor(s, now);
+      if (a <= 0) { delete strokes[id]; continue; }
+      keep.push(id);
+      drawStroke(s, a);
+      var g = groups[s.group];
+      if (!s.ended || (g && g.fadeAt !== null)) live = true; // still animating or waiting to fade
+    }
+    order = keep;
+    if (drawPointer(now)) live = true;
+    if (live) schedule();
+  }
+
+  window.__ann = {
+    stroke: stroke,
+    end: end,
+    pointer: setPointer,
+    clear: clear,
+    // test hook: number of visible strokes
+    count: function () { return order.length; }
+  };
+  try { window.ipc && window.ipc.postMessage(JSON.stringify({ type: 'ready' })); } catch (e) {}
+})();
+</script>
+</body>
+</html>

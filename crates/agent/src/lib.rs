@@ -21,6 +21,7 @@
 //! * [`service`]  — launchd / Windows service integration
 //! * [`platform`] — misc OS helpers (logged-in user, permissions, main-thread dispatch)
 
+pub mod annotate;
 pub mod app;
 pub mod approval;
 pub mod audio;

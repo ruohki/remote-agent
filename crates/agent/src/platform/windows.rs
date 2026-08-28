@@ -137,6 +137,29 @@ pub fn show_indicator(
 
 /// Exclude a window (e.g. the tao/wry app window) from every screen capture that honours it
 /// (DXGI desktop duplication on Windows 10 2004+). `hwnd` is tao's `WindowExtWindows::hwnd()`.
+/// Make an overlay window transparent to input, topmost, and absent from the taskbar / Alt-Tab.
+pub fn configure_overlay_hwnd(hwnd: isize) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+    };
+    if hwnd == 0 {
+        return;
+    }
+    // SAFETY: plain style bit twiddling on a window we own.
+    unsafe {
+        let h = HWND(hwnd as *mut core::ffi::c_void);
+        let ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+        let add = (WS_EX_TRANSPARENT.0
+            | WS_EX_LAYERED.0
+            | WS_EX_TOPMOST.0
+            | WS_EX_TOOLWINDOW.0
+            | WS_EX_NOACTIVATE.0) as isize;
+        SetWindowLongPtrW(h, GWL_EXSTYLE, ex | add);
+    }
+}
+
 pub fn exclude_hwnd_from_capture(hwnd: isize) {
     use windows::Win32::UI::WindowsAndMessaging::{
         SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE,
