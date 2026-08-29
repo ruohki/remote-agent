@@ -188,6 +188,8 @@ impl Pacer {
 #[cfg(target_os = "macos")]
 mod macos {
     use super::*;
+    use objc2::rc::Retained;
+    use objc2::Message;
     use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSCursor};
     use objc2_core_graphics::CGEvent;
     use objc2_foundation::NSDictionary;
@@ -223,8 +225,12 @@ mod macos {
     }
 
     /// Current system cursor as PNG plus its hotspot and size in points (main thread).
-    fn current_shape() -> Option<ShapeSample> {
-        crate::platform::run_on_main(|| {
+    ///
+    /// The cursor image carries several representations (1×, 2×, 5× and 10× on current
+    /// macOS, and the TIFF's first bitmap is the 10× one), so the representation matching
+    /// `scale` is encoded: the browser gets a small PNG at the display's pixel density.
+    fn current_shape(scale: f64) -> Option<ShapeSample> {
+        crate::platform::run_on_main(move || {
             // Deprecated by Apple but still the only public way to read the *system*
             // cursor (`currentCursor` only knows this app's own cursor).
             #[allow(deprecated)]
@@ -232,8 +238,30 @@ mod macos {
             let image = cursor.image();
             let hot = cursor.hotSpot();
             let size = image.size();
-            let tiff = image.TIFFRepresentation()?;
-            let rep = NSBitmapImageRep::imageRepWithData(&tiff)?;
+            let target = (size.width * scale).round().max(1.0) as isize;
+            // Smallest representation at least as wide as the target (largest otherwise).
+            let mut best: Option<Retained<NSBitmapImageRep>> = None;
+            for rep in image.representations().iter() {
+                let Some(bmp) = rep.downcast_ref::<NSBitmapImageRep>() else {
+                    continue;
+                };
+                let w = bmp.pixelsWide();
+                let better = match best.as_ref().map(|b| b.pixelsWide()) {
+                    None => true,
+                    Some(bw) if bw >= target => w >= target && w < bw,
+                    Some(bw) => w > bw,
+                };
+                if better {
+                    best = Some(bmp.retain());
+                }
+            }
+            let rep = match best {
+                Some(rep) => rep,
+                None => {
+                    let tiff = image.TIFFRepresentation()?;
+                    NSBitmapImageRep::imageRepWithData(&tiff)?
+                }
+            };
             let props = NSDictionary::new();
             // SAFETY: valid rep and (empty) properties dictionary.
             let png = unsafe {
@@ -260,8 +288,8 @@ mod macos {
             }
             self.next_tick = Instant::now() + Duration::from_secs_f64(1.0 / POSITION_HZ as f64);
             if self.shapes && self.pacer.shape_due() {
-                if let Some((png, hot, size)) = current_shape() {
-                    let scale = self.pacer.current_scale();
+                let scale = self.pacer.current_scale();
+                if let Some((png, hot, size)) = current_shape(scale) {
                     if let Some(u) = self.pacer.shape_update(png, hot, size, scale) {
                         self.queue.push_back(u);
                     }
