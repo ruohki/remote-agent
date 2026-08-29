@@ -63,7 +63,7 @@ impl Capturer for FakeCapturer {
         self.tick = self.tick.wrapping_add(1);
         std::thread::sleep(Duration::from_millis(10));
         let mut data = vec![0u8; (self.width * self.height * 4) as usize];
-        for px in data.chunks_exact_mut(4) {
+        for px in data.as_chunks_mut::<4>().0 {
             px[0] = self.tick;
             px[1] = 0x40;
             px[2] = 0x80;
