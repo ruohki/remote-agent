@@ -3,4 +3,4 @@
 /**
  * Who or what changed the privacy screen, or why a request was refused.
  */
-export type PrivacyScreenReason = "operator" | "device_user" | "policy" | "permission" | "unsupported" | "locked" | "timeout" | "watchdog" | "displays_changed" | "control_paused" | "session_ended" | "failed";
+export type PrivacyScreenReason = "operator" | "device_user" | "policy" | "permission" | "unsupported" | "timeout" | "watchdog" | "displays_changed" | "control_paused" | "session_ended" | "failed";

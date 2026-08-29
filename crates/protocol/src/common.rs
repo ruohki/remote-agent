@@ -137,7 +137,7 @@ pub enum PrivacyScreenSupport {
 pub enum PrivacyScreenReason {
     /// The operator engaged or released it.
     Operator,
-    /// The person at the device lifted it (it stays off for the rest of the session).
+    /// The person at the device lifted it (the operator may engage it again).
     DeviceUser,
     /// Console policy or a local override forbids it.
     Policy,
@@ -145,8 +145,6 @@ pub enum PrivacyScreenReason {
     Permission,
     /// This device cannot do it (see [`PrivacyScreenSupport`]).
     Unsupported,
-    /// The device user lifted it earlier in this session; it cannot be re-engaged.
-    Locked,
     /// The maximum engagement time elapsed.
     Timeout,
     /// The agent's watchdog released it (the session stopped confirming it).

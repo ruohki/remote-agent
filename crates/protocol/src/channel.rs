@@ -109,8 +109,8 @@ pub enum ControlMessage {
     /// Engage / release the privacy screen: the device's own displays show a branded notice
     /// instead of the desktop while the operator works (requires
     /// `AgentConfig.allow_privacy_screen`, the operator's `manage` permission and device
-    /// support). The person at the device can always lift it; once they do, it stays off for
-    /// the rest of the session.
+    /// support). The person at the device can always lift it; the operator may engage it
+    /// again afterwards, and pausing control at the device blocks it for as long as it lasts.
     SetPrivacyScreen {
         enabled: bool,
     },
@@ -215,13 +215,11 @@ pub enum ControlMessage {
     AnnotateClear,
     /// Agent → browser: annotations are not allowed on this device (policy or local override).
     AnnotationsDisabled,
-    /// Agent → browser: privacy screen state changed. `locked` = the device user lifted it,
-    /// so the operator cannot engage it again in this session.
+    /// Agent → browser: privacy screen state changed (the operator's button follows this echo,
+    /// never its own optimistic state).
     PrivacyScreen {
         active: bool,
         reason: crate::common::PrivacyScreenReason,
-        #[serde(default)]
-        locked: bool,
     },
     /// Agent → browser: a `set_privacy_screen` request was refused.
     PrivacyScreenDenied {

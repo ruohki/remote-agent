@@ -2428,7 +2428,7 @@ async fn privacy_screen_is_refused_by_policy_and_by_missing_permission() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn privacy_screen_engages_releases_on_pause_and_locks_after_the_device_user_lifts_it() {
+async fn privacy_screen_engages_releases_on_pause_and_can_be_re_engaged_after_a_lift() {
     use protocol::common::PrivacyScreenReason;
     use protocol::config::AgentConfig;
 
@@ -2460,14 +2460,13 @@ async fn privacy_screen_engages_releases_on_pause_and_locks_after_the_device_use
             ControlMessage::PrivacyScreen {
                 active: true,
                 reason: PrivacyScreenReason::Operator,
-                locked: false
             }
         )
     })
     .await;
     assert!(wait_privacy_event(&mut h.hub_events, true, PrivacyScreenReason::Operator).await);
 
-    // The emergency stop at the device also gives the desktop back — without locking.
+    // The emergency stop at the device also gives the desktop back.
     h.sessions.set_control_paused(true);
     next_control(&mut h.control_rx, |m| {
         matches!(
@@ -2475,7 +2474,6 @@ async fn privacy_screen_engages_releases_on_pause_and_locks_after_the_device_use
             ControlMessage::PrivacyScreen {
                 active: false,
                 reason: PrivacyScreenReason::ControlPaused,
-                locked: false
             }
         )
     })
@@ -2487,7 +2485,7 @@ async fn privacy_screen_engages_releases_on_pause_and_locks_after_the_device_use
     })
     .await;
 
-    // Engage again, then the person at the device lifts it: off for the rest of the session.
+    // Engage again, then the person at the device lifts it: a stop, not a session-long lock.
     send_json(
         &h.control_dc,
         &ControlMessage::SetPrivacyScreen { enabled: true },
@@ -2504,12 +2502,42 @@ async fn privacy_screen_engages_releases_on_pause_and_locks_after_the_device_use
             ControlMessage::PrivacyScreen {
                 active: false,
                 reason: PrivacyScreenReason::DeviceUser,
-                locked: true
             }
         )
     })
     .await;
     assert!(wait_privacy_event(&mut h.hub_events, false, PrivacyScreenReason::DeviceUser).await);
+
+    // The operator may cover the screen again after a lift.
+    send_json(
+        &h.control_dc,
+        &ControlMessage::SetPrivacyScreen { enabled: true },
+    )
+    .await;
+    next_control(&mut h.control_rx, |m| {
+        matches!(
+            m,
+            ControlMessage::PrivacyScreen {
+                active: true,
+                reason: PrivacyScreenReason::Operator,
+            }
+        )
+    })
+    .await;
+
+    // Pausing control at the device is the durable escape: it releases the screen and refuses
+    // every further engagement while it lasts.
+    h.sessions.set_control_paused(true);
+    next_control(&mut h.control_rx, |m| {
+        matches!(
+            m,
+            ControlMessage::PrivacyScreen {
+                active: false,
+                reason: PrivacyScreenReason::ControlPaused,
+            }
+        )
+    })
+    .await;
     send_json(
         &h.control_dc,
         &ControlMessage::SetPrivacyScreen { enabled: true },
@@ -2519,7 +2547,7 @@ async fn privacy_screen_engages_releases_on_pause_and_locks_after_the_device_use
         matches!(
             m,
             ControlMessage::PrivacyScreenDenied {
-                reason: PrivacyScreenReason::Locked
+                reason: PrivacyScreenReason::ControlPaused
             }
         )
     })

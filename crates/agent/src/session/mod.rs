@@ -357,8 +357,6 @@ struct Session {
     privacy_allowed: bool,
     /// Engaged privacy screen; `None` when the desktop is visible.
     privacy: Option<PrivacyGuard>,
-    /// The device user lifted the screen: it cannot be engaged again this session.
-    privacy_locked: bool,
     /// The guard reports every release here (its own watchdog, the operator, the device user…).
     privacy_release_tx: mpsc::UnboundedSender<PrivacyScreenReason>,
     privacy_release_rx: mpsc::UnboundedReceiver<PrivacyScreenReason>,
@@ -519,7 +517,6 @@ async fn run_session(
         started_ms: crate::chat::now_ms(),
         privacy_allowed: req.privacy_screen_allowed,
         privacy: None,
-        privacy_locked: false,
         privacy_release_tx,
         privacy_release_rx,
     };
@@ -623,13 +620,6 @@ async fn run_session(
                     if session.control_paused {
                         // Survives an operator reconnect within the same session.
                         session.send_control(ControlMessage::ControlPaused { paused: true }).await;
-                    }
-                    if session.privacy_locked {
-                        session.send_control(ControlMessage::PrivacyScreen {
-                            active: false,
-                            reason: PrivacyScreenReason::DeviceUser,
-                            locked: true,
-                        }).await;
                     }
                 }
                 Some(ChannelEvent::Control(msg)) => session.on_control(msg).await,
@@ -870,8 +860,6 @@ impl Session {
             Some(PrivacyScreenReason::Permission)
         } else if !self.cfg.allow_privacy_screen {
             Some(PrivacyScreenReason::Policy)
-        } else if self.privacy_locked {
-            Some(PrivacyScreenReason::Locked)
         } else if crate::privacy::support() == protocol::common::PrivacyScreenSupport::Unsupported {
             Some(PrivacyScreenReason::Unsupported)
         } else if self.control_paused {
@@ -917,7 +905,6 @@ impl Session {
                 self.send_control(ControlMessage::PrivacyScreen {
                     active: true,
                     reason: PrivacyScreenReason::Operator,
-                    locked: false,
                 })
                 .await;
                 self.event(SessionEvent::PrivacyScreen {
@@ -951,14 +938,10 @@ impl Session {
     /// The guard released the screen (any reason): tell the operator and the console.
     async fn on_privacy_released(&mut self, reason: PrivacyScreenReason) {
         self.privacy = None;
-        if reason == PrivacyScreenReason::DeviceUser {
-            self.privacy_locked = true;
-        }
-        tracing::info!(session = %self.id, ?reason, locked = self.privacy_locked, "privacy screen off");
+        tracing::info!(session = %self.id, ?reason, "privacy screen off");
         self.send_control(ControlMessage::PrivacyScreen {
             active: false,
             reason,
-            locked: self.privacy_locked,
         })
         .await;
         self.event(SessionEvent::PrivacyScreen {

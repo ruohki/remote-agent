@@ -72,13 +72,14 @@ Two repositories:
   display; a heavily downsampled snapshot of the desktop as backdrop) while the operator keeps
   seeing the desktop. Gates, all agent-side: `AgentConfig.allow_privacy_screen` (console policy,
   default off, tightenable locally), `SessionRequest.privacy_screen_allowed` (the console's
-  `manage` check), device support (`hello.capabilities.privacy_screen`), not control-paused, not
-  lifted by the device user earlier in the session. The guarantee that it comes back lives in
+  `manage` check), device support (`hello.capabilities.privacy_screen`) and not control-paused.
+  The guarantee that it comes back lives in
   `privacy::PrivacyGuard`: a dedicated OS thread releases on missed keepalives (5 s), the hard cap
   (30 min) or a display change; releases also fire on session end, control-channel close, the
   pause switch, policy tightening and shutdown; if the UI thread does not confirm a release within
   10 s the process aborts so the supervisor restarts it with the desktop visible. The person at
-  the device lifts it with *Show screen* / `Esc`; after that it stays off for the session.
+  the device lifts it with *Show screen* / `Esc`; the operator may engage it again afterwards, and
+  pausing control at the device keeps it off for as long as the pause lasts.
 * **`remote-agent privacy-probe`** (hidden): measures on the running machine whether the
   agent's own windows — and the window configurations a privacy screen would use — stay out of
   the capture the operator sees, by painting sentinel windows and reading them back through the
