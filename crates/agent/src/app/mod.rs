@@ -101,14 +101,51 @@ pub enum AppEvent {
     /// Internal: an overlay page finished loading.
     #[doc(hidden)]
     OverlayReady,
+    /// Connect screen (first-run enrollment) state.
+    Connect(ConnectUi),
+    /// Reply to the Connect screen's inline URL check.
+    UrlCheck {
+        ok: bool,
+        message: String,
+    },
     Quit,
     /// Internal: the page finished loading and is ready to receive JS.
     #[doc(hidden)]
     __Ready,
 }
 
+/// What the Connect screen submitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectRequest {
+    pub server_url: String,
+    pub token: String,
+    pub name: Option<String>,
+}
+
+/// State of the Connect screen, rendered by `window.__app.setConnect`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ConnectUi {
+    /// Ask for console URL + token. `locked`: the URL is fixed (baked binary). `error`: why we
+    /// are here (auto-enrollment failed, device deleted …).
+    Show {
+        server_url: String,
+        name: String,
+        locked: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// Enrollment in flight (spinner, form disabled).
+    Busy,
+    /// Enrollment failed; `message` is shown inline and the form is editable again.
+    Failed { message: String },
+    /// Enrolled: back to the Status screen.
+    Done,
+}
+
 type SendCb = Arc<dyn Fn(String) + Send + Sync>;
 type DisconnectCb = Arc<dyn Fn() + Send + Sync>;
+type ConnectCb = Arc<dyn Fn(ConnectRequest) + Send + Sync>;
 
 struct Callbacks {
     on_send: SendCb,
@@ -125,6 +162,10 @@ static OVERRIDES_CB: parking_lot::Mutex<Option<OverridesCb>> = parking_lot::Mute
 /// Pause / resume remote control on the active session (session bar emergency switch).
 type PauseCb = Arc<dyn Fn(bool) + Send + Sync>;
 static PAUSE_CB: parking_lot::Mutex<Option<PauseCb>> = parking_lot::Mutex::new(None);
+/// Receives Connect-screen submissions while enrollment is pending (set by `startup`).
+static CONNECT_CB: parking_lot::Mutex<Option<ConnectCb>> = parking_lot::Mutex::new(None);
+/// "Enroll again" from Settings: wakes the hub, which drops the identity and returns.
+static REENROLL: tokio::sync::Notify = tokio::sync::Notify::const_new();
 static PROXY: OnceLock<parking_lot::Mutex<Option<Proxy>>> = OnceLock::new();
 /// Config dir used to persist small UI state (session bar position).
 static STATE_DIR: parking_lot::Mutex<Option<std::path::PathBuf>> = parking_lot::Mutex::new(None);
@@ -195,6 +236,36 @@ fn dispatch_overrides(ov: LocalOverrides) {
     if let Some(cb) = cb {
         cb(ov);
     }
+}
+
+/// Register the receiver of Connect-screen submissions (the enrollment flow).
+pub fn set_connect_handler(cb: ConnectCb) {
+    *CONNECT_CB.lock() = Some(cb);
+}
+
+/// Called from the webview IPC when the Connect form is submitted.
+fn dispatch_connect(req: ConnectRequest) {
+    let cb = CONNECT_CB.lock().clone();
+    match cb {
+        Some(cb) => cb(req),
+        None => tracing::debug!("connect request while no enrollment is pending; ignored"),
+    }
+}
+
+/// Render a Connect screen state.
+pub fn set_connect_ui(ui: ConnectUi) {
+    post(AppEvent::Connect(ui));
+}
+
+/// Settings → "Enroll again": the hub ends sessions, forgets the identity and returns to the
+/// Connect screen.
+fn request_reenroll() {
+    REENROLL.notify_one();
+}
+
+/// Resolves when the user asked to enroll again (see [`request_reenroll`]).
+pub async fn reenroll_requested() {
+    REENROLL.notified().await
 }
 
 /// Push the current policy (console vs. local restrictions vs. effective) to the Settings screen.

@@ -3,8 +3,8 @@
 use super::annotate::OverlayManager;
 use super::bar::{BarIpc, SessionBar};
 use super::{
-    branding_json, dispatch_disconnect, dispatch_send, key_fingerprint, set_proxy, AppEvent,
-    AppOptions,
+    branding_json, dispatch_connect, dispatch_disconnect, dispatch_send, key_fingerprint,
+    request_reenroll, set_proxy, AppEvent, AppOptions, ConnectRequest, ConnectUi,
 };
 use crate::baked;
 use crate::branding;
@@ -67,6 +67,10 @@ struct Controller {
     console_url: String,
     /// Last permission state pushed to the page (`(screen, accessibility)`).
     permissions: Option<(bool, bool)>,
+    /// The Connect screen as last shown (`ConnectUi::Show`), while enrollment is pending.
+    connect_form: Option<ConnectUi>,
+    /// Progress on top of the form (`Busy` / `Failed`), replayed after it on ready.
+    connect_progress: Option<ConnectUi>,
     /// Branded session bar (created on the first session).
     bar: Option<SessionBar>,
     /// Operator annotation overlays (one per display, lazily created).
@@ -146,12 +150,26 @@ impl Controller {
                 serde_json::json!({ "supported": crate::platform::permissions_supported(), "screen": screen, "accessibility": accessibility })
             ));
         }
+        for ui in self.connect_form.iter().chain(self.connect_progress.iter()) {
+            js.push_str(&connect_js(ui));
+        }
         // Developer aid for screenshots: open a specific screen at start.
         if let Ok(screen) = std::env::var("REMOTE_AGENT_START_SCREEN") {
             js.push_str(&format!(
                 "window.__app.show({});",
                 serde_json::json!(screen)
             ));
+        }
+        // Developer aid (debug builds): run a script file in the page once it is ready, to
+        // drive the UI (fill forms, click) from an automated check.
+        if cfg!(debug_assertions) {
+            if let Some(script) = std::env::var_os("REMOTE_AGENT_DEV_SCRIPT")
+                .and_then(|p| std::fs::read_to_string(p).ok())
+            {
+                js.push_str("setTimeout(function(){");
+                js.push_str(&script);
+                js.push_str("},0);");
+            }
         }
         // Flush anything buffered before ready.
         let pending = std::mem::take(&mut self.pending);
@@ -299,6 +317,40 @@ impl Controller {
                 self.policy = json.clone();
                 self.eval(format!("window.__app.setPolicy({json});"));
             }
+            AppEvent::Connect(ui) => {
+                match &ui {
+                    ConnectUi::Show { .. } => {
+                        self.connect_form = Some(ui.clone());
+                        self.connect_progress = None;
+                        // Not enrolled: no console, no device, no session possible.
+                        self.console_connected = false;
+                        self.device = (String::new(), String::new());
+                        self.end_item.set_enabled(false);
+                        self.chat_item.set_enabled(false);
+                        // The user has to act; in app mode bring the window up (service mode
+                        // stays in the tray, whose status line says what to do).
+                        if self.opts.show_on_start {
+                            self.show(target, false);
+                        }
+                    }
+                    ConnectUi::Busy | ConnectUi::Failed { .. } => {
+                        self.connect_progress = Some(ui.clone());
+                    }
+                    ConnectUi::Done => {
+                        self.connect_form = None;
+                        self.connect_progress = None;
+                    }
+                }
+                self.update_status_item();
+                self.refresh_tooltip();
+                self.eval(connect_js(&ui));
+            }
+            AppEvent::UrlCheck { ok, message } => {
+                self.eval(format!(
+                    "window.__app.urlCheck({});",
+                    serde_json::json!({ "ok": ok, "message": message })
+                ));
+            }
             AppEvent::Quit => { /* handled by caller (control flow) */ }
             AppEvent::__Ready => self.on_ready(),
         }
@@ -369,13 +421,18 @@ impl Controller {
         if matches!(self.permissions, Some((false, _))) {
             text = format!("{product} — Screen Recording permission required");
         }
+        if self.connect_form.is_some() {
+            text = format!("{product} — Not enrolled");
+        }
         let _ = self.tray.set_tooltip(Some(text));
     }
 
     /// Status line of the tray menu: connected / disconnected and to which console.
     fn update_status_item(&self) {
         let host = console_host(&self.console_url);
-        let text = if self.console_connected {
+        let text = if self.connect_form.is_some() {
+            "Not connected — open to enroll".to_string()
+        } else if self.console_connected {
             format!("Connected to {host}")
         } else if host.is_empty() {
             "Not connected".to_string()
@@ -423,6 +480,13 @@ impl Controller {
             let _ = self.window.set_skip_taskbar(true);
         }
     }
+}
+
+fn connect_js(ui: &ConnectUi) -> String {
+    format!(
+        "window.__app.setConnect({});",
+        serde_json::to_string(ui).unwrap_or_else(|_| "{}".into())
+    )
 }
 
 fn push_js(from: ChatParty, text: &str, ts_ms: u64) -> String {
@@ -510,6 +574,23 @@ fn build_and_run(work: impl FnOnce() -> i32 + Send + 'static, opts: AppOptions) 
                     super::post(AppEvent::MoveResult { ok, message });
                 });
             }
+            Ok(IpcIn::CheckUrl { server_url }) => {
+                let (ok, message) = match crate::startup::validate_console_url(&server_url) {
+                    Ok(_) => (true, String::new()),
+                    Err(m) => (false, m),
+                };
+                super::post(AppEvent::UrlCheck { ok, message });
+            }
+            Ok(IpcIn::Connect {
+                server_url,
+                token,
+                name,
+            }) => dispatch_connect(ConnectRequest {
+                server_url,
+                token,
+                name,
+            }),
+            Ok(IpcIn::Reenroll) => request_reenroll(),
             Err(e) => tracing::debug!("app IPC parse error: {e}"),
         }
     };
@@ -590,6 +671,8 @@ fn build_and_run(work: impl FnOnce() -> i32 + Send + 'static, opts: AppOptions) 
             .map(|b| b.config.server_url.clone())
             .unwrap_or_default(),
         permissions: None,
+        connect_form: None,
+        connect_progress: None,
         bar: None,
         overlays: OverlayManager::default(),
         location: crate::platform::exe_location(),
@@ -699,6 +782,19 @@ enum IpcIn {
         which: String,
     },
     MoveToApplications,
+    /// Connect screen: inline validation of the console URL field.
+    CheckUrl {
+        server_url: String,
+    },
+    /// Connect screen submitted.
+    Connect {
+        server_url: String,
+        token: String,
+        #[serde(default)]
+        name: Option<String>,
+    },
+    /// Settings → "Enroll again".
+    Reenroll,
 }
 
 /// The Settings toggles as the page reports them: each value is the *effective local choice*.

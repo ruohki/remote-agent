@@ -42,6 +42,7 @@ pub mod platform;
 pub mod secrets;
 pub mod service;
 pub mod session;
+pub mod startup;
 pub mod transfer;
 pub mod transport;
 pub mod updater;

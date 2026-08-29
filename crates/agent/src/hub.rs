@@ -27,6 +27,51 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
+/// The console no longer accepts this device's identity (deleted device, bad credentials) or
+/// the user asked to enroll again. `run_agent` returns this in app mode so the process can drop
+/// the identity and show the Connect screen instead of reconnecting forever.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reenroll {
+    pub reason: String,
+}
+
+impl Reenroll {
+    /// What the Connect screen shows.
+    pub fn notice(&self) -> String {
+        match self.reason.as_str() {
+            "requested" => "Enroll this device again.".into(),
+            "device deleted" | "unknown device" => {
+                "This device was removed from the console. Enroll it again.".into()
+            }
+            "bad credentials" => {
+                "The console no longer accepts this device. Enroll it again.".into()
+            }
+            other => format!("Enroll this device again ({other})."),
+        }
+    }
+}
+
+impl std::fmt::Display for Reenroll {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "re-enrollment needed: {}", self.reason)
+    }
+}
+
+impl std::error::Error for Reenroll {}
+
+/// Close codes `/ws/agent` uses when the device identity is no longer valid
+/// (4401 bad credentials, 4409 device deleted).
+fn close_code_means_reenroll(code: u16) -> bool {
+    matches!(code, 4401 | 4409)
+}
+
+/// A `goodbye` whose reason says the device is gone (as opposed to "replaced by a newer
+/// connection" or a console restart).
+fn goodbye_means_reenroll(reason: &str) -> bool {
+    let r = reason.to_ascii_lowercase();
+    r.contains("deleted") || r.contains("unknown device") || r.contains("bad credentials")
+}
+
 /// Handle for sending messages to the console. Cloneable and reconnect-safe.
 #[derive(Clone)]
 pub struct HubSink {
@@ -241,7 +286,7 @@ pub async fn run_agent(paths: Paths) -> Result<()> {
 
     // Runtime branding: fetched from the console (public endpoint) on start, on demand and
     // every 10 minutes; cached in the config dir so restarts are branded immediately.
-    tokio::spawn(crate::branding::refresh_loop(
+    let branding_task = tokio::spawn(crate::branding::refresh_loop(
         local.server_url.clone(),
         paths.clone(),
     ));
@@ -253,10 +298,24 @@ pub async fn run_agent(paths: Paths) -> Result<()> {
 
     let mut backoff = Duration::from_secs(1);
     loop {
-        match connect_once(&paths, &local, &state, &sessions, &mut out_rx, &pending).await {
+        let app = crate::app::is_running();
+        let outcome = tokio::select! {
+            r = connect_once(&paths, &local, &state, &sessions, &mut out_rx, &pending) => r,
+            // Settings → "Enroll again" (only meaningful with the app window).
+            _ = crate::app::reenroll_requested(), if app => Err(Reenroll { reason: "requested".into() }.into()),
+        };
+        match outcome {
             Ok(()) => {
                 backoff = Duration::from_secs(1);
                 tracing::info!("console closed the connection; reconnecting");
+            }
+            // In app mode hand the identity problem to the Connect screen; headless keeps
+            // retrying with backoff as before (the service manager owns the process).
+            Err(e) if app && e.is::<Reenroll>() => {
+                sessions.end_all(EndReason::DeviceUserClosed);
+                crate::app::set_console_status(false);
+                branding_task.abort();
+                return Err(e);
             }
             Err(e) => {
                 tracing::warn!("hub connection error: {e:#}");
@@ -320,6 +379,16 @@ async fn connect_once(
         .context("timed out waiting for hello_ack")?
         .context("connection closed before hello_ack")?
         .context("reading hello_ack")?;
+    if let Message::Close(frame) = &ack {
+        let (code, reason) = frame
+            .as_ref()
+            .map(|f| (u16::from(f.code), f.reason.to_string()))
+            .unwrap_or((1005, String::new()));
+        if close_code_means_reenroll(code) {
+            return Err(Reenroll { reason }.into());
+        }
+        return Err(anyhow!("console closed before hello_ack ({code} {reason})"));
+    }
     match parse(&ack)? {
         Some(ConsoleToAgent::HelloAck {
             protocol_version,
@@ -340,6 +409,9 @@ async fn connect_once(
             crate::branding::request_refresh();
         }
         Some(ConsoleToAgent::Goodbye { reason }) => {
+            if goodbye_means_reenroll(&reason) {
+                return Err(Reenroll { reason }.into());
+            }
             return Err(anyhow!("console rejected connection: {reason}"));
         }
         other => return Err(anyhow!("expected hello_ack, got {other:?}")),
@@ -383,6 +455,9 @@ async fn connect_once(
                 let Some(frame) = frame else { return Ok(()); };
                 let frame = frame.context("reading frame")?;
                 match frame {
+                    Message::Close(Some(f)) if close_code_means_reenroll(u16::from(f.code)) => {
+                        return Err(Reenroll { reason: f.reason.to_string() }.into());
+                    }
                     Message::Close(_) => return Ok(()),
                     Message::Ping(p) => { write.send(Message::Pong(p)).await.ok(); }
                     Message::Pong(_) => {}
@@ -476,6 +551,9 @@ where
         }
         ConsoleToAgent::Goodbye { reason } => {
             tracing::info!("console said goodbye: {reason}");
+            if goodbye_means_reenroll(&reason) {
+                return Err(Reenroll { reason }.into());
+            }
             return Ok(true);
         }
     }
@@ -591,6 +669,41 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_rejections_are_recognised() {
+        assert!(close_code_means_reenroll(4409));
+        assert!(close_code_means_reenroll(4401));
+        for code in [1000, 1001, 1011, 4400, 4426, 4429] {
+            assert!(!close_code_means_reenroll(code), "{code}");
+        }
+        assert!(goodbye_means_reenroll("device deleted"));
+        assert!(goodbye_means_reenroll("unknown device"));
+        assert!(!goodbye_means_reenroll("replaced by a newer connection"));
+        assert!(!goodbye_means_reenroll("bye"));
+    }
+
+    #[test]
+    fn reenroll_notice_is_user_facing() {
+        assert!(Reenroll {
+            reason: "device deleted".into()
+        }
+        .notice()
+        .contains("removed from the console"));
+        assert_eq!(
+            Reenroll {
+                reason: "requested".into()
+            }
+            .notice(),
+            "Enroll this device again."
+        );
+        let e: anyhow::Error = Reenroll {
+            reason: "bad credentials".into(),
+        }
+        .into();
+        assert!(e.is::<Reenroll>());
+        assert!(e.context("hub").is::<Reenroll>());
+    }
 
     #[test]
     fn ws_url_derivation() {

@@ -36,9 +36,17 @@
 
   // ---- navigation ----
   var current = 'home';
+  var connectRequired = false; // not enrolled: only Connect + About are reachable
+  var installable = false;
+  function applyRail() {
+    $('tab-connect').hidden = !connectRequired;
+    ['home', 'chat', 'settings'].forEach(function (s) { $('tab-' + s).hidden = connectRequired; });
+    $('tab-install').hidden = connectRequired || !installable;
+  }
   function show(screen) {
+    if (connectRequired && screen !== 'connect' && screen !== 'about') screen = 'connect';
     current = screen;
-    ['home', 'chat', 'install', 'settings', 'about'].forEach(function (s) {
+    ['connect', 'home', 'chat', 'install', 'settings', 'about'].forEach(function (s) {
       var el = $('screen-' + s); if (el) el.hidden = s !== screen;
       var tab = $('tab-' + s); if (tab) tab.classList.toggle('active', s === screen);
       var main = document.querySelector('.main'); if (main) main.classList.toggle('chat-mode', screen === 'chat');
@@ -152,6 +160,80 @@
     ipc({ type: 'install' });
   });
 
+  // ---- connect (first-run enrollment) ----
+  var connectBusy = false;
+  var urlCheckTimer = null;
+  function fieldError(id, message) {
+    var err = $(id + 'Err'), field = $(id).closest('.field');
+    err.textContent = message || ''; err.hidden = !message;
+    if (field) field.classList.toggle('invalid', !!message);
+  }
+  function setConnectBusy(on) {
+    connectBusy = !!on;
+    $('connectSpin').hidden = !on;
+    $('connectBtnText').textContent = on ? 'Connecting…' : 'Connect';
+    $('connectBtn').disabled = !!on;
+    ['connectUrl', 'connectToken', 'connectName'].forEach(function (id) { $(id).disabled = !!on; });
+  }
+  function requestUrlCheck() {
+    var url = $('connectUrl').value.trim();
+    if (!url) { fieldError('connectUrl', ''); return; }
+    ipc({ type: 'check_url', server_url: url });
+  }
+  $('connectUrl').addEventListener('input', function () {
+    fieldError('connectUrl', '');
+    clearTimeout(urlCheckTimer);
+    urlCheckTimer = setTimeout(requestUrlCheck, 400);
+  });
+  $('connectUrl').addEventListener('blur', function () { clearTimeout(urlCheckTimer); requestUrlCheck(); });
+  $('connectToken').addEventListener('input', function () { fieldError('connectToken', ''); });
+  $('connectForm').addEventListener('submit', function (e) {
+    e.preventDefault();
+    if (connectBusy) return;
+    var url = $('connectUrl').value.trim(), token = $('connectToken').value.trim(), name = $('connectName').value.trim();
+    var ok = true;
+    if (!url) { fieldError('connectUrl', 'Enter the console URL'); ok = false; }
+    if (!token) { fieldError('connectToken', 'Enter the enrollment token'); ok = false; }
+    if (!ok) return;
+    $('connectErr').hidden = true;
+    setConnectBusy(true);
+    ipc({ type: 'connect', server_url: url, token: token, name: name || null });
+  });
+  function renderConnect(s) {
+    if (s.state === 'show') {
+      connectRequired = true;
+      $('connectUrl').value = s.server_url || '';
+      $('connectUrl').readOnly = !!s.locked;
+      $('connectToken').value = '';
+      $('connectName').value = s.name || '';
+      fieldError('connectUrl', ''); fieldError('connectToken', '');
+      var n = $('connectNotice'); n.textContent = s.error || ''; n.hidden = !s.error;
+      $('connectErr').hidden = true;
+      setConnectBusy(false);
+      applyRail();
+      $('railStatus').textContent = 'Not enrolled';
+      $('railDot').classList.remove('on'); $('railDot').classList.add('warn');
+      show('connect');
+      (s.server_url ? $('connectToken') : $('connectUrl')).focus();
+    } else if (s.state === 'busy') {
+      setConnectBusy(true);
+    } else if (s.state === 'failed') {
+      setConnectBusy(false);
+      var el = $('connectErr'); el.textContent = s.message || 'Enrollment failed'; el.hidden = false;
+      $('connectToken').focus();
+    } else if (s.state === 'done') {
+      connectRequired = false;
+      setConnectBusy(false);
+      $('connectToken').value = '';
+      applyRail();
+      $('railStatus').textContent = 'Connecting…';
+      show('home');
+    }
+  }
+  $('reenrollBtn').addEventListener('click', function () {
+    if (window.confirm('Disconnect from the console and enroll this device again?')) ipc({ type: 'reenroll' });
+  });
+
   function setConnected(on) {
     connected = !!on;
     $('sessionActive').hidden = !on;
@@ -263,6 +345,7 @@
       $('consoleUrl').textContent = host || '—';
       $('consoleUrl').title = url || '';
       $('aboutConsole').textContent = url || '—';
+      $('reenrollSub').textContent = host ? 'Enrolled with ' + host : '—';
       $('consoleState').textContent = connectedToConsole ? 'Connected' : 'Not connected';
       $('consoleDot').classList.toggle('on', !!connectedToConsole);
       $('railStatus').textContent = connectedToConsole ? 'Online' : 'Offline';
@@ -282,13 +365,16 @@
       $('aboutOrg').textContent = b.organization || '—';
       $('supportText').textContent = b.support_text || '';
       var logoUrl = b.logo ? 'url("data:image/png;base64,' + b.logo + '")' : '';
-      ['logo', 'heroLogo'].forEach(function (id) {
+      ['logo', 'heroLogo', 'connectLogo'].forEach(function (id) {
         $(id).style.backgroundImage = logoUrl;
         $(id).classList.toggle('has-logo', !!b.logo);
       });
     },
     setAbout: function (version, keyfp) { $('aboutVersion').textContent = version || '—'; $('aboutKey').textContent = keyfp || '—'; },
-    setInstallable: function (yes) { $('tab-install').hidden = !yes; },
+    setInstallable: function (yes) { installable = !!yes; applyRail(); },
+    // First-run enrollment
+    setConnect: renderConnect,
+    urlCheck: function (r) { fieldError('connectUrl', r && !r.ok ? r.message : ''); },
     installResult: function (ok, message) {
       $('installBtn').disabled = ok;
       setStatus2($('installStatus'), message, ok ? 'ok' : 'err');

@@ -74,6 +74,11 @@ pub fn png_size(png: &[u8]) -> Option<(u32, u32)> {
     Some((w, h))
 }
 
+/// PNG bytes plus the cursor's hotspot and size in logical units (points on macOS,
+/// bitmap pixels on Windows).
+#[allow(dead_code)]
+type ShapeSample = (Vec<u8>, (f64, f64), (f64, f64));
+
 /// Platform cursor source, if the platform provides one.
 pub fn create_source() -> Option<Box<dyn CursorSource>> {
     #[cfg(target_os = "macos")]
@@ -218,7 +223,7 @@ mod macos {
     }
 
     /// Current system cursor as PNG plus its hotspot and size in points (main thread).
-    fn current_shape() -> Option<(Vec<u8>, (f64, f64), (f64, f64))> {
+    fn current_shape() -> Option<ShapeSample> {
         crate::platform::run_on_main(|| {
             // Deprecated by Apple but still the only public way to read the *system*
             // cursor (`currentCursor` only knows this app's own cursor).
@@ -357,7 +362,7 @@ mod windows {
 
     /// Current cursor as PNG + hotspot; `None` when unchanged (`last_handle`).
     /// Cursor bitmaps are already in physical pixels, so the size is reported with scale 1.
-    fn current_shape(last_handle: &mut isize) -> Option<(Vec<u8>, (f64, f64), (f64, f64))> {
+    fn current_shape(last_handle: &mut isize) -> Option<ShapeSample> {
         let mut info = CURSORINFO {
             cbSize: std::mem::size_of::<CURSORINFO>() as u32,
             ..Default::default()

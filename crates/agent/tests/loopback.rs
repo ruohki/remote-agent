@@ -509,6 +509,12 @@ async fn multi_display_binding_and_input() {
         matches!(m, ControlMessage::DisplayInfo { .. })
     })
     .await;
+    // JSON control messages must travel as text frames (a browser gets binary as a Blob).
+    assert_eq!(
+        BINARY_CONTROL_FRAMES.load(Ordering::SeqCst),
+        0,
+        "agent sent JSON on the control channel as binary frames"
+    );
     let ControlMessage::DisplayInfo {
         displays,
         active,

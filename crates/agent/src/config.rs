@@ -169,6 +169,18 @@ impl LocalConfig {
         !self.server_url.is_empty() && !self.device_id.is_empty() && has_secret
     }
 
+    /// Drop the device identity and credentials (the console no longer knows this device or the
+    /// user asked to enroll again). The console URL, the cached policy and the local
+    /// restrictions stay so the Connect screen can prefill and a re-enrollment keeps them.
+    pub fn clear_enrollment(&mut self) {
+        self.device_id.clear();
+        self.device_secret.clear();
+        self.device_secret_dpapi = None;
+        self.secret_backend = None;
+        self.console_public_key = None;
+        self.console_tls_spki_sha256 = None;
+    }
+
     /// The console's config (cached), with a hostname display-name default. This is the policy
     /// the console set, *before* any local restrictions.
     pub fn console_config(&self) -> AgentConfig {

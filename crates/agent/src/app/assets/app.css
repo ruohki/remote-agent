@@ -133,6 +133,23 @@ body {
 .install-status.ok { color: var(--ok); }
 .install-status.err { color: var(--danger); }
 
+/* connect (first-run enrollment) */
+.form { padding: 16px; display: grid; gap: 14px; }
+.field { display: grid; gap: 5px; }
+.field-label { font-weight: 550; font-size: 12px; }
+.input { width: 100%; border: 1px solid var(--border); border-radius: 8px; padding: 9px 11px; font: inherit; font-size: 13px; background: var(--panel-2); color: var(--text); outline: none; -webkit-user-select: text; user-select: text; }
+.input:focus { border-color: var(--accent); }
+.input:disabled { opacity: .6; }
+.input[readonly] { opacity: .75; }
+.field.invalid .input { border-color: var(--danger); }
+.field-err { color: var(--danger); font-size: 12px; }
+.form-actions { display: flex; align-items: center; gap: 12px; }
+.notice { padding: 9px 11px; border-radius: 8px; font-size: 12px; background: var(--panel-2); }
+.notice.err { background: color-mix(in srgb, var(--danger) 12%, var(--panel)); color: var(--danger); }
+.spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid rgba(255,255,255,.45); border-top-color: #fff; border-radius: 50%; margin-right: 8px; vertical-align: -2px; animation: spin .8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.settings-foot { display: flex; align-items: center; gap: 16px; padding: 14px 4px 0; margin-top: 10px; border-top: 1px solid var(--border); }
+
 /* about */
 .about { display: grid; grid-template-columns: 130px 1fr; gap: 8px 16px; }
 .about dt { color: var(--muted); }

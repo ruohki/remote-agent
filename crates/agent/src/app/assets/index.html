@@ -15,6 +15,9 @@
           <div class="logo" id="logo" aria-hidden="true"></div>
           <div class="brand-name" id="brandName">Remote Support</div>
         </div>
+        <button class="tab" data-screen="connect" id="tab-connect" hidden>
+          <span class="tab-ico">⇄</span><span>Connect</span>
+        </button>
         <button class="tab" data-screen="home" id="tab-home">
           <span class="tab-ico">◎</span><span>Status</span>
         </button>
@@ -122,7 +125,35 @@
               </div>
             </div>
           </div>
-          <p class="tip muted">Session control: you can end the session at any time. Closing or minimizing this window does not end the session; reopen it from the menu bar icon.</p>
+        </section>
+
+        <!-- CONNECT (first run: not baked, not enrolled) -->
+        <section class="screen" id="screen-connect" hidden>
+          <header class="hero">
+            <div class="hero-logo" id="connectLogo" aria-hidden="true"></div>
+            <div><h1>Connect to console</h1></div>
+          </header>
+          <form class="card form" id="connectForm" novalidate autocomplete="off">
+            <div class="notice err" id="connectNotice" hidden></div>
+            <label class="field">
+              <span class="field-label">Console URL</span>
+              <input class="input mono" id="connectUrl" type="url" placeholder="https://console.example.com" spellcheck="false" autocapitalize="off" />
+              <span class="field-err" id="connectUrlErr" hidden></span>
+            </label>
+            <label class="field">
+              <span class="field-label">Enrollment token</span>
+              <input class="input mono" id="connectToken" type="text" placeholder="Token from the console" spellcheck="false" autocapitalize="off" />
+              <span class="field-err" id="connectTokenErr" hidden></span>
+            </label>
+            <label class="field">
+              <span class="field-label">Device name</span>
+              <input class="input" id="connectName" type="text" placeholder="Optional" />
+            </label>
+            <div class="form-actions">
+              <button class="btn primary" id="connectBtn" type="submit"><span class="spinner" id="connectSpin" hidden></span><span id="connectBtnText">Connect</span></button>
+              <span class="install-status err" id="connectErr" hidden></span>
+            </div>
+          </form>
         </section>
 
         <!-- CHAT -->
@@ -226,6 +257,13 @@
               <button class="switch" role="switch" aria-checked="true" data-key="allow_annotations"></button>
             </li>
           </ul>
+          <div class="settings-foot">
+            <div class="setting-text">
+              <div class="setting-title">Enrollment</div>
+              <div class="setting-sub" id="reenrollSub">—</div>
+            </div>
+            <button class="btn sm" id="reenrollBtn">Enroll again…</button>
+          </div>
         </section>
 
         <!-- ABOUT -->

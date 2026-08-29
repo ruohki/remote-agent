@@ -103,37 +103,74 @@ pub fn is_local_or_private_host(host: &str) -> bool {
     }
 }
 
-/// Classify a console URL. `Ok(false)` = secure or local; `Ok(true)` = insecure but allowed
-/// by the override; `Err` = insecure and refused.
-pub fn check_console_url(url: &str) -> Result<bool> {
-    let parsed =
-        url::Url::parse(url.trim()).with_context(|| format!("invalid console URL {url}"))?;
-    let scheme = parsed.scheme();
+/// Why a console URL is refused (see [`classify_console_url`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UrlProblem {
+    /// Not parseable as an absolute URL, or without a host.
+    Invalid,
+    /// Plain `http` / `ws` to a public host without the insecure override.
+    PlainTextPublic,
+    /// Neither http(s) nor ws(s).
+    UnsupportedScheme(String),
+}
+
+impl std::fmt::Display for UrlProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UrlProblem::Invalid => write!(f, "invalid console URL"),
+            UrlProblem::PlainTextPublic => write!(
+                f,
+                "the console must use HTTPS (or run on localhost / a private network); \
+                 use --insecure to override"
+            ),
+            UrlProblem::UnsupportedScheme(s) => write!(f, "unsupported console URL scheme {s}"),
+        }
+    }
+}
+
+impl std::error::Error for UrlProblem {}
+
+/// Pure classification of a console URL with an explicit insecure policy: `Ok(false)` = secure
+/// or local; `Ok(true)` = plain text to a public host, tolerated by the override.
+pub fn classify_console_url(url: &str, insecure_allowed: bool) -> Result<bool, UrlProblem> {
+    let parsed = url::Url::parse(url.trim()).map_err(|_| UrlProblem::Invalid)?;
     let host = parsed.host_str().unwrap_or("");
-    match scheme {
+    match parsed.scheme() {
         "https" | "wss" => Ok(false),
         "http" | "ws" => {
             if is_local_or_private_host(host) {
-                return Ok(false);
-            }
-            if insecure_allowed() {
-                if !INSECURE_WARNED.swap(true, Ordering::SeqCst) {
-                    tracing::error!(
-                        %url,
-                        "INSECURE: talking to a public console over plain {scheme} because \
-                         --insecure / REMOTE_AGENT_INSECURE is set. Credentials and session \
-                         signaling are not encrypted."
-                    );
-                }
+                Ok(false)
+            } else if insecure_allowed {
                 Ok(true)
             } else {
-                bail!(
-                    "refusing plain {scheme} console URL {url}: the console must use HTTPS \
-                     (or run on localhost / a private network). Use --insecure to override."
-                )
+                Err(UrlProblem::PlainTextPublic)
             }
         }
-        other => bail!("unsupported console URL scheme {other} in {url}"),
+        other => Err(UrlProblem::UnsupportedScheme(other.to_string())),
+    }
+}
+
+/// Classify a console URL against the process policy. `Ok(false)` = secure or local;
+/// `Ok(true)` = insecure but allowed by the override (logged once); `Err` = refused.
+pub fn check_console_url(url: &str) -> Result<bool> {
+    match classify_console_url(url, insecure_allowed()) {
+        Ok(true) => {
+            if !INSECURE_WARNED.swap(true, Ordering::SeqCst) {
+                tracing::error!(
+                    %url,
+                    "INSECURE: talking to a public console over plain text because \
+                     --insecure / REMOTE_AGENT_INSECURE is set. Credentials and session \
+                     signaling are not encrypted."
+                );
+            }
+            Ok(true)
+        }
+        Ok(false) => Ok(false),
+        Err(UrlProblem::PlainTextPublic) => bail!(
+            "refusing plain-text console URL {url}: the console must use HTTPS \
+             (or run on localhost / a private network). Use --insecure to override."
+        ),
+        Err(e) => Err(e).with_context(|| format!("console URL {url}")),
     }
 }
 

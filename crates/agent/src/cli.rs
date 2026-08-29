@@ -89,7 +89,9 @@ pub fn run() -> Result<()> {
             name,
         }) => {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(crate::enroll::enroll(&paths, &server, &token, name))
+            rt.block_on(crate::enroll::enroll(&paths, &server, &token, name))?
+                .print_summary();
+            Ok(())
         }
         Some(Command::Service { action }) => crate::service::handle(&paths, action),
         Some(Command::Status) => crate::config::print_status(&paths),
@@ -126,14 +128,27 @@ fn run_in_app(paths: &crate::config::Paths, app_mode: bool) -> Result<()> {
 
 /// Run the agent event loop to completion on the current thread (used by `run` and by the
 /// service managers). Builds its own tokio runtime.
+///
+/// Before the hub starts, [`crate::startup::ensure_enrolled`] gets credentials: a baked token
+/// enrolls silently, otherwise the app window asks for console URL + token (headless runs fail
+/// with the CLI hint as before). When the console later rejects the device (deleted / bad
+/// credentials) or the user chooses "Enroll again", the identity is dropped and the Connect
+/// screen comes back without restarting the process.
 pub fn run_agent_blocking(paths: &crate::config::Paths) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
-        // Baked binaries with an enrollment token enroll themselves on first run.
-        if let Err(e) = crate::enroll::auto_enroll_if_baked(paths).await {
-            tracing::error!("auto-enrollment failed: {e:#}");
+        let mut notice = None;
+        loop {
+            crate::startup::ensure_enrolled(paths, notice.take()).await?;
+            match crate::hub::run_agent(paths.clone()).await {
+                Err(e) if e.is::<crate::hub::Reenroll>() && crate::app::is_running() => {
+                    tracing::warn!("{e:#}; returning to the Connect screen");
+                    crate::startup::forget_enrollment(paths)?;
+                    notice = e.downcast_ref::<crate::hub::Reenroll>().map(|r| r.notice());
+                }
+                other => return other,
+            }
         }
-        crate::hub::run_agent(paths.clone()).await
     })
 }
 

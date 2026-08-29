@@ -33,7 +33,7 @@ use crate::input::{InputHandler, LatestMove};
 use crate::transfer::{TransferConfig, TransferManager, TransferNotice};
 use anyhow::{anyhow, Context, Result};
 use audio::{AudioPacket, AudioPipeline};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use media::{choose_codec, MediaFactory};
 use parking_lot::{Mutex, RwLock};
 use peer::{is_keyframe_request, Peer, PeerEvent};
@@ -1885,9 +1885,11 @@ impl Session {
         let Some(dc) = self.control.as_ref() else {
             return;
         };
-        match serde_json::to_vec(&msg) {
-            Ok(bytes) => {
-                if let Err(e) = dc.send(BytesMut::from(&bytes[..])).await {
+        // JSON goes as a *text* frame: browsers hand binary frames over as a Blob, which the
+        // viewer cannot `JSON.parse`.
+        match serde_json::to_string(&msg) {
+            Ok(text) => {
+                if let Err(e) = dc.send_text(&text).await {
                     tracing::debug!(session = %self.id, "control send: {e}");
                 }
             }

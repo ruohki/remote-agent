@@ -462,6 +462,11 @@ impl FakeClipboard {
 /// Everything the "browser" receives on the control channel.
 pub type ControlRx = mpsc::UnboundedReceiver<ControlMessage>;
 
+/// Control-channel frames that arrived as *binary*. A browser delivers those as a `Blob`, so
+/// the viewer's `JSON.parse(ev.data)` throws and the message is lost; the reader below drops
+/// them the same way and counts them so a test can assert none were sent.
+pub static BINARY_CONTROL_FRAMES: AtomicU64 = AtomicU64::new(0);
+
 /// Spawn a reader that decodes control messages; returns once the channel is open.
 pub async fn read_control(dc: Arc<dyn DataChannel>) -> ControlRx {
     let (tx, rx) = mpsc::unbounded_channel();
@@ -476,6 +481,13 @@ pub async fn read_control(dc: Arc<dyn DataChannel>) -> ControlRx {
                     }
                 }
                 DataChannelEvent::OnMessage(m) => {
+                    if !m.is_string {
+                        BINARY_CONTROL_FRAMES.fetch_add(1, Ordering::SeqCst);
+                        eprintln!(
+                            "control channel: binary frame dropped (browsers cannot parse it)"
+                        );
+                        continue;
+                    }
                     if let Ok(msg) = serde_json::from_slice::<ControlMessage>(&m.data) {
                         let _ = tx.send(msg);
                     }
