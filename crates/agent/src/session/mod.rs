@@ -321,6 +321,10 @@ struct Session {
     cursor_stop: Option<Arc<AtomicBool>>,
     /// The capture omits the system cursor (client-side cursor active).
     client_cursor: bool,
+    /// Agent → browser messages produced before the control channel opened (or while it is
+    /// re-opening); flushed on open. Without this the first clipboard/chat/cursor-shape
+    /// messages of a session were silently lost.
+    control_backlog: std::sync::Mutex<Vec<ControlMessage>>,
     clipboard: Option<ClipboardWatch>,
     /// Rich clipboard content (image / files) announced to the operator but not yet pulled.
     pending_clipboard: Option<ClipboardContent>,
@@ -469,6 +473,7 @@ async fn run_session(
         annotations_disabled_sent: false,
         annotations_used: false,
         control: None,
+        control_backlog: std::sync::Mutex::new(Vec::new()),
         media: None,
         channel_tx,
         readers: Vec::new(),
@@ -562,6 +567,14 @@ async fn run_session(
             ev = channel_rx.recv() => match ev {
                 Some(ChannelEvent::ControlOpen(dc)) => {
                     session.control = Some(dc);
+                    let backlog: Vec<ControlMessage> = session
+                        .control_backlog
+                        .lock()
+                        .map(|mut b| std::mem::take(&mut *b))
+                        .unwrap_or_default();
+                    for msg in backlog {
+                        session.send_control(msg).await;
+                    }
                     session.send_display_info().await;
                     session.notify_pending_permission().await;
                     if session.control_paused {
@@ -1883,6 +1896,7 @@ impl Session {
 
     async fn send_control(&self, msg: ControlMessage) {
         let Some(dc) = self.control.as_ref() else {
+            self.queue_control(msg);
             return;
         };
         // JSON goes as a *text* frame: browsers hand binary frames over as a Blob, which the
@@ -1895,6 +1909,25 @@ impl Session {
             }
             Err(e) => tracing::warn!("serializing control message: {e}"),
         }
+    }
+
+    /// Hold a message until the control channel opens. Stats are dropped (stale by then) and
+    /// only the newest cursor position is kept; the backlog is bounded.
+    fn queue_control(&self, msg: ControlMessage) {
+        const MAX_BACKLOG: usize = 64;
+        if matches!(msg, ControlMessage::Stats { .. }) {
+            return;
+        }
+        let Ok(mut backlog) = self.control_backlog.lock() else {
+            return;
+        };
+        if matches!(msg, ControlMessage::CursorPosition { .. }) {
+            backlog.retain(|m| !matches!(m, ControlMessage::CursorPosition { .. }));
+        }
+        if backlog.len() >= MAX_BACKLOG {
+            backlog.remove(0);
+        }
+        backlog.push(msg);
     }
 
     async fn send_display_info(&self) {
