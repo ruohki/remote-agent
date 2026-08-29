@@ -106,6 +106,14 @@ pub enum ControlMessage {
     RequestKeyframe,
     /// Send Ctrl+Alt+Del (Windows) / equivalent secure attention sequence.
     SecureAttention,
+    /// Engage / release the privacy screen: the device's own displays show a branded notice
+    /// instead of the desktop while the operator works (requires
+    /// `AgentConfig.allow_privacy_screen`, the operator's `manage` permission and device
+    /// support). The person at the device can always lift it; once they do, it stays off for
+    /// the rest of the session.
+    SetPrivacyScreen {
+        enabled: bool,
+    },
     /// Operator's clipboard text to place on the device clipboard.
     ClipboardSet {
         text: String,
@@ -207,6 +215,18 @@ pub enum ControlMessage {
     AnnotateClear,
     /// Agent → browser: annotations are not allowed on this device (policy or local override).
     AnnotationsDisabled,
+    /// Agent → browser: privacy screen state changed. `locked` = the device user lifted it,
+    /// so the operator cannot engage it again in this session.
+    PrivacyScreen {
+        active: bool,
+        reason: crate::common::PrivacyScreenReason,
+        #[serde(default)]
+        locked: bool,
+    },
+    /// Agent → browser: a `set_privacy_screen` request was refused.
+    PrivacyScreenDenied {
+        reason: crate::common::PrivacyScreenReason,
+    },
 
     // ── performance (browser → agent) ───────────────────────────────────────────
     /// Size at which the browser renders `display` (CSS px × devicePixelRatio). The agent

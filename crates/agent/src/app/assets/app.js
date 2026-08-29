@@ -255,7 +255,7 @@
   // ---- settings (privacy & control) ----
   // policy: { console:{mode,allow_input,...}, overrides:{...}, effective:{...} }
   var policy = null;
-  var SWITCH_KEYS = ['require_approval', 'allow_input', 'allow_audio', 'allow_clipboard', 'allow_file_transfer', 'allow_annotations'];
+  var SWITCH_KEYS = ['require_approval', 'allow_input', 'allow_audio', 'allow_clipboard', 'allow_file_transfer', 'allow_annotations', 'allow_privacy_screen'];
 
   function consoleAllows(key) {
     if (!policy) return true;
@@ -306,7 +306,8 @@
         allow_audio: switchState('allow_audio'),
         allow_clipboard: switchState('allow_clipboard'),
         allow_file_transfer: switchState('allow_file_transfer'),
-        allow_annotations: switchState('allow_annotations')
+        allow_annotations: switchState('allow_annotations'),
+        allow_privacy_screen: switchState('allow_privacy_screen')
       }
     });
   }

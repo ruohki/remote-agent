@@ -69,6 +69,11 @@ pub enum SessionEvent {
     ControlPaused {
         paused: bool,
     },
+    /// The privacy screen was engaged (`active`) or released, and by whom / why.
+    PrivacyScreen {
+        active: bool,
+        reason: crate::common::PrivacyScreenReason,
+    },
 }
 
 fn default_true() -> bool {
@@ -84,6 +89,9 @@ pub struct AgentCapabilities {
     pub displays: Vec<DisplayInfo>,
     pub input: bool,
     pub clipboard: bool,
+    /// Whether (and how well) the device can hide its own displays during a session.
+    #[serde(default)]
+    pub privacy_screen: crate::common::PrivacyScreenSupport,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -196,6 +204,10 @@ pub enum ConsoleToAgent {
         /// Whether the operator's viewer / device banner should announce the observer.
         #[serde(default = "default_true")]
         notify_operator: bool,
+        /// Whether this operator may engage the privacy screen (console decides from the
+        /// operator's device permission; policy and device support are checked by the agent).
+        #[serde(default)]
+        privacy_screen_allowed: bool,
     },
     IceCandidate {
         session_id: String,

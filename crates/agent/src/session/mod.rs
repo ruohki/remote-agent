@@ -59,6 +59,9 @@ use video::{PipelineConfig, PipelineEvent, VideoPipeline};
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
 use webrtc::peer_connection::RTCPeerConnectionState;
 
+use crate::privacy::{PrivacyGuard, PrivacyScreenInfo};
+use protocol::common::PrivacyScreenReason;
+
 /// Builds an input handler; called once per session (may prompt for permissions).
 pub type InputFactory = Arc<dyn Fn() -> Result<Box<dyn InputHandler>> + Send + Sync>;
 
@@ -87,6 +90,8 @@ pub struct SessionRequest {
     pub role: SessionRole,
     pub shadow_of: Option<String>,
     pub notify_operator: bool,
+    /// The console granted this operator the privacy screen (they hold `manage`).
+    pub privacy_screen_allowed: bool,
 }
 
 enum SessionCommand {
@@ -95,6 +100,8 @@ enum SessionCommand {
     UpdateConfig(AgentConfig),
     /// The person at the device paused / resumed remote control (session bar switch).
     SetControlPaused(bool),
+    /// The person at the device lifted the privacy screen ("Show screen" / Esc).
+    LiftPrivacyScreen,
     End(EndReason),
 }
 
@@ -190,6 +197,14 @@ impl SessionManager {
         let active = self.active.lock();
         if let Some(s) = active.as_ref() {
             let _ = s.cmd_tx.send(SessionCommand::UpdateConfig(effective));
+        }
+    }
+
+    /// The person at the device lifted the privacy screen; it stays off for the session.
+    pub fn lift_privacy_screen(&self) {
+        let active = self.active.lock();
+        if let Some(s) = active.as_ref() {
+            let _ = s.cmd_tx.send(SessionCommand::LiftPrivacyScreen);
         }
     }
 
@@ -336,6 +351,17 @@ struct Session {
     indicator: Option<Box<dyn IndicatorHandle>>,
     /// Set when the local user pressed "Disconnect" on the indicator / chat window.
     user_ended: Arc<AtomicBool>,
+    /// Session start (Unix ms), shown on the privacy screen.
+    started_ms: u64,
+    /// The console granted this operator the privacy screen (`manage` permission).
+    privacy_allowed: bool,
+    /// Engaged privacy screen; `None` when the desktop is visible.
+    privacy: Option<PrivacyGuard>,
+    /// The device user lifted the screen: it cannot be engaged again this session.
+    privacy_locked: bool,
+    /// The guard reports every release here (its own watchdog, the operator, the device user…).
+    privacy_release_tx: mpsc::UnboundedSender<PrivacyScreenReason>,
+    privacy_release_rx: mpsc::UnboundedReceiver<PrivacyScreenReason>,
 }
 
 /// How long a `disconnected` connection state may last before the session is ended.
@@ -459,6 +485,7 @@ async fn run_session(
 
     let (channel_tx, mut channel_rx) = mpsc::unbounded_channel();
     let (notices_tx, notices_rx) = mpsc::unbounded_channel();
+    let (privacy_release_tx, privacy_release_rx) = mpsc::unbounded_channel();
     let cfg_allow_input = cfg.allow_input;
     let mut session = Session {
         deps: deps.clone(),
@@ -489,6 +516,12 @@ async fn run_session(
         chat_ui: None,
         indicator: None,
         user_ended: Arc::new(AtomicBool::new(false)),
+        started_ms: crate::chat::now_ms(),
+        privacy_allowed: req.privacy_screen_allowed,
+        privacy: None,
+        privacy_locked: false,
+        privacy_release_tx,
+        privacy_release_rx,
     };
     for c in pending.drain(..) {
         session.add_candidate(&c).await;
@@ -499,6 +532,9 @@ async fn run_session(
     stats_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut transfer_tick = tokio::time::interval(Duration::from_secs(5));
     transfer_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Keeps the privacy screen's watchdog fed (and its pages' liveness indicator green).
+    let mut privacy_tick = tokio::time::interval(Duration::from_secs(1));
+    privacy_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut disconnect_deadline: Option<tokio::time::Instant> = None;
     let mut connected_once = false;
 
@@ -527,9 +563,16 @@ async fn run_session(
                 Some(SessionCommand::AddIceCandidate(c)) => session.add_candidate(&c).await,
                 Some(SessionCommand::UpdateConfig(new)) => session.apply_config(new).await,
                 Some(SessionCommand::SetControlPaused(p)) => session.set_control_paused(p).await,
+                Some(SessionCommand::LiftPrivacyScreen) => session.release_privacy(PrivacyScreenReason::DeviceUser),
                 Some(SessionCommand::End(reason)) => break reason,
                 None => break EndReason::Error,
             },
+            _ = privacy_tick.tick() => session.privacy_tick(),
+            reason = session.privacy_release_rx.recv() => {
+                if let Some(reason) = reason {
+                    session.on_privacy_released(reason).await;
+                }
+            }
             ev = peer_rx.recv() => match ev {
                 Some(PeerEvent::IceCandidate(c)) => {
                     session.deps.hub.send(AgentToConsole::IceCandidate { session_id: session.id.clone(), candidate: c });
@@ -581,9 +624,20 @@ async fn run_session(
                         // Survives an operator reconnect within the same session.
                         session.send_control(ControlMessage::ControlPaused { paused: true }).await;
                     }
+                    if session.privacy_locked {
+                        session.send_control(ControlMessage::PrivacyScreen {
+                            active: false,
+                            reason: PrivacyScreenReason::DeviceUser,
+                            locked: true,
+                        }).await;
+                    }
                 }
                 Some(ChannelEvent::Control(msg)) => session.on_control(msg).await,
-                Some(ChannelEvent::ControlClosed) => session.control = None,
+                Some(ChannelEvent::ControlClosed) => {
+                    session.control = None;
+                    // The operator is gone (for now): never hold the device's screen for them.
+                    session.release_privacy(PrivacyScreenReason::SessionEnded);
+                }
                 Some(ChannelEvent::FilesOpen(dc)) => session.on_files_open(dc),
                 Some(ChannelEvent::FilesText(msg)) => session.on_files_message(msg).await,
                 Some(ChannelEvent::FilesBinary(bytes)) => {
@@ -677,6 +731,7 @@ async fn drain_until_end(
             Some(SessionCommand::UpdateConfig(_)) => {}
             // No input yet before the session is up; the pause applies once it exists.
             Some(SessionCommand::SetControlPaused(_)) => {}
+            Some(SessionCommand::LiftPrivacyScreen) => {}
             Some(SessionCommand::End(reason)) => return reason,
             None => return EndReason::Error,
         }
@@ -720,6 +775,10 @@ impl Session {
             self.annotations_used = false;
             self.annotations_disabled_sent = false;
             self.reject_annotation().await;
+        }
+        if old.allow_privacy_screen && !new.allow_privacy_screen {
+            tracing::info!(session = %self.id, "privacy screen disallowed by policy");
+            self.release_privacy(PrivacyScreenReason::Policy);
         }
         self.send_display_info().await;
     }
@@ -783,6 +842,8 @@ impl Session {
             if let Some(h) = self.input.lock().as_mut() {
                 h.release_all();
             }
+            // An emergency stop at the device also gives the desktop back.
+            self.release_privacy(PrivacyScreenReason::ControlPaused);
         } else {
             tracing::info!(session = %self.id, "remote control resumed by the device user");
         }
@@ -790,6 +851,120 @@ impl Session {
             .await;
         self.event(SessionEvent::ControlPaused { paused });
         crate::app::set_control_paused_state(paused);
+    }
+
+    // ── privacy screen ────────────────────────────────────────────────────────────────
+
+    /// Operator request. Every gate must pass; a refusal is told to the operator with the
+    /// gate that failed. Engaging shows the branded surface (with a downsampled snapshot of
+    /// each display behind it) on every display and starts the guard's watchdog.
+    async fn set_privacy_screen(&mut self, enabled: bool) {
+        if !enabled {
+            self.release_privacy(PrivacyScreenReason::Operator);
+            return;
+        }
+        if self.privacy.is_some() {
+            return;
+        }
+        let denied = if !self.privacy_allowed {
+            Some(PrivacyScreenReason::Permission)
+        } else if !self.cfg.allow_privacy_screen {
+            Some(PrivacyScreenReason::Policy)
+        } else if self.privacy_locked {
+            Some(PrivacyScreenReason::Locked)
+        } else if crate::privacy::support() == protocol::common::PrivacyScreenSupport::Unsupported {
+            Some(PrivacyScreenReason::Unsupported)
+        } else if self.control_paused {
+            Some(PrivacyScreenReason::ControlPaused)
+        } else {
+            None
+        };
+        if let Some(reason) = denied {
+            tracing::info!(session = %self.id, ?reason, "privacy screen refused");
+            self.send_control(ControlMessage::PrivacyScreenDenied { reason })
+                .await;
+            return;
+        }
+        // Backdrops: one heavily downsampled frame per display (best effort, bounded).
+        let displays: Vec<u32> = self
+            .media
+            .as_ref()
+            .map(|m| m.displays.iter().map(|d| d.index).collect())
+            .unwrap_or_default();
+        let backdrops = tokio::task::spawn_blocking(move || {
+            displays
+                .into_iter()
+                .filter_map(|i| crate::privacy::mosaic_data_url(i).map(|url| (i, url)))
+                .collect::<std::collections::HashMap<u32, String>>()
+        })
+        .await
+        .unwrap_or_default();
+        let info = PrivacyScreenInfo {
+            operator: self.operator.name.clone(),
+            device: self.cfg.display_name.clone(),
+            started_ms: self.started_ms,
+            backdrops,
+        };
+        let tx = self.privacy_release_tx.clone();
+        match PrivacyGuard::engage(info, move |reason| {
+            let _ = tx.send(reason);
+        })
+        .await
+        {
+            Ok(guard) => {
+                self.privacy = Some(guard);
+                tracing::info!(session = %self.id, "privacy screen engaged by the operator");
+                self.send_control(ControlMessage::PrivacyScreen {
+                    active: true,
+                    reason: PrivacyScreenReason::Operator,
+                    locked: false,
+                })
+                .await;
+                self.event(SessionEvent::PrivacyScreen {
+                    active: true,
+                    reason: PrivacyScreenReason::Operator,
+                });
+            }
+            Err(reason) => {
+                tracing::warn!(session = %self.id, ?reason, "privacy screen could not be engaged");
+                self.send_control(ControlMessage::PrivacyScreenDenied { reason })
+                    .await;
+            }
+        }
+    }
+
+    /// Release the screen if it is up; the guard reports back through `privacy_release_rx`.
+    fn release_privacy(&self, reason: PrivacyScreenReason) {
+        if let Some(g) = self.privacy.as_ref() {
+            g.release(reason);
+        }
+    }
+
+    /// Once a second while engaged: feed the watchdog and the pages' liveness indicator.
+    fn privacy_tick(&self) {
+        if let Some(g) = self.privacy.as_ref() {
+            g.keepalive();
+            crate::app::privacy_heartbeat();
+        }
+    }
+
+    /// The guard released the screen (any reason): tell the operator and the console.
+    async fn on_privacy_released(&mut self, reason: PrivacyScreenReason) {
+        self.privacy = None;
+        if reason == PrivacyScreenReason::DeviceUser {
+            self.privacy_locked = true;
+        }
+        tracing::info!(session = %self.id, ?reason, locked = self.privacy_locked, "privacy screen off");
+        self.send_control(ControlMessage::PrivacyScreen {
+            active: false,
+            reason,
+            locked: self.privacy_locked,
+        })
+        .await;
+        self.event(SessionEvent::PrivacyScreen {
+            active: false,
+            reason,
+        });
     }
 
     /// Report an in-session event to the console.
@@ -1639,6 +1814,7 @@ impl Session {
                 self.update_input_display();
             }
             ControlMessage::SetAudio { enabled } => self.set_audio(enabled).await,
+            ControlMessage::SetPrivacyScreen { enabled } => self.set_privacy_screen(enabled).await,
             ControlMessage::Chat { from, text, ts_ms } => {
                 if from == ChatParty::Operator {
                     self.on_chat_from_operator(text, ts_ms).await;
@@ -1969,6 +2145,9 @@ impl Session {
     }
 
     async fn teardown(&mut self) {
+        // First thing: the desktop comes back before anything else is torn down.
+        self.release_privacy(PrivacyScreenReason::SessionEnded);
+        self.privacy = None;
         if let Some(stop) = self.cursor_stop.take() {
             stop.store(true, Ordering::Relaxed);
         }

@@ -61,4 +61,10 @@ allow_audio: boolean,
  * Whether operators may draw guidance annotations on the device screen (independent of
  * `allow_input`, so guidance works while control is disabled or paused).
  */
-allow_annotations: boolean, };
+allow_annotations: boolean, 
+/**
+ * Whether operators with `manage` permission may engage the privacy screen (the device's
+ * own displays show a branded notice while the operator works). Off by default: it hides
+ * the operator's actions from the person at the device.
+ */
+allow_privacy_screen: boolean, };

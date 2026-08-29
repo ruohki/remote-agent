@@ -139,6 +139,8 @@ struct Options {
     annotations_available: bool,
     /// Also open the unordered/unreliable `input-fast` channel.
     fast_input: bool,
+    /// The console granted the operator the privacy screen (`manage` permission).
+    privacy_screen_allowed: bool,
 }
 
 impl Default for Options {
@@ -153,6 +155,7 @@ impl Default for Options {
             media: FakeMedia::default(),
             annotations_available: true,
             fast_input: false,
+            privacy_screen_allowed: true,
         }
     }
 }
@@ -315,6 +318,7 @@ impl Harness {
             role: SessionRole::Operator,
             shadow_of: None,
             notify_operator: true,
+            privacy_screen_allowed: opts.privacy_screen_allowed,
         });
 
         // Relay agent → browser signaling; everything else goes to `hub_events`.
@@ -1250,6 +1254,7 @@ async fn help_me_denial_ends_session() {
         role: SessionRole::Operator,
         shadow_of: None,
         notify_operator: true,
+        privacy_screen_allowed: true,
     });
 
     let mut saw_awaiting = false;
@@ -2335,5 +2340,189 @@ async fn annotation_points_scale_from_encoded_picture_to_display() {
         AnnotateEvent::Pointer { point, .. } => assert_eq!(*point, Some((80.0, 60.0))),
         other => panic!("unexpected {other:?}"),
     }
+    h.end().await;
+}
+
+// ─── privacy screen ─────────────────────────────────────────────────────────────────────
+
+/// Wait for `SessionEvent::PrivacyScreen { active, reason }` from the agent.
+async fn wait_privacy_event(
+    rx: &mut mpsc::UnboundedReceiver<AgentToConsole>,
+    want_active: bool,
+    want_reason: protocol::common::PrivacyScreenReason,
+) -> bool {
+    use protocol::agent::SessionEvent;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Some(AgentToConsole::SessionEvent {
+                    event: SessionEvent::PrivacyScreen { active, reason },
+                    ..
+                }) if active == want_active && reason == want_reason => return true,
+                Some(_) => continue,
+                None => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn privacy_screen_is_refused_by_policy_and_by_missing_permission() {
+    use protocol::common::PrivacyScreenReason;
+    use protocol::config::AgentConfig;
+
+    // Policy off (the default) refuses even an operator the console granted.
+    let mut h = Harness::connect(Options::default()).await;
+    next_control(&mut h.control_rx, |m| {
+        matches!(m, ControlMessage::DisplayInfo { .. })
+    })
+    .await;
+    send_json(
+        &h.control_dc,
+        &ControlMessage::SetPrivacyScreen { enabled: true },
+    )
+    .await;
+    next_control(&mut h.control_rx, |m| {
+        matches!(
+            m,
+            ControlMessage::PrivacyScreenDenied {
+                reason: PrivacyScreenReason::Policy
+            }
+        )
+    })
+    .await;
+    h.end().await;
+
+    // Policy on, but the console did not grant this operator `manage`.
+    let mut h = Harness::connect(Options {
+        config: AgentConfig {
+            max_fps: 30,
+            allow_privacy_screen: true,
+            ..AgentConfig::default()
+        },
+        privacy_screen_allowed: false,
+        ..Default::default()
+    })
+    .await;
+    next_control(&mut h.control_rx, |m| {
+        matches!(m, ControlMessage::DisplayInfo { .. })
+    })
+    .await;
+    send_json(
+        &h.control_dc,
+        &ControlMessage::SetPrivacyScreen { enabled: true },
+    )
+    .await;
+    next_control(&mut h.control_rx, |m| {
+        matches!(
+            m,
+            ControlMessage::PrivacyScreenDenied {
+                reason: PrivacyScreenReason::Permission
+            }
+        )
+    })
+    .await;
+    h.end().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn privacy_screen_engages_releases_on_pause_and_locks_after_the_device_user_lifts_it() {
+    use protocol::common::PrivacyScreenReason;
+    use protocol::config::AgentConfig;
+
+    // Debug-only seam: report support and engage without creating windows.
+    std::env::set_var("REMOTE_AGENT_PRIVACY_FAKE", "1");
+    let mut h = Harness::connect(Options {
+        config: AgentConfig {
+            max_fps: 30,
+            allow_privacy_screen: true,
+            ..AgentConfig::default()
+        },
+        ..Default::default()
+    })
+    .await;
+    next_control(&mut h.control_rx, |m| {
+        matches!(m, ControlMessage::DisplayInfo { .. })
+    })
+    .await;
+
+    // The operator engages it; the viewer and the console both hear about it.
+    send_json(
+        &h.control_dc,
+        &ControlMessage::SetPrivacyScreen { enabled: true },
+    )
+    .await;
+    next_control(&mut h.control_rx, |m| {
+        matches!(
+            m,
+            ControlMessage::PrivacyScreen {
+                active: true,
+                reason: PrivacyScreenReason::Operator,
+                locked: false
+            }
+        )
+    })
+    .await;
+    assert!(wait_privacy_event(&mut h.hub_events, true, PrivacyScreenReason::Operator).await);
+
+    // The emergency stop at the device also gives the desktop back — without locking.
+    h.sessions.set_control_paused(true);
+    next_control(&mut h.control_rx, |m| {
+        matches!(
+            m,
+            ControlMessage::PrivacyScreen {
+                active: false,
+                reason: PrivacyScreenReason::ControlPaused,
+                locked: false
+            }
+        )
+    })
+    .await;
+    assert!(wait_privacy_event(&mut h.hub_events, false, PrivacyScreenReason::ControlPaused).await);
+    h.sessions.set_control_paused(false);
+    next_control(&mut h.control_rx, |m| {
+        matches!(m, ControlMessage::ControlPaused { paused: false })
+    })
+    .await;
+
+    // Engage again, then the person at the device lifts it: off for the rest of the session.
+    send_json(
+        &h.control_dc,
+        &ControlMessage::SetPrivacyScreen { enabled: true },
+    )
+    .await;
+    next_control(&mut h.control_rx, |m| {
+        matches!(m, ControlMessage::PrivacyScreen { active: true, .. })
+    })
+    .await;
+    h.sessions.lift_privacy_screen();
+    next_control(&mut h.control_rx, |m| {
+        matches!(
+            m,
+            ControlMessage::PrivacyScreen {
+                active: false,
+                reason: PrivacyScreenReason::DeviceUser,
+                locked: true
+            }
+        )
+    })
+    .await;
+    assert!(wait_privacy_event(&mut h.hub_events, false, PrivacyScreenReason::DeviceUser).await);
+    send_json(
+        &h.control_dc,
+        &ControlMessage::SetPrivacyScreen { enabled: true },
+    )
+    .await;
+    next_control(&mut h.control_rx, |m| {
+        matches!(
+            m,
+            ControlMessage::PrivacyScreenDenied {
+                reason: PrivacyScreenReason::Locked
+            }
+        )
+    })
+    .await;
     h.end().await;
 }

@@ -2,13 +2,14 @@
 import type { ChatParty } from "./ChatParty";
 import type { ClipboardKind } from "./ClipboardKind";
 import type { DisplayInfo } from "./DisplayInfo";
+import type { PrivacyScreenReason } from "./PrivacyScreenReason";
 import type { VideoCodec } from "./VideoCodec";
 
 export type ControlMessage = { "t": "select_display", index: number, } | { "t": "set_active_displays", indices: Array<number>, } | { "t": "set_audio", enabled: boolean, } | { "t": "chat", from: ChatParty, text: string, 
 /**
  * Unix epoch milliseconds.
  */
-ts_ms: bigint, } | { "t": "set_quality", max_fps?: number, max_bitrate_kbps?: number, } | { "t": "request_keyframe" } | { "t": "secure_attention" } | { "t": "clipboard_set", text: string, } | { "t": "display_info", displays: Array<DisplayInfo>, 
+ts_ms: bigint, } | { "t": "set_quality", max_fps?: number, max_bitrate_kbps?: number, } | { "t": "request_keyframe" } | { "t": "secure_attention" } | { "t": "set_privacy_screen", enabled: boolean, } | { "t": "clipboard_set", text: string, } | { "t": "display_info", displays: Array<DisplayInfo>, 
 /**
  * Primary display (the one `select_display` targets).
  */
@@ -44,4 +45,4 @@ pipeline_ms: number, hardware: boolean, } | { "t": "session_ended_by_user" } | {
 /**
  * Width in physical pixels.
  */
-width: number, points: Array<[number, number]>, } | { "t": "annotate_end", id: number, } | { "t": "annotate_pointer", display: number, point?: [number, number], color: string, } | { "t": "annotate_clear" } | { "t": "annotations_disabled" } | { "t": "set_viewport", display: number, width?: number, height?: number, } | { "t": "cursor_shape", id: number, png_base64: string, hotspot_x: number, hotspot_y: number, width: number, height: number, } | { "t": "cursor_position", display: number, x: number, y: number, shape_id: number, visible: boolean, };
+width: number, points: Array<[number, number]>, } | { "t": "annotate_end", id: number, } | { "t": "annotate_pointer", display: number, point?: [number, number], color: string, } | { "t": "annotate_clear" } | { "t": "annotations_disabled" } | { "t": "privacy_screen", active: boolean, reason: PrivacyScreenReason, locked: boolean, } | { "t": "privacy_screen_denied", reason: PrivacyScreenReason, } | { "t": "set_viewport", display: number, width?: number, height?: number, } | { "t": "cursor_shape", id: number, png_base64: string, hotspot_x: number, hotspot_y: number, width: number, height: number, } | { "t": "cursor_position", display: number, x: number, y: number, shape_id: number, visible: boolean, };

@@ -114,6 +114,53 @@ pub enum SessionRole {
     Observer,
 }
 
+/// How completely a device can hide its own displays while an operator works (the
+/// "privacy screen"). Reported in `hello` capabilities; the viewer only offers the control
+/// when it is not `Unsupported`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS, Default)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum PrivacyScreenSupport {
+    /// Not available on this device (platform, OS build, or no UI loop).
+    #[default]
+    Unsupported,
+    /// Displays can be covered; the device's own keyboard and mouse stay live.
+    ScreenOnly,
+    /// Displays covered and local input suppressed (except on OS secure surfaces).
+    Standard,
+}
+
+/// Who or what changed the privacy screen, or why a request was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum PrivacyScreenReason {
+    /// The operator engaged or released it.
+    Operator,
+    /// The person at the device lifted it (it stays off for the rest of the session).
+    DeviceUser,
+    /// Console policy or a local override forbids it.
+    Policy,
+    /// The operator lacks the `manage` permission on this device.
+    Permission,
+    /// This device cannot do it (see [`PrivacyScreenSupport`]).
+    Unsupported,
+    /// The device user lifted it earlier in this session; it cannot be re-engaged.
+    Locked,
+    /// The maximum engagement time elapsed.
+    Timeout,
+    /// The agent's watchdog released it (the session stopped confirming it).
+    Watchdog,
+    /// The set of displays changed; coverage could not be guaranteed.
+    DisplaysChanged,
+    /// Remote control was paused at the device.
+    ControlPaused,
+    /// The session ended or the connection dropped.
+    SessionEnded,
+    /// The screen could not be shown (window creation failed).
+    Failed,
+}
+
 /// Minimal description of the operator shown to the person at the device.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]

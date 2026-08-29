@@ -180,6 +180,37 @@ pub fn configure_bar_hwnd(hwnd: isize) {
     }
 }
 
+/// Make a privacy-screen window a topmost tool window that still takes input and focus
+/// (unlike the overlay, which is click-through and non-activating).
+pub fn configure_privacy_hwnd(hwnd: isize) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, HWND_TOPMOST,
+        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+        WS_EX_TRANSPARENT,
+    };
+    if hwnd == 0 {
+        return;
+    }
+    // SAFETY: plain style bit twiddling on a window we own.
+    unsafe {
+        let h = HWND(hwnd as *mut core::ffi::c_void);
+        let ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+        let add = (WS_EX_TOPMOST.0 | WS_EX_TOOLWINDOW.0) as isize;
+        let remove = (WS_EX_TRANSPARENT.0 | WS_EX_NOACTIVATE.0) as isize;
+        SetWindowLongPtrW(h, GWL_EXSTYLE, (ex | add) & !remove);
+        let _ = SetWindowPos(
+            h,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+}
+
 pub fn exclude_hwnd_from_capture(hwnd: isize) {
     use windows::Win32::UI::WindowsAndMessaging::{
         SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE,

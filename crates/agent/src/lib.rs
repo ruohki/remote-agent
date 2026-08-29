@@ -41,6 +41,7 @@ pub mod enroll;
 pub mod hub;
 pub mod input;
 pub mod platform;
+pub mod privacy;
 pub mod probe;
 pub mod secrets;
 pub mod service;

@@ -29,6 +29,7 @@ fn agent_hello_roundtrip() {
             }],
             input: true,
             clipboard: true,
+            privacy_screen: protocol::common::PrivacyScreenSupport::ScreenOnly,
         },
         logged_in_user: None,
         local_overrides: LocalOverrides::default(),
@@ -60,6 +61,7 @@ fn console_session_request_roundtrip() {
         }],
         role: SessionRole::Operator,
         shadow_of: None,
+        privacy_screen_allowed: true,
         notify_operator: true,
     };
     let json = serde_json::to_string(&msg).unwrap();

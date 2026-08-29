@@ -60,6 +60,38 @@ pub fn configure_overlay_ns_window(ns_window: *mut c_void) {
     });
 }
 
+/// Make a privacy-screen `NSWindow` (tao/wry) an opaque shield: above everything including the
+/// menu bar and full-screen apps on every Space, taking pointer *and* keyboard so nothing
+/// reaches the desktop underneath and `Esc` reaches the page.
+pub fn configure_privacy_ns_window(ns_window: *mut c_void) {
+    if ns_window.is_null() {
+        return;
+    }
+    let addr = ns_window as usize;
+    let _ = run_on_main(move || {
+        // SAFETY: `addr` is a live `NSWindow` created by tao for the process lifetime; main thread.
+        let window: &NSWindow = unsafe { &*(addr as *const NSWindow) };
+        window.setOpaque(true);
+        window.setBackgroundColor(Some(
+            &objc2_app_kit::NSColor::colorWithSRGBRed_green_blue_alpha(
+                10.0 / 255.0,
+                15.0 / 255.0,
+                21.0 / 255.0,
+                1.0,
+            ),
+        ));
+        window.setHasShadow(false);
+        window.setIgnoresMouseEvents(false);
+        window.setCollectionBehavior(
+            NSWindowCollectionBehavior::CanJoinAllSpaces
+                | NSWindowCollectionBehavior::FullScreenAuxiliary
+                | NSWindowCollectionBehavior::Stationary
+                | NSWindowCollectionBehavior::IgnoresCycle,
+        );
+        window.setLevel(objc2_core_graphics::CGShieldingWindowLevel() as isize);
+    });
+}
+
 /// Make the session bar's `NSWindow` a true transparent panel: no opaque backing, clear
 /// background and no system shadow. The shadow matters most: AppKit derives it from the
 /// window's opaque region, which is computed before the web content has painted, so a

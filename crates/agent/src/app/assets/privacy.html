@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="color-scheme" content="dark" />
+    <title>Screen hidden</title>
+    <style>
+      :root {
+        --accent: #3b82f6;
+        --accent-ink: #ffffff;
+        --base: #0a0f15;
+        --plate: rgba(13, 18, 25, 0.78);
+        --ink: #eef2f6;
+        --ink-2: #a9b8c6;
+        --ink-3: #8b9bab;
+        --line: rgba(255, 255, 255, 0.12);
+        --ok: #4ea87c;
+        --warn: #e0a83a;
+        --danger: #e5695b;
+        --u: clamp(10px, 1.1vw, 19px);
+      }
+      * { box-sizing: border-box; }
+      html, body { margin: 0; height: 100%; overflow: hidden; background: var(--base); }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        color: var(--ink); -webkit-user-select: none; user-select: none; cursor: default;
+        font-size: calc(var(--u) * 0.95); line-height: 1.45;
+      }
+      /* ground: the downsampled snapshot (or a synthetic accent field) under a dark veil */
+      .ground { position: absolute; inset: -6%; background-position: center; background-size: cover; background-repeat: no-repeat;
+        background-image:
+          radial-gradient(58% 78% at 24% 22%, color-mix(in srgb, var(--accent) 34%, transparent), transparent 62%),
+          radial-gradient(52% 66% at 78% 72%, color-mix(in srgb, var(--accent) 22%, transparent), transparent 60%),
+          linear-gradient(150deg, #0d131b, #0a0f15 60%);
+        filter: blur(0px); transform: scale(1.06);
+      }
+      .ground.snapshot { filter: blur(calc(var(--u) * 1.4)) saturate(0.85) brightness(0.55); }
+      .veil { position: absolute; inset: 0; background: radial-gradient(120% 120% at 50% 40%, transparent 30%, rgba(0, 0, 0, 0.45)); }
+      /* plate */
+      .plate {
+        position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+        width: min(calc(var(--u) * 48), 92vw); max-height: 94vh; overflow: hidden;
+        background: var(--plate); border: 1px solid var(--line); border-radius: calc(var(--u) * 0.7);
+        padding: calc(var(--u) * 1.5) calc(var(--u) * 1.7) calc(var(--u) * 1.4);
+        box-shadow: 0 24px 60px -24px rgba(0, 0, 0, 0.8);
+        animation: rise 240ms ease-out both;
+      }
+      .plate::before { content: ""; position: absolute; left: 0; right: 0; top: 0; height: 3px; background: linear-gradient(90deg, var(--accent), transparent); }
+      @keyframes rise { from { opacity: 0; transform: translate(-50%, calc(-50% + 6px)); } to { opacity: 1; transform: translate(-50%, -50%); } }
+      @media (prefers-reduced-motion: reduce) { .plate { animation: none; } .dot { animation: none !important; } }
+      .brand { display: flex; align-items: center; gap: calc(var(--u) * 0.7); margin-bottom: calc(var(--u) * 1.1); }
+      .mark { width: calc(var(--u) * 2.2); height: calc(var(--u) * 2.2); border-radius: calc(var(--u) * 0.45); background: var(--accent); color: var(--accent-ink);
+        display: grid; place-items: center; font-weight: 700; font-size: calc(var(--u) * 1.05); flex: 0 0 auto; background-size: contain; background-position: center; background-repeat: no-repeat; }
+      .mark.has-logo { background-color: transparent; color: transparent; }
+      .bn { font-weight: 650; font-size: calc(var(--u) * 1.05); letter-spacing: -0.005em; line-height: 1.2; }
+      .bo { font-size: calc(var(--u) * 0.82); color: var(--ink-2); line-height: 1.2; margin-top: 2px; }
+      .bo:empty { display: none; }
+      .chip { margin-left: auto; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: calc(var(--u) * 0.72); letter-spacing: 0.07em;
+        padding: 3px 7px; border: 1px solid var(--line); border-radius: 4px; color: var(--ink-2); white-space: nowrap; }
+      .chip:empty { display: none; }
+      h1 { font-size: calc(var(--u) * 2.4); font-weight: 650; letter-spacing: -0.02em; margin: 0 0 calc(var(--u) * 0.3); line-height: 1.1; }
+      .lead { color: var(--ink-2); margin: 0 0 calc(var(--u) * 1.1); }
+      .facts { display: grid; grid-template-columns: repeat(3, 1fr); gap: calc(var(--u) * 0.8); padding: calc(var(--u) * 0.9) 0;
+        border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); margin-bottom: calc(var(--u) * 1); }
+      .fk { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: calc(var(--u) * 0.68); letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-3); margin-bottom: 3px; }
+      .fv { font-weight: 500; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .act { display: flex; align-items: center; gap: 7px; color: var(--ink-2); font-size: calc(var(--u) * 0.88); margin-bottom: calc(var(--u) * 1.1); }
+      .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 22%, transparent); flex: 0 0 auto; }
+      body.stale .dot { background: var(--warn); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 22%, transparent); }
+      body.stale .act { color: var(--warn); }
+      .btns { display: flex; gap: calc(var(--u) * 0.6); flex-wrap: wrap; margin-bottom: calc(var(--u) * 0.8); }
+      .btn { font: inherit; font-size: calc(var(--u) * 0.92); font-weight: 500; padding: calc(var(--u) * 0.55) calc(var(--u) * 1); border-radius: calc(var(--u) * 0.35);
+        border: 1px solid transparent; cursor: pointer; color: var(--ink); background: transparent; display: inline-flex; align-items: center; gap: 8px; }
+      .btn.primary { background: var(--accent); color: var(--accent-ink); }
+      .btn.primary:hover { filter: brightness(1.08); }
+      .btn.primary:disabled { opacity: 0.6; cursor: default; filter: none; }
+      .btn.ghost { border-color: rgba(255, 255, 255, 0.24); color: #d6e0ea; }
+      .btn.ghost:hover { background: rgba(255, 255, 255, 0.06); }
+      .btn.danger { border-color: var(--danger); color: var(--danger); }
+      .btn.danger:hover { background: color-mix(in srgb, var(--danger) 14%, transparent); }
+      .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .kbd { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: calc(var(--u) * 0.7); opacity: 0.75; border: 1px solid rgba(255,255,255,0.35); border-radius: 3px; padding: 1px 5px; }
+      .confirm { display: none; align-items: center; gap: 8px; }
+      body.confirming .confirm { display: flex; }
+      body.confirming #reveal, body.confirming #end { display: none; }
+      .confirm .q { color: var(--danger); font-weight: 600; }
+      .hint { min-height: 1.3em; font-size: calc(var(--u) * 0.82); color: var(--ink-3); margin: 0 0 calc(var(--u) * 0.6); }
+      .hint.warn { color: var(--warn); }
+      .guar { font-size: calc(var(--u) * 0.82); color: var(--ink-3); margin: 0; }
+      .supp { font-size: calc(var(--u) * 0.82); color: var(--ink-3); margin: calc(var(--u) * 0.5) 0 0; padding-top: calc(var(--u) * 0.6); border-top: 1px solid rgba(255,255,255,0.09); }
+      .supp:empty { display: none; }
+      @media (max-height: 460px) { .lead, .guar, .supp { display: none; } }
+    </style>
+  </head>
+  <body>
+    <div class="ground" id="ground"></div>
+    <div class="veil"></div>
+    <div class="plate" role="dialog" aria-labelledby="hl">
+      <div class="brand">
+        <div class="mark" id="mark">R</div>
+        <div>
+          <div class="bn" id="bn">Remote Support</div>
+          <div class="bo" id="bo"></div>
+        </div>
+        <span class="chip" id="chip"></span>
+      </div>
+      <h1 id="hl">Screen hidden</h1>
+      <p class="lead">Your desktop is hidden on this monitor while the session runs.</p>
+      <div class="facts">
+        <div><div class="fk">Technician</div><div class="fv" id="tech">Support technician</div></div>
+        <div><div class="fk">Started</div><div class="fv" id="started">--:--</div></div>
+        <div><div class="fk">Elapsed</div><div class="fv" id="elapsed">0:00</div></div>
+      </div>
+      <div class="act"><span class="dot"></span><span id="act">Connected</span></div>
+      <div class="btns">
+        <button class="btn primary" id="reveal">Show screen <span class="kbd">Esc</span></button>
+        <button class="btn danger" id="end">End session</button>
+        <span class="confirm"><span class="q">End session?</span>
+          <button class="btn danger" id="endYes">Confirm</button>
+          <button class="btn ghost" id="endNo">Cancel</button></span>
+      </div>
+      <p class="hint" id="hint"></p>
+      <p class="guar">Only you can lift this screen. The technician cannot.</p>
+      <p class="supp" id="supp"></p>
+    </div>
+    <script>
+      (function () {
+        var DISPLAY = __DISPLAY__;
+        function ipc(o) { try { window.ipc.postMessage(JSON.stringify(o)); } catch (e) {} }
+        var startedMs = 0, lastSignal = Date.now(), pending = null, confirmTimer = null;
+        function pad(n) { return String(n).padStart(2, '0'); }
+        function fmt(ms) { var s = Math.max(0, Math.floor(ms / 1000)); var m = Math.floor(s / 60); var h = Math.floor(m / 60);
+          return (h ? h + ':' + pad(m % 60) : m) + ':' + pad(s % 60); }
+        function clock(ms) { var d = new Date(ms); return pad(d.getHours()) + ':' + pad(d.getMinutes()); }
+        setInterval(function () {
+          if (startedMs) document.getElementById('elapsed').textContent = fmt(Date.now() - startedMs);
+          var stale = Date.now() - lastSignal > 15000;
+          document.body.classList.toggle('stale', stale);
+          document.getElementById('act').textContent = stale ? 'No signal' : 'Connected';
+        }, 1000);
+        function setConfirming(on) {
+          document.body.classList.toggle('confirming', on);
+          if (confirmTimer) { clearTimeout(confirmTimer); confirmTimer = null; }
+          if (on) confirmTimer = setTimeout(function () { setConfirming(false); }, 6000);
+        }
+        function reveal() {
+          if (pending) return;
+          var b = document.getElementById('reveal'); b.disabled = true; b.firstChild.textContent = 'Showing screen ';
+          document.getElementById('hint').textContent = 'Waiting for the agent…'; document.getElementById('hint').className = 'hint';
+          ipc({ type: 'reveal' });
+          pending = setTimeout(function () {
+            pending = null; b.disabled = false; b.firstChild.textContent = 'Show screen ';
+            var h = document.getElementById('hint'); h.textContent = 'No response. Press Esc again, or end the session.'; h.className = 'hint warn';
+          }, 3000);
+        }
+        document.getElementById('reveal').addEventListener('click', reveal);
+        document.getElementById('end').addEventListener('click', function () { setConfirming(true); });
+        document.getElementById('endNo').addEventListener('click', function () { setConfirming(false); });
+        document.getElementById('endYes').addEventListener('click', function () { setConfirming(false); ipc({ type: 'end' }); });
+        window.addEventListener('keydown', function (e) { if (e.key === 'Escape') { e.preventDefault(); if (document.body.classList.contains('confirming')) setConfirming(false); else reveal(); } });
+        window.__privacy = {
+          set: function (s) {
+            if (s.accent) document.documentElement.style.setProperty('--accent', s.accent);
+            if (s.product) { document.getElementById('bn').textContent = s.product; document.getElementById('mark').textContent = s.product.slice(0, 1).toUpperCase(); document.title = s.product + ' — screen hidden'; }
+            document.getElementById('bo').textContent = s.organization || '';
+            var mark = document.getElementById('mark');
+            var ok = typeof s.logo === 'string' && /^[A-Za-z0-9+/=\s]+$/.test(s.logo) && s.logo.length > 16;
+            mark.style.backgroundImage = ok ? 'url(data:image/png;base64,' + s.logo + ')' : '';
+            mark.classList.toggle('has-logo', ok);
+            document.getElementById('tech').textContent = s.operator || 'Support technician';
+            if (s.started_ms) { startedMs = s.started_ms; document.getElementById('started').textContent = clock(s.started_ms); }
+            var d = s.display || {}; document.getElementById('chip').textContent = d.count > 1 ? 'Display ' + (d.index + 1) + ' of ' + d.count : '';
+            document.getElementById('supp').textContent = s.support_text || '';
+            var g = document.getElementById('ground');
+            if (typeof s.backdrop === 'string' && /^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(s.backdrop)) { g.style.backgroundImage = 'url(' + s.backdrop + ')'; g.classList.add('snapshot'); }
+            else { g.style.backgroundImage = ''; g.classList.remove('snapshot'); }
+            lastSignal = Date.now();
+          },
+          heartbeat: function () { lastSignal = Date.now(); }
+        };
+        ipc({ type: 'ready', display: DISPLAY });
+      })();
+    </script>
+  </body>
+</html>

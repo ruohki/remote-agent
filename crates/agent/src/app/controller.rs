@@ -2,6 +2,7 @@
 
 use super::annotate::OverlayManager;
 use super::bar::{BarIpc, SessionBar};
+use super::privacy::PrivacyManager;
 use super::{
     branding_json, dispatch_connect, dispatch_disconnect, dispatch_send, key_fingerprint,
     request_reenroll, set_proxy, AppEvent, AppOptions, ConnectRequest, ConnectUi,
@@ -75,6 +76,8 @@ struct Controller {
     bar: Option<SessionBar>,
     /// Operator annotation overlays (one per display, lazily created).
     overlays: OverlayManager,
+    /// Privacy-screen windows (one per display while engaged).
+    privacy: PrivacyManager,
     location: crate::platform::ExeLocation,
     end_item: MenuItem,
     chat_item: MenuItem,
@@ -201,6 +204,9 @@ impl Controller {
                 if self.overlays.clear_all() {
                     self.eval("window.__app.setAnnotations(false);".into());
                 }
+                // Belt and braces: the guard releases the screen itself, but a session that
+                // ends must never leave a window up.
+                self.privacy.disengage(crate::privacy::no_confirm());
                 self.end_item.set_enabled(false);
                 self.chat_item.set_enabled(false);
                 self.refresh_tooltip();
@@ -287,6 +293,14 @@ impl Controller {
                 }
             }
             AppEvent::OverlayReady => { /* routed per window below */ }
+            AppEvent::PrivacyEngage {
+                info,
+                displays,
+                confirm,
+            } => self.privacy.engage(target, info, displays, confirm),
+            AppEvent::PrivacyDisengage { confirm } => self.privacy.disengage(confirm),
+            AppEvent::PrivacyHeartbeat => self.privacy.heartbeat(),
+            AppEvent::Privacy(msg) => self.privacy.on_ipc(msg),
             AppEvent::MoveResult { ok, message } => {
                 self.eval(format!(
                     "window.__app.moveResult({},{});",
@@ -451,6 +465,7 @@ impl Controller {
         if let Some(bar) = self.bar.as_mut() {
             bar.rebrand();
         }
+        self.privacy.rebrand();
         apply_tray_icon(&self.tray);
         apply_app_icons(&self.window);
     }
@@ -675,6 +690,7 @@ fn build_and_run(work: impl FnOnce() -> i32 + Send + 'static, opts: AppOptions) 
         connect_progress: None,
         bar: None,
         overlays: OverlayManager::default(),
+        privacy: PrivacyManager::default(),
         location: crate::platform::exe_location(),
         end_item,
         chat_item,
@@ -733,8 +749,11 @@ fn build_and_run(work: impl FnOnce() -> i32 + Send + 'static, opts: AppOptions) 
                 ..
             } => {
                 let is_bar = controller.bar.as_ref().map(|b| b.window_id()) == Some(window_id);
-                if is_bar || controller.overlays.owns(window_id) {
-                    // The bar and the overlays have no close control; ignore.
+                if is_bar
+                    || controller.overlays.owns(window_id)
+                    || controller.privacy.owns(window_id)
+                {
+                    // The bar, the overlays and the privacy screen have no close control; ignore.
                 } else {
                     // Close hides the window; the session keeps running.
                     controller.hide(target);
@@ -812,6 +831,8 @@ struct UiOverrides {
     allow_file_transfer: bool,
     #[serde(default = "default_true")]
     allow_annotations: bool,
+    #[serde(default = "default_true")]
+    allow_privacy_screen: bool,
 }
 
 fn default_true() -> bool {
@@ -832,6 +853,7 @@ impl UiOverrides {
             allow_clipboard: restrict(self.allow_clipboard),
             allow_file_transfer: restrict(self.allow_file_transfer),
             allow_annotations: restrict(self.allow_annotations),
+            allow_privacy_screen: restrict(self.allow_privacy_screen),
         }
     }
 }

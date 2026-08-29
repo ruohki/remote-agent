@@ -6,6 +6,7 @@ import type { DisplayInfo } from "./DisplayInfo";
 import type { GroupRef } from "./GroupRef";
 import type { LocalOverrides } from "./LocalOverrides";
 import type { Os } from "./Os";
+import type { PrivacyScreenSupport } from "./PrivacyScreenSupport";
 import type { VideoCodec } from "./VideoCodec";
 
 /**
@@ -31,4 +32,8 @@ permission: DevicePermission,
 /**
  * Restrictions the person at the device applied locally (tighten-only).
  */
-local_overrides: LocalOverrides, };
+local_overrides: LocalOverrides, 
+/**
+ * Whether the agent can hide the device's displays (from its `hello` capabilities).
+ */
+privacy_screen: PrivacyScreenSupport, };

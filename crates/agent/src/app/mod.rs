@@ -16,6 +16,7 @@
 mod annotate;
 mod bar;
 mod controller;
+mod privacy;
 
 use crate::approval::{Indicator, IndicatorHandle};
 use crate::chat::{ChatHandle, ChatLine, ChatUi};
@@ -101,6 +102,21 @@ pub enum AppEvent {
     /// Internal: an overlay page finished loading.
     #[doc(hidden)]
     OverlayReady,
+    /// Privacy screen: create the windows (from `privacy::PrivacyGuard::engage`); confirmed
+    /// once every page is up, or with the failure.
+    PrivacyEngage {
+        info: crate::privacy::PrivacyScreenInfo,
+        displays: Vec<protocol::common::DisplayInfo>,
+        confirm: crate::privacy::Confirm<Result<(), String>>,
+    },
+    /// Privacy screen: remove the windows. Always confirmed.
+    PrivacyDisengage {
+        confirm: crate::privacy::Confirm<()>,
+    },
+    /// The session is alive (the privacy pages show "No signal" without it).
+    PrivacyHeartbeat,
+    /// Messages from a privacy page (`Show screen`, `End session`, ready).
+    Privacy(privacy::PrivacyIpc),
     /// Connect screen (first-run enrollment) state.
     Connect(ConnectUi),
     /// Reply to the Connect screen's inline URL check.
@@ -164,6 +180,10 @@ type PauseCb = Arc<dyn Fn(bool) + Send + Sync>;
 static PAUSE_CB: parking_lot::Mutex<Option<PauseCb>> = parking_lot::Mutex::new(None);
 /// Receives Connect-screen submissions while enrollment is pending (set by `startup`).
 static CONNECT_CB: parking_lot::Mutex<Option<ConnectCb>> = parking_lot::Mutex::new(None);
+/// The person at the device lifted the privacy screen (page button / Esc). Set by the hub.
+type PrivacyRevealCb = Arc<dyn Fn() + Send + Sync>;
+static PRIVACY_REVEAL_CB: parking_lot::Mutex<Option<PrivacyRevealCb>> =
+    parking_lot::Mutex::new(None);
 /// "Enroll again" from Settings: wakes the hub, which drops the identity and returns.
 static REENROLL: tokio::sync::Notify = tokio::sync::Notify::const_new();
 static PROXY: OnceLock<parking_lot::Mutex<Option<Proxy>>> = OnceLock::new();
@@ -228,6 +248,51 @@ fn dispatch_pause(paused: bool) {
 /// The session reports its pause state so the bar and the window render it.
 pub fn set_control_paused_state(paused: bool) {
     post(AppEvent::ControlPaused { paused });
+}
+
+/// Register the handler for "Show screen" on the privacy pages (lifts the privacy screen).
+pub fn set_privacy_reveal_handler(cb: PrivacyRevealCb) {
+    *PRIVACY_REVEAL_CB.lock() = Some(cb);
+}
+
+fn dispatch_privacy_reveal() {
+    let cb = PRIVACY_REVEAL_CB.lock().clone();
+    match cb {
+        Some(cb) => cb(),
+        None => tracing::warn!("privacy screen reveal with no session handler"),
+    }
+}
+
+/// Show the privacy screen on `displays`. Confirmed on the UI thread once every window is up;
+/// fails at once when no UI loop is running.
+pub fn engage_privacy(
+    info: crate::privacy::PrivacyScreenInfo,
+    displays: Vec<protocol::common::DisplayInfo>,
+    confirm: crate::privacy::Confirm<Result<(), String>>,
+) {
+    if !is_running() {
+        crate::privacy::confirm(&confirm, Err("no UI loop".into()));
+        return;
+    }
+    post(AppEvent::PrivacyEngage {
+        info,
+        displays,
+        confirm,
+    });
+}
+
+/// Remove the privacy screen. Confirmed on the UI thread (at once when no loop is running).
+pub fn disengage_privacy(confirm: crate::privacy::Confirm<()>) {
+    if !is_running() {
+        crate::privacy::confirm(&confirm, ());
+        return;
+    }
+    post(AppEvent::PrivacyDisengage { confirm });
+}
+
+/// The session is alive: keep the privacy pages' liveness indicator green.
+pub fn privacy_heartbeat() {
+    post(AppEvent::PrivacyHeartbeat);
 }
 
 /// Called from the webview IPC when the local user changes the restrictions.

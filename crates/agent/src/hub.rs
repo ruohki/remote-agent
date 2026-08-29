@@ -146,6 +146,7 @@ impl AgentState {
                 "allow_clipboard": console.allow_clipboard,
                 "allow_file_transfer": console.allow_file_transfer,
                 "allow_annotations": console.allow_annotations,
+                "allow_privacy_screen": console.allow_privacy_screen,
             },
             "overrides": overrides,
             "effective": {
@@ -155,6 +156,7 @@ impl AgentState {
                 "allow_clipboard": effective.allow_clipboard,
                 "allow_file_transfer": effective.allow_file_transfer,
                 "allow_annotations": effective.allow_annotations,
+                "allow_privacy_screen": effective.allow_privacy_screen,
             },
         })
         .to_string()
@@ -260,6 +262,10 @@ pub async fn run_agent(paths: Paths) -> Result<()> {
         let sessions_for_pause = Arc::clone(&sessions);
         crate::app::set_pause_handler(Arc::new(move |paused| {
             sessions_for_pause.set_control_paused(paused)
+        }));
+        let sessions_for_privacy = Arc::clone(&sessions);
+        crate::app::set_privacy_reveal_handler(Arc::new(move || {
+            sessions_for_privacy.lift_privacy_screen()
         }));
         crate::app::set_device_info(&config.read().display_name, &local.device_id);
         crate::app::set_console_url(&local.server_url);
@@ -397,6 +403,7 @@ async fn connect_once(
             displays,
             input: true,
             clipboard: true,
+            privacy_screen: crate::privacy::support(),
         },
         logged_in_user: crate::platform::logged_in_user(),
         local_overrides: state.overrides.read().clone(),
@@ -549,6 +556,7 @@ where
             role,
             shadow_of,
             notify_operator,
+            privacy_screen_allowed,
             ..
         } => {
             sessions.start(SessionRequest {
@@ -559,6 +567,7 @@ where
                 role,
                 shadow_of,
                 notify_operator,
+                privacy_screen_allowed,
             });
         }
         ConsoleToAgent::IceCandidate {

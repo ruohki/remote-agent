@@ -42,6 +42,11 @@ pub struct AgentConfig {
     /// `allow_input`, so guidance works while control is disabled or paused).
     #[serde(default = "default_true")]
     pub allow_annotations: bool,
+    /// Whether operators with `manage` permission may engage the privacy screen (the device's
+    /// own displays show a branded notice while the operator works). Off by default: it hides
+    /// the operator's actions from the person at the device.
+    #[serde(default)]
+    pub allow_privacy_screen: bool,
 }
 
 fn default_true() -> bool {
@@ -69,6 +74,7 @@ impl Default for AgentConfig {
             transfer_dir: None,
             allow_audio: true,
             allow_annotations: true,
+            allow_privacy_screen: false,
         }
     }
 }
@@ -100,6 +106,9 @@ pub struct LocalOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub allow_annotations: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub allow_privacy_screen: Option<bool>,
 }
 
 impl LocalOverrides {
@@ -126,6 +135,9 @@ impl LocalOverrides {
         }
         if self.allow_annotations == Some(false) {
             cfg.allow_annotations = false;
+        }
+        if self.allow_privacy_screen == Some(false) {
+            cfg.allow_privacy_screen = false;
         }
         cfg
     }

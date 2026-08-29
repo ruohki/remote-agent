@@ -71,6 +71,9 @@ pub struct DeviceSummary {
     /// Restrictions the person at the device applied locally (tighten-only).
     #[serde(default)]
     pub local_overrides: crate::config::LocalOverrides,
+    /// Whether the agent can hide the device's displays (from its `hello` capabilities).
+    #[serde(default)]
+    pub privacy_screen: crate::common::PrivacyScreenSupport,
 }
 
 /// Session row as shown in the console.

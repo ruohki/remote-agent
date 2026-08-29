@@ -67,6 +67,18 @@ Two repositories:
   returns; the process exits with code 0 and the service manager restarts it where configured.
   Quit has a 6 s backstop. Windows `TerminateProcess` from the service supervisor bypasses all of
   this (known gap). Release builds use `panic = "abort"`, so none of it relies on destructors.
+* **Privacy screen** (`privacy.rs` + `app/privacy.rs`): on `set_privacy_screen` the device's
+  displays show a branded "Screen hidden" page (one opaque, focused, capture-excluded window per
+  display; a heavily downsampled snapshot of the desktop as backdrop) while the operator keeps
+  seeing the desktop. Gates, all agent-side: `AgentConfig.allow_privacy_screen` (console policy,
+  default off, tightenable locally), `SessionRequest.privacy_screen_allowed` (the console's
+  `manage` check), device support (`hello.capabilities.privacy_screen`), not control-paused, not
+  lifted by the device user earlier in the session. The guarantee that it comes back lives in
+  `privacy::PrivacyGuard`: a dedicated OS thread releases on missed keepalives (5 s), the hard cap
+  (30 min) or a display change; releases also fire on session end, control-channel close, the
+  pause switch, policy tightening and shutdown; if the UI thread does not confirm a release within
+  10 s the process aborts so the supervisor restarts it with the desktop visible. The person at
+  the device lifts it with *Show screen* / `Esc`; after that it stays off for the session.
 * **`remote-agent privacy-probe`** (hidden): measures on the running machine whether the
   agent's own windows — and the window configurations a privacy screen would use — stay out of
   the capture the operator sees, by painting sentinel windows and reading them back through the
