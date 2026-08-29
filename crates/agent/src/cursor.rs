@@ -96,6 +96,8 @@ struct Pacer {
     displays: Vec<DisplayInfo>,
     last_pos: Option<(u32, i32, i32, bool)>,
     shape_id: u32,
+    /// Display scale the current shape was emitted for; a different scale re-emits it.
+    shape_scale: f64,
     ticks: u32,
 }
 
@@ -105,8 +107,22 @@ impl Pacer {
             displays,
             last_pos: None,
             shape_id: 0,
+            shape_scale: 0.0,
             ticks: 0,
         }
+    }
+
+    /// Scale factor of the display the cursor was last seen on (primary display before the
+    /// first position, `1.0` without displays).
+    fn current_scale(&self) -> f64 {
+        let idx = self.last_pos.map(|p| p.0);
+        self.displays
+            .iter()
+            .find(|d| Some(d.index) == idx)
+            .or_else(|| self.displays.iter().find(|d| d.primary))
+            .or_else(|| self.displays.first())
+            .map(|d| if d.scale > 0.0 { d.scale as f64 } else { 1.0 })
+            .unwrap_or(1.0)
     }
 
     fn position_update(&mut self, global: Option<(f64, f64)>) -> Option<CursorUpdate> {
@@ -135,20 +151,31 @@ impl Pacer {
         self.ticks % (POSITION_HZ / SHAPE_HZ).max(1) == 1
     }
 
-    fn shape_update(&mut self, png: Vec<u8>, hotspot: (u32, u32)) -> Option<CursorUpdate> {
+    /// `hotspot` and `size` are the cursor's logical geometry (points); both are reported in
+    /// physical pixels of the display (`scale`) so the browser can size the image with the
+    /// picture regardless of the PNG's own pixel density.
+    fn shape_update(
+        &mut self,
+        png: Vec<u8>,
+        hotspot: (f64, f64),
+        size: (f64, f64),
+        scale: f64,
+    ) -> Option<CursorUpdate> {
         let id = shape_id(&png);
-        if id == self.shape_id {
+        if id == self.shape_id && scale == self.shape_scale {
             return None;
         }
-        let (width, height) = png_size(&png)?;
+        png_size(&png)?;
         self.shape_id = id;
+        self.shape_scale = scale;
+        let px = |v: f64| (v * scale).round().max(0.0) as u32;
         Some(CursorUpdate::Shape {
             id,
             png,
-            hotspot_x: hotspot.0,
-            hotspot_y: hotspot.1,
-            width,
-            height,
+            hotspot_x: px(hotspot.0),
+            hotspot_y: px(hotspot.1),
+            width: px(size.0).max(1),
+            height: px(size.1).max(1),
         })
     }
 }
@@ -190,8 +217,8 @@ mod macos {
         Some((p.x, p.y))
     }
 
-    /// Current system cursor as PNG plus its hotspot in image pixels (main thread).
-    fn current_shape() -> Option<(Vec<u8>, (u32, u32))> {
+    /// Current system cursor as PNG plus its hotspot and size in points (main thread).
+    fn current_shape() -> Option<(Vec<u8>, (f64, f64), (f64, f64))> {
         crate::platform::run_on_main(|| {
             // Deprecated by Apple but still the only public way to read the *system*
             // cursor (`currentCursor` only knows this app's own cursor).
@@ -207,20 +234,7 @@ mod macos {
             let png = unsafe {
                 rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &props)
             }?;
-            let bytes = png.to_vec();
-            let (pw, _) = png_size(&bytes)?;
-            let scale = if size.width > 0.0 {
-                pw as f64 / size.width
-            } else {
-                1.0
-            };
-            Some((
-                bytes,
-                (
-                    (hot.x * scale).round().max(0.0) as u32,
-                    (hot.y * scale).round().max(0.0) as u32,
-                ),
-            ))
+            Some((png.to_vec(), (hot.x, hot.y), (size.width, size.height)))
         })
         .ok()
         .flatten()
@@ -241,8 +255,9 @@ mod macos {
             }
             self.next_tick = Instant::now() + Duration::from_secs_f64(1.0 / POSITION_HZ as f64);
             if self.shapes && self.pacer.shape_due() {
-                if let Some((png, hot)) = current_shape() {
-                    if let Some(u) = self.pacer.shape_update(png, hot) {
+                if let Some((png, hot, size)) = current_shape() {
+                    let scale = self.pacer.current_scale();
+                    if let Some(u) = self.pacer.shape_update(png, hot, size, scale) {
                         self.queue.push_back(u);
                     }
                 }
@@ -341,7 +356,8 @@ mod windows {
     }
 
     /// Current cursor as PNG + hotspot; `None` when unchanged (`last_handle`).
-    fn current_shape(last_handle: &mut isize) -> Option<(Vec<u8>, (u32, u32))> {
+    /// Cursor bitmaps are already in physical pixels, so the size is reported with scale 1.
+    fn current_shape(last_handle: &mut isize) -> Option<(Vec<u8>, (f64, f64), (f64, f64))> {
         let mut info = CURSORINFO {
             cbSize: std::mem::size_of::<CURSORINFO>() as u32,
             ..Default::default()
@@ -406,7 +422,11 @@ mod windows {
             px.swap(0, 2);
         }
         let png = crate::branding::encode_png(&crate::branding::Rgba::from_rgba(w, h, bgra));
-        Some((png, (icon.xHotspot, icon.yHotspot)))
+        Some((
+            png,
+            (icon.xHotspot as f64, icon.yHotspot as f64),
+            (w as f64, h as f64),
+        ))
     }
 
     impl CursorSource for WinCursor {
@@ -424,8 +444,8 @@ mod windows {
             }
             self.next_tick = Instant::now() + Duration::from_secs_f64(1.0 / POSITION_HZ as f64);
             if self.pacer.shape_due() {
-                if let Some((png, hot)) = current_shape(&mut self.last_handle) {
-                    if let Some(u) = self.pacer.shape_update(png, hot) {
+                if let Some((png, hot, size)) = current_shape(&mut self.last_handle) {
+                    if let Some(u) = self.pacer.shape_update(png, hot, size, 1.0) {
                         self.queue.push_back(u);
                     }
                 }
@@ -504,7 +524,7 @@ mod tests {
         let mut p = Pacer::new(displays());
         let png = crate::branding::encode_png(&crate::branding::Rgba::new(4, 4));
         assert!(matches!(
-            p.shape_update(png.clone(), (1, 2)),
+            p.shape_update(png.clone(), (1.0, 2.0), (4.0, 4.0), 1.0),
             Some(CursorUpdate::Shape {
                 width: 4,
                 height: 4,
@@ -513,7 +533,39 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(p.shape_update(png, (1, 2)), None);
+        assert_eq!(p.shape_update(png, (1.0, 2.0), (4.0, 4.0), 1.0), None);
         assert_eq!(png_size(b"nope"), None);
+    }
+
+    #[test]
+    fn shape_geometry_follows_the_display_scale() {
+        let mut p = Pacer::new(displays());
+        // Before any position: the primary (Retina) display's scale applies.
+        assert_eq!(p.current_scale(), 2.0);
+        let png = crate::branding::encode_png(&crate::branding::Rgba::new(32, 32));
+        assert!(matches!(
+            p.shape_update(png.clone(), (4.0, 2.0), (16.0, 16.0), p.current_scale()),
+            Some(CursorUpdate::Shape {
+                width: 32,
+                height: 32,
+                hotspot_x: 8,
+                hotspot_y: 4,
+                ..
+            })
+        ));
+        // Moving to the 1× display re-emits the same shape at its native size.
+        p.position_update(Some((1500.0, 100.0)));
+        assert_eq!(p.current_scale(), 1.0);
+        assert!(matches!(
+            p.shape_update(png.clone(), (4.0, 2.0), (16.0, 16.0), p.current_scale()),
+            Some(CursorUpdate::Shape {
+                width: 16,
+                height: 16,
+                hotspot_x: 4,
+                hotspot_y: 2,
+                ..
+            })
+        ));
+        assert_eq!(p.shape_update(png, (4.0, 2.0), (16.0, 16.0), 1.0), None);
     }
 }
