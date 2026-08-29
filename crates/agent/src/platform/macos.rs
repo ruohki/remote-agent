@@ -1183,7 +1183,8 @@ define_class!(
 
         #[unsafe(method(quit:))]
         fn quit(&self, _sender: Option<&AnyObject>) {
-            std::process::exit(0);
+            // End the session cleanly first; the worker exits the process when done.
+            crate::shutdown::quit("menu bar quit");
         }
     }
 

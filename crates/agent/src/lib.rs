@@ -20,6 +20,8 @@
 //! * [`audio`]    — system audio capture + Opus encoding
 //! * [`service`]  — launchd / Windows service integration
 //! * [`platform`] — misc OS helpers (logged-in user, permissions, main-thread dispatch)
+//! * [`shutdown`] — one place every stop request (signals, Quit, updater) arrives at
+//! * [`probe`]    — `privacy-probe`: measures whether this agent's windows stay out of the capture
 
 pub mod annotate;
 pub mod app;
@@ -39,9 +41,11 @@ pub mod enroll;
 pub mod hub;
 pub mod input;
 pub mod platform;
+pub mod probe;
 pub mod secrets;
 pub mod service;
 pub mod session;
+pub mod shutdown;
 pub mod startup;
 pub mod transfer;
 pub mod transport;

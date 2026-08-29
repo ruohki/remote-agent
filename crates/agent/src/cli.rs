@@ -51,6 +51,20 @@ pub enum Command {
     Doctor,
     /// Remove enrollment and local state (does not uninstall the service).
     Reset,
+    /// Measure whether this agent's own windows (and a would-be privacy screen) stay out of
+    /// the screen capture on this machine. Field diagnostic; shows test windows briefly.
+    #[command(hide = true)]
+    PrivacyProbe {
+        /// Only probe this display index (default: every display).
+        #[arg(long)]
+        display: Option<u32>,
+        /// Print the report as JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+        /// Skip the tests that show the real session bar and annotation overlay.
+        #[arg(long)]
+        skip_app: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -97,6 +111,18 @@ pub fn run() -> Result<()> {
         Some(Command::Status) => crate::config::print_status(&paths),
         Some(Command::Doctor) => crate::platform::doctor(&paths),
         Some(Command::Reset) => crate::config::reset(&paths),
+        Some(Command::PrivacyProbe {
+            display,
+            json,
+            skip_app,
+        }) => crate::probe::run_in_app(
+            &paths,
+            crate::probe::ProbeOptions {
+                display,
+                json,
+                skip_app,
+            },
+        ),
     }
 }
 
@@ -137,9 +163,17 @@ fn run_in_app(paths: &crate::config::Paths, app_mode: bool) -> Result<()> {
 pub fn run_agent_blocking(paths: &crate::config::Paths) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
+        crate::shutdown::install_handlers();
         let mut notice = None;
         loop {
-            crate::startup::ensure_enrolled(paths, notice.take()).await?;
+            // The Connect screen can wait forever; a stop request must not.
+            tokio::select! {
+                r = crate::startup::ensure_enrolled(paths, notice.take()) => r?,
+                _ = crate::shutdown::wait() => {
+                    tracing::info!("shutting down before enrollment completed");
+                    return Ok(());
+                }
+            }
             match crate::hub::run_agent(paths.clone()).await {
                 Err(e) if e.is::<crate::hub::Reenroll>() && crate::app::is_running() => {
                     tracing::warn!("{e:#}; returning to the Connect screen");

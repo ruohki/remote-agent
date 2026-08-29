@@ -59,6 +59,19 @@ impl std::fmt::Display for Reenroll {
 
 impl std::error::Error for Reenroll {}
 
+/// A process shutdown was requested (signal, Quit, update): the connection was closed cleanly
+/// and `run_agent` must not reconnect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShuttingDown;
+
+impl std::fmt::Display for ShuttingDown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "shutting down")
+    }
+}
+
+impl std::error::Error for ShuttingDown {}
+
 /// Close codes `/ws/agent` uses when the device identity is no longer valid
 /// (4401 bad credentials, 4409 device deleted).
 fn close_code_means_reenroll(code: u16) -> bool {
@@ -317,6 +330,16 @@ pub async fn run_agent(paths: Paths) -> Result<()> {
                 branding_task.abort();
                 return Err(e);
             }
+            // Stop requested: `connect_once` already ended the session and closed the socket
+            // (or never got to connect). Do not reconnect.
+            Err(e) if e.is::<ShuttingDown>() => {
+                sessions.end_all(EndReason::AgentOffline);
+                sessions.wait_idle(crate::shutdown::SESSION_END_GRACE).await;
+                crate::app::set_console_status(false);
+                branding_task.abort();
+                tracing::info!(reason = ?crate::shutdown::reason(), "agent stopped");
+                return Ok(());
+            }
             Err(e) => {
                 tracing::warn!("hub connection error: {e:#}");
             }
@@ -325,7 +348,15 @@ pub async fn run_agent(paths: Paths) -> Result<()> {
         sessions.end_all(EndReason::AgentOffline);
         crate::app::set_console_status(false);
         let jitter = Duration::from_millis(rand::random::<u64>() % 500);
-        tokio::time::sleep(backoff + jitter).await;
+        tokio::select! {
+            _ = tokio::time::sleep(backoff + jitter) => {}
+            _ = crate::shutdown::wait() => {
+                sessions.wait_idle(crate::shutdown::SESSION_END_GRACE).await;
+                branding_task.abort();
+                tracing::info!(reason = ?crate::shutdown::reason(), "agent stopped while offline");
+                return Ok(());
+            }
+        }
         backoff = (backoff * 2).min(Duration::from_secs(60));
     }
 }
@@ -341,7 +372,10 @@ async fn connect_once(
 ) -> Result<()> {
     let ws_url = ws_url(&local.server_url)?;
     tracing::info!(%ws_url, "connecting to console");
-    let (ws, _resp) = crate::transport::ws_connect(&ws_url).await?;
+    let (ws, _resp) = tokio::select! {
+        r = crate::transport::ws_connect(&ws_url) => r?,
+        _ = crate::shutdown::wait() => return Err(ShuttingDown.into()),
+    };
     let (mut write, mut read) = ws.split();
 
     // ── hello ──────────────────────────────────────────────────────────────────────
@@ -374,11 +408,18 @@ async fn connect_once(
         .context("sending hello")?;
 
     // ── wait for hello_ack ───────────────────────────────────────────────────────────
-    let ack = tokio::time::timeout(Duration::from_secs(15), read.next())
-        .await
-        .context("timed out waiting for hello_ack")?
-        .context("connection closed before hello_ack")?
-        .context("reading hello_ack")?;
+    let ack = tokio::select! {
+        // Prefer the ack when both are ready: nothing is lost by taking the normal path.
+        biased;
+        r = tokio::time::timeout(Duration::from_secs(15), read.next()) => r
+            .context("timed out waiting for hello_ack")?
+            .context("connection closed before hello_ack")?
+            .context("reading hello_ack")?,
+        _ = crate::shutdown::wait() => {
+            let _ = write.send(Message::Close(Some(close_frame()))).await;
+            return Err(ShuttingDown.into());
+        }
+    };
     if let Message::Close(frame) = &ack {
         let (code, reason) = frame
             .as_ref()
@@ -449,6 +490,11 @@ async fn connect_once(
             _ = heartbeat.tick() => {
                 let hb = build_heartbeat(state);
                 write.send(Message::text(serde_json::to_string(&hb)?)).await.context("heartbeat")?;
+            }
+            // Stop requested: end the session, let it say goodbye, close the socket.
+            _ = crate::shutdown::wait() => {
+                graceful_close(sessions, &mut write, out_rx).await;
+                return Err(ShuttingDown.into());
             }
             // Inbound: console → agent.
             frame = read.next() => {
@@ -543,8 +589,9 @@ where
             match crate::updater::apply_update(&version, &url, &sha256).await {
                 Ok(()) => {
                     tracing::info!("update applied; restarting");
-                    // The service manager restarts us; just exit cleanly.
-                    std::process::exit(0);
+                    // Clean shutdown (session ended, socket closed); the service manager
+                    // restarts us.
+                    crate::shutdown::request("update applied");
                 }
                 Err(e) => tracing::error!("update failed: {e:#}"),
             }
@@ -558,6 +605,74 @@ where
         }
     }
     Ok(false)
+}
+
+/// A stop was requested while connected: end the active session, forward what it still has
+/// to say (its `session_state: ended` above all), then close the socket. Bounded by
+/// [`crate::shutdown::SESSION_END_GRACE`] so a wedged session cannot hold the process.
+async fn graceful_close<W>(
+    sessions: &Arc<SessionManager>,
+    write: &mut W,
+    out_rx: &mut mpsc::UnboundedReceiver<AgentToConsole>,
+) where
+    W: SinkExt<Message> + Unpin,
+    <W as futures_util::Sink<Message>>::Error: std::fmt::Display,
+{
+    let had_session = sessions.active_session_id().is_some();
+    sessions.end_all(EndReason::AgentOffline);
+    let grace = if had_session {
+        crate::shutdown::SESSION_END_GRACE
+    } else {
+        Duration::from_millis(200)
+    };
+    let idle = sessions.wait_idle(grace);
+    tokio::pin!(idle);
+    loop {
+        tokio::select! {
+            msg = out_rx.recv() => match msg {
+                Some(msg) => forward(write, &msg).await,
+                None => break,
+            },
+            _ = &mut idle => break,
+        }
+    }
+    // The session task is done (or out of time): flush whatever it queued last.
+    while let Ok(msg) = out_rx.try_recv() {
+        forward(write, &msg).await;
+    }
+    if let Err(e) = write.send(Message::Close(Some(close_frame()))).await {
+        tracing::debug!("close frame during shutdown: {e}");
+    }
+    tracing::info!(had_session, "console connection closed for shutdown");
+}
+
+/// The close frame sent to the console when shutting down (normal closure, reason attached).
+fn close_frame() -> tokio_tungstenite::tungstenite::protocol::CloseFrame {
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+    CloseFrame {
+        code: CloseCode::Normal,
+        reason: format!(
+            "agent shutting down: {}",
+            crate::shutdown::reason().unwrap_or_default()
+        )
+        .into(),
+    }
+}
+
+async fn forward<W>(write: &mut W, msg: &AgentToConsole)
+where
+    W: SinkExt<Message> + Unpin,
+    <W as futures_util::Sink<Message>>::Error: std::fmt::Display,
+{
+    match serde_json::to_string(msg) {
+        Ok(text) => {
+            if let Err(e) = write.send(Message::text(text)).await {
+                tracing::debug!("send during shutdown: {e}");
+            }
+        }
+        Err(e) => tracing::debug!("serialising during shutdown: {e}"),
+    }
 }
 
 fn build_heartbeat(state: &Arc<AgentState>) -> AgentToConsole {

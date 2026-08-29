@@ -351,7 +351,7 @@ impl Controller {
                     serde_json::json!({ "ok": ok, "message": message })
                 ));
             }
-            AppEvent::Quit => { /* handled by caller (control flow) */ }
+            AppEvent::Quit => { /* handled by the loop (shutdown request) */ }
             AppEvent::__Ready => self.on_ready(),
         }
     }
@@ -710,7 +710,9 @@ fn build_and_run(work: impl FnOnce() -> i32 + Send + 'static, opts: AppOptions) 
                 ID_OPEN => controller.show(target, false),
                 ID_CHAT => controller.show(target, true),
                 ID_END => dispatch_disconnect(),
-                ID_QUIT => *control_flow = ControlFlow::Exit,
+                // Clean shutdown: the worker ends the session and exits the process itself;
+                // a backstop forces the exit if that takes too long.
+                ID_QUIT => crate::shutdown::quit("tray quit"),
                 _ => {}
             }
         }
@@ -723,7 +725,7 @@ fn build_and_run(work: impl FnOnce() -> i32 + Send + 'static, opts: AppOptions) 
         match event {
             Event::UserEvent(AppEvent::__Ready) => controller.on_ready(),
             Event::UserEvent(AppEvent::OverlayReady) => controller.overlays.mark_ready(),
-            Event::UserEvent(AppEvent::Quit) => *control_flow = ControlFlow::Exit,
+            Event::UserEvent(AppEvent::Quit) => crate::shutdown::quit("app quit"),
             Event::UserEvent(ev) => controller.handle(ev, target),
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,

@@ -60,6 +60,17 @@ Two repositories:
 * One binary; `run` is the actual agent, everything else is CLI plumbing.
 * State lives in `/Library/Application Support/RemoteAgent/agent.toml` or
   `%ProgramData%\RemoteAgent\agent.toml` (owner-only permissions; contains the device secret).
+* **Stopping**: `SIGTERM` / `SIGINT` / `SIGHUP` (`launchctl kill`, `bootout`, Ctrl-C), the Windows
+  console control events, the tray *Quit* item and a completed update all go through
+  `shutdown::request`. The hub ends the active session (keys released, overlays and session bar
+  removed, `session_state: ended` sent), flushes, closes the console socket with a reason and
+  returns; the process exits with code 0 and the service manager restarts it where configured.
+  Quit has a 6 s backstop. Windows `TerminateProcess` from the service supervisor bypasses all of
+  this (known gap). Release builds use `panic = "abort"`, so none of it relies on destructors.
+* **`remote-agent privacy-probe`** (hidden): measures on the running machine whether the
+  agent's own windows — and the window configurations a privacy screen would use — stay out of
+  the capture the operator sees, by painting sentinel windows and reading them back through the
+  real capture pipeline. Prints a table (`--json` for JSON) and writes the report to the log dir.
 
 ## Modes
 

@@ -497,6 +497,14 @@ impl Drop for SckCapturer {
 }
 
 pub fn create(cfg: &CaptureConfig) -> Result<Box<dyn Capturer>> {
+    create_excluding(cfg, &[])
+}
+
+/// Like [`create`], additionally removing `window_ids` (CoreGraphics window numbers, i.e.
+/// `NSWindow.windowNumber`) from the stream through the content filter — the documented way
+/// to keep a window out of a capture, independent of `sharingType`. Windows that are not
+/// shareable content (already closed, other session) are skipped with a warning.
+pub fn create_excluding(cfg: &CaptureConfig, window_ids: &[u32]) -> Result<Box<dyn Capturer>> {
     if !CGPreflightScreenCaptureAccess() {
         // Ask the system for the permission: this shows the TCC prompt the first time
         // and registers the app in System Settings → Screen Recording. Without this call
@@ -540,12 +548,31 @@ pub fn create(cfg: &CaptureConfig) -> Result<Box<dyn Capturer>> {
     // them `NSWindowSharingType::None` (see `platform::macos`), so a plain full-display filter
     // is used here. That per-window exclusion covers windows created after the stream starts and
     // avoids the SCK connection problems seen when excluding the capturing application itself.
+    // Callers that want the documented exclusion as well pass the window numbers in.
+    let excluded: Vec<Retained<SCWindow>> = if window_ids.is_empty() {
+        Vec::new()
+    } else {
+        // SAFETY: plain accessors on the shareable content / window objects.
+        let windows = unsafe { content.0.windows() };
+        windows
+            .iter()
+            .filter(|w| window_ids.contains(&unsafe { w.windowID() }))
+            .collect()
+    };
+    if excluded.len() != window_ids.len() {
+        tracing::warn!(
+            requested = window_ids.len(),
+            found = excluded.len(),
+            "some windows to exclude from the capture are not shareable content"
+        );
+    }
+    let excluded = NSArray::from_retained_slice(&excluded);
     // SAFETY: constructing SCK objects with valid arguments.
     let filter = unsafe {
         SCContentFilter::initWithDisplay_excludingWindows(
             SCContentFilter::alloc(),
             &sc_display,
-            &NSArray::<SCWindow>::new(),
+            &excluded,
         )
     };
 
