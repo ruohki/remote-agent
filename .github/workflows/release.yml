@@ -11,9 +11,27 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # ── gate: never publish a tag that does not pass its own tests ──────────────────────
+  test:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
   # ── macOS universal binary ──────────────────────────────────────────────────────────
   macos:
+    needs: test
     runs-on: macos-14
+    # Step-level `env` is not in scope for that step's own `if`, so the signing gate has to
+    # live at job level.
+    env:
+      HAS_SIGNING: ${{ secrets.MACOS_CERT_P12 != '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -36,7 +54,7 @@ jobs:
 
       # Optional codesign + notarization, only when signing secrets are configured.
       - name: Codesign & notarize
-        if: ${{ env.MACOS_CERT_P12 != '' }}
+        if: env.HAS_SIGNING == 'true'
         env:
           MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
           MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
@@ -53,11 +71,12 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k ci build.keychain
           codesign --force --options runtime --timestamp \
             --sign "$MACOS_SIGN_IDENTITY" dist/remote-agent-macos-universal
-          # Notarize (zip, submit, staple is not applicable to a bare binary; ship the signed binary)
+          # Notarize (zip, submit; stapling is not applicable to a bare binary, so ship the
+          # signed binary). A rejected submission fails the release rather than shipping quietly.
           echo "$AC_API_KEY_P8" | base64 --decode > key.p8
           ditto -c -k dist/remote-agent-macos-universal notarize.zip
           xcrun notarytool submit notarize.zip \
-            --key key.p8 --key-id "$AC_API_KEY_ID" --issuer "$AC_API_ISSUER_ID" --wait || true
+            --key key.p8 --key-id "$AC_API_KEY_ID" --issuer "$AC_API_ISSUER_ID" --wait
           rm -f cert.p12 key.p8
 
       - uses: actions/upload-artifact@v4
@@ -67,7 +86,10 @@ jobs:
 
   # ── Windows binaries ────────────────────────────────────────────────────────────────
   windows:
+    needs: test
     runs-on: windows-latest
+    env:
+      HAS_SIGNING: ${{ secrets.WINDOWS_CERT_PFX != '' }}
     strategy:
       matrix:
         include:
@@ -86,7 +108,7 @@ jobs:
         run: cargo build --release --features winservice --target ${{ matrix.target }} -p remote-agent
 
       - name: Sign (optional)
-        if: ${{ env.WINDOWS_CERT_PFX != '' }}
+        if: env.HAS_SIGNING == 'true'
         shell: pwsh
         env:
           WINDOWS_CERT_PFX: ${{ secrets.WINDOWS_CERT_PFX }}

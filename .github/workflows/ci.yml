@@ -46,3 +46,9 @@ jobs:
 
       - name: Generate protocol bindings
         run: cargo test -p protocol
+
+      # The bindings are committed (the console's web app consumes copies of them), so a
+      # protocol change that skipped regeneration must fail here rather than in the console.
+      - name: Bindings are up to date
+        if: runner.os == 'macOS'
+        run: git diff --exit-code -- crates/protocol/bindings
