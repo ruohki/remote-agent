@@ -1164,10 +1164,7 @@ impl Session {
                 let mut fps = max_fps;
                 let mut ticker = tokio::time::interval(AimdController::INTERVAL);
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                loop {
-                    let Some(track) = peer.video(track_index) else {
-                        break;
-                    };
+                while let Some(track) = peer.video(track_index) {
                     tokio::select! {
                         ev = track.poll_rtcp() => match ev {
                             Some(ev) => {

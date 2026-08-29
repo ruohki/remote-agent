@@ -2,7 +2,7 @@
 //! indicator window, `SendSAS`, and helpers for launching a process in the active session.
 
 use crate::approval::{ApprovalOutcome, IndicatorHandle};
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
@@ -482,7 +482,7 @@ unsafe extern "system" fn chat_wndproc(
     }
     match msg {
         WM_COMMAND => {
-            let id = (wparam.0 & 0xffff) as usize;
+            let id = wparam.0 & 0xffff;
             if !shared_ptr.is_null() {
                 let shared = &*shared_ptr;
                 match id {

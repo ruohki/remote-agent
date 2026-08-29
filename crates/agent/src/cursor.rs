@@ -118,7 +118,9 @@ impl Pacer {
     }
 
     /// Scale factor of the display the cursor was last seen on (primary display before the
-    /// first position, `1.0` without displays).
+    /// first position, `1.0` without displays). Only the macOS source needs it: Windows reads
+    /// the scale from the cursor image itself.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn current_scale(&self) -> f64 {
         let idx = self.last_pos.map(|p| p.0);
         self.displays
@@ -420,8 +422,8 @@ mod windows {
             {
                 // Colour cursor: the mask's top half is the AND mask (1 = transparent).
                 let mut c = c;
-                let opaque = c.chunks_exact(4).any(|p| p[3] != 0);
-                for (i, px) in c.chunks_exact_mut(4).enumerate() {
+                let opaque = c.as_chunks::<4>().0.iter().any(|p| p[3] != 0);
+                for (i, px) in c.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                     let masked = m[i * 4] != 0;
                     if !opaque {
                         px[3] = if masked { 0 } else { 255 };
@@ -451,7 +453,7 @@ mod windows {
             _ => return None,
         };
         // Premultiplied alpha is not expected by the browser; convert BGRA → RGBA for PNG.
-        for px in bgra.chunks_exact_mut(4) {
+        for px in bgra.as_chunks_mut::<4>().0 {
             px.swap(0, 2);
         }
         let png = crate::branding::encode_png(&crate::branding::Rgba::from_rgba(w, h, bgra));

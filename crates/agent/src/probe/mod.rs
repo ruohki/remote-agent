@@ -997,7 +997,7 @@ mod tests {
 
     fn frame(w: u32, h: u32, fill: Rgb) -> Bgra {
         let mut data = vec![0u8; (w * h * 4) as usize];
-        for px in data.chunks_exact_mut(4) {
+        for px in data.as_chunks_mut::<4>().0 {
             px[0] = fill.b;
             px[1] = fill.g;
             px[2] = fill.r;

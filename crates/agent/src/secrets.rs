@@ -41,6 +41,7 @@ impl SecretBackend {
 }
 
 /// Account name under which the secret is filed (one per config directory).
+#[cfg(target_os = "macos")]
 fn account(paths: &Paths) -> String {
     paths.dir.to_string_lossy().into_owned()
 }
@@ -109,6 +110,7 @@ pub fn load(paths: &Paths, cfg: &LocalConfig) -> Result<(String, SecretBackend)>
             }
             #[cfg(not(target_os = "macos"))]
             {
+                let _ = paths;
                 anyhow::bail!("config references the keychain but this platform has none")
             }
         }

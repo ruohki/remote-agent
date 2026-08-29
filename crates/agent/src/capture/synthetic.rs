@@ -93,7 +93,7 @@ impl SyntheticCapturer {
     }
 
     fn paint_background(&mut self) {
-        for (i, px) in self.canvas.chunks_exact_mut(4).enumerate() {
+        for (i, px) in self.canvas.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let y = (i as u32) / WIDTH;
             px.copy_from_slice(&Self::background_at(y));
         }

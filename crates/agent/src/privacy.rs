@@ -254,7 +254,7 @@ fn spawn_watchdog(inner: Arc<Inner>) {
                 std::thread::sleep(Duration::from_millis(500));
                 tick = tick.wrapping_add(1);
                 // Display topology every ~2 s (cheap CoreGraphics / Win32 calls).
-                let displays_now = if tick % 4 == 0 {
+                let displays_now = if tick.is_multiple_of(4) {
                     capture::list_displays().ok()
                 } else {
                     None
@@ -328,7 +328,7 @@ fn mosaic_png(bgra: &[u8], stride: usize, width: u32, height: u32) -> Option<Vec
     let mut rgba = Vec::with_capacity((width * height * 4) as usize);
     for y in 0..height as usize {
         let row = bgra.get(y * stride..y * stride + width as usize * 4)?;
-        for px in row.chunks_exact(4) {
+        for px in row.as_chunks::<4>().0 {
             rgba.extend_from_slice(&[px[2], px[1], px[0], 255]);
         }
     }

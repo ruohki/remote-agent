@@ -256,14 +256,18 @@ pub fn decode_png(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
     let rgba = match (info.color_type, info.bit_depth) {
         (png::ColorType::Rgba, png::BitDepth::Eight) => data.to_vec(),
         (png::ColorType::Rgb, png::BitDepth::Eight) => data
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .flat_map(|p| [p[0], p[1], p[2], 255])
             .collect(),
         (png::ColorType::Grayscale, png::BitDepth::Eight) => {
             data.iter().flat_map(|&g| [g, g, g, 255]).collect()
         }
         (png::ColorType::GrayscaleAlpha, png::BitDepth::Eight) => data
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .flat_map(|p| [p[0], p[0], p[0], p[1]])
             .collect(),
         (ct, bd) => anyhow::bail!("unsupported PNG format {ct:?}/{bd:?}"),

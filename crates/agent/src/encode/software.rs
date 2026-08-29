@@ -81,7 +81,7 @@ impl I420Buffer {
         for row in 0..h {
             let src = &bgra[row * stride..row * stride + w * 4];
             let y_row = &mut self.y[row * w..(row + 1) * w];
-            for (x, px) in src.chunks_exact(4).enumerate() {
+            for (x, px) in src.as_chunks::<4>().0.iter().enumerate() {
                 y_row[x] = bgra_to_y(px[2], px[1], px[0]);
             }
         }

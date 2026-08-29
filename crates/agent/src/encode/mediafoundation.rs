@@ -214,9 +214,6 @@ struct Converter {
     /// Input (capture) size.
     width: u32,
     height: u32,
-    /// Output (encoded) size; the video processor scales when it differs.
-    out_width: u32,
-    out_height: u32,
     nv12_pool: Vec<(ID3D11Texture2D, ID3D11VideoProcessorOutputView)>,
     pool_next: usize,
     /// Upload target for CPU BGRA frames.
@@ -284,8 +281,6 @@ impl Converter {
             processor,
             width,
             height,
-            out_width,
-            out_height,
             nv12_pool: Vec::new(),
             pool_next: 0,
             upload: None,
