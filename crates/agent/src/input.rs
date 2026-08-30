@@ -509,7 +509,10 @@ mod tests {
         assert_eq!(virtual_desktop_absolute(0, 0, rect), (32776, 6559));
         // Anything outside the desktop is clamped rather than wrapping to the far side.
         assert_eq!(virtual_desktop_absolute(-5000, -5000, rect), (0, 0));
-        assert_eq!(virtual_desktop_absolute(99_999, 99_999, rect), (65535, 65535));
+        assert_eq!(
+            virtual_desktop_absolute(99_999, 99_999, rect),
+            (65535, 65535)
+        );
     }
 
     #[test]

@@ -351,8 +351,8 @@ mod windows {
         // `flags` is a bitfield: CURSOR_SUPPRESSED (touch or pen input) can be set alongside
         // CURSOR_SHOWING, and an equality test then reports a perfectly visible cursor as
         // hidden.
-        let visible = unsafe { GetCursorInfo(&mut info) }.is_ok()
-            && info.flags.0 & CURSOR_SHOWING.0 != 0;
+        let visible =
+            unsafe { GetCursorInfo(&mut info) }.is_ok() && info.flags.0 & CURSOR_SHOWING.0 != 0;
         Some((p.x as f64, p.y as f64, visible))
     }
 
