@@ -7,7 +7,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 use windows::core::{HSTRING, PCWSTR};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
+// `CloseHandle` is only reached from the active-session process launcher below.
+#[cfg(feature = "winservice")]
+use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::Foundation::{HANDLE, HWND};
 use windows::Win32::System::RemoteDesktop::{
     WTSFreeMemory, WTSGetActiveConsoleSessionId, WTSQuerySessionInformationW, WTSUserName,
     WTS_CURRENT_SERVER_HANDLE,

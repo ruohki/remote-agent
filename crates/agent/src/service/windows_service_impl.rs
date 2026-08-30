@@ -11,6 +11,8 @@ use crate::config::Paths;
 use anyhow::{bail, Context, Result};
 use std::ffi::OsString;
 use std::path::PathBuf;
+// Only the SCM dispatcher (below) uses a channel.
+#[cfg(feature = "winservice")]
 use std::sync::mpsc;
 use std::time::Duration;
 use windows_service::service::{
