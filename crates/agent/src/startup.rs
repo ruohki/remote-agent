@@ -72,6 +72,53 @@ pub fn validate_console_url_with(input: &str, insecure_allowed: bool) -> Result<
     }
 }
 
+/// Which console an enrollment may target.
+///
+/// A baked binary carries its console's URL (and its TLS pin) in the signed trailer, and it is
+/// branded for that console: letting it enroll somewhere else would hand a stranger an agent
+/// wearing someone's branding, pinned to a certificate that no longer matches. The Connect
+/// screen locks the field for a baked build, but a lock only the page enforces is no lock, so
+/// the decision lives here and the submitted URL is checked against the baked one.
+///
+/// Hosts are compared case-insensitively, and a URL that only differs by trailing slash or
+/// default port is the same console.
+pub fn enrollment_target(baked: Option<&BakedConfig>, requested: &str) -> Result<String, String> {
+    let requested = validate_console_url(requested)?;
+    let Some(baked_url) = baked.map(|b| b.server_url.as_str()) else {
+        return Ok(requested);
+    };
+    let baked_url = baked_url.trim_end_matches('/').to_string();
+    if same_console(&baked_url, &requested) {
+        // Always the baked spelling: it is what the pin and the branding were issued for.
+        return Ok(baked_url);
+    }
+    let host = url::Url::parse(&baked_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or(baked_url);
+    Err(format!(
+        "This agent was built for {host} and can only enroll there. Download an agent from the other console instead."
+    ))
+}
+
+/// Whether two console URLs address the same console (scheme, host, port and path).
+fn same_console(a: &str, b: &str) -> bool {
+    let norm = |s: &str| {
+        url::Url::parse(s).ok().map(|u| {
+            (
+                u.scheme().to_ascii_lowercase(),
+                u.host_str().unwrap_or_default().to_ascii_lowercase(),
+                u.port_or_known_default(),
+                u.path().trim_end_matches('/').to_string(),
+            )
+        })
+    };
+    match (norm(a), norm(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => a.trim_end_matches('/') == b.trim_end_matches('/'),
+    }
+}
+
 /// Default device name offered on the Connect screen: the last known display name, else the
 /// hostname.
 pub fn default_device_name(local: Option<&LocalConfig>) -> String {
@@ -92,6 +139,7 @@ fn hostname() -> String {
 /// validated first (URL policy, non-empty token); `emit` receives the UI states to render.
 /// Returns `None` when the request channel closes without an enrollment.
 pub async fn connect_flow<F, Fut>(
+    baked: Option<&BakedConfig>,
     rx: &mut mpsc::UnboundedReceiver<ConnectRequest>,
     emit: impl Fn(ConnectUi),
     mut enroll: F,
@@ -101,7 +149,7 @@ where
     Fut: Future<Output = Result<()>>,
 {
     while let Some(req) = rx.recv().await {
-        let server_url = match validate_console_url(&req.server_url) {
+        let server_url = match enrollment_target(baked, &req.server_url) {
             Ok(u) => u,
             Err(message) => {
                 emit(ConnectUi::Failed { message });
@@ -186,7 +234,7 @@ pub async fn ensure_enrolled(paths: &Paths, notice: Option<String>) -> Result<()
         error,
     });
     let paths_for_enroll = paths.clone();
-    let done = connect_flow(&mut rx, crate::app::set_connect_ui, move |req| {
+    let done = connect_flow(baked, &mut rx, crate::app::set_connect_ui, move |req| {
         let paths = paths_for_enroll.clone();
         async move {
             crate::enroll::enroll(&paths, &req.server_url, &req.token, req.name)
@@ -241,6 +289,52 @@ mod tests {
             server_url: "https://old.example".into(),
             ..Default::default()
         }
+    }
+
+    fn baked_for(url: &str) -> BakedConfig {
+        BakedConfig {
+            version: 1,
+            server_url: url.to_string(),
+            enroll_token: None,
+            quick_support: false,
+            branding: protocol::bakery::Branding::default(),
+            issued_at: 0,
+            console_tls_spki_sha256: None,
+        }
+    }
+
+    #[test]
+    fn a_baked_agent_only_enrolls_with_the_console_it_was_built_for() {
+        let baked = baked_for("https://console.example.com");
+        // The same console spelled differently is still the same console.
+        for spelling in [
+            "https://console.example.com",
+            "https://console.example.com/",
+            "https://Console.Example.com",
+            "console.example.com",
+            "https://console.example.com:443",
+        ] {
+            assert_eq!(
+                enrollment_target(Some(&baked), spelling).as_deref(),
+                Ok("https://console.example.com"),
+                "{spelling}"
+            );
+        }
+        // Anything else is refused, and the message names where it does belong.
+        let err = enrollment_target(Some(&baked), "https://other.example.net").unwrap_err();
+        assert!(err.contains("console.example.com"), "{err}");
+        assert!(enrollment_target(Some(&baked), "https://console.example.com.evil.net").is_err());
+        // A different port is a different console.
+        assert!(enrollment_target(Some(&baked), "https://console.example.com:8443").is_err());
+    }
+
+    #[test]
+    fn an_unbaked_agent_may_enroll_anywhere_the_url_policy_allows() {
+        assert_eq!(
+            enrollment_target(None, "https://console.example.com/").as_deref(),
+            Ok("https://console.example.com")
+        );
+        assert!(enrollment_target(None, "not a url").is_err());
     }
 
     #[test]
@@ -402,7 +496,7 @@ mod tests {
         crate::transport::set_insecure(false);
         let done = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            connect_flow(&mut rx, emit, enroll),
+            connect_flow(None, &mut rx, emit, enroll),
         )
         .await
         .unwrap();
@@ -439,7 +533,7 @@ mod tests {
     async fn connect_flow_ends_when_the_window_goes_away() {
         let (tx, mut rx) = mpsc::unbounded_channel::<ConnectRequest>();
         drop(tx);
-        let done = connect_flow(&mut rx, |_| {}, |_| async { Ok(()) }).await;
+        let done = connect_flow(None, &mut rx, |_| {}, |_| async { Ok(()) }).await;
         assert_eq!(done, None);
     }
 }
