@@ -518,21 +518,32 @@ fn push_js(from: ChatParty, text: &str, ts_ms: u64) -> String {
 /// Run the application: builds the window/webview/tray, spawns `work` on a worker thread and
 /// pumps the event loop on the calling (main) thread. Returns the worker's exit code.
 pub fn run(work: impl FnOnce() -> i32 + Send + 'static, opts: AppOptions) -> i32 {
-    match build_and_run(work, opts) {
+    // Handed to `build_and_run` by reference: it only takes the worker once the loop is about
+    // to start, so a setup failure leaves it here for us to run without a UI.
+    let mut work: Option<Worker> = Some(Box::new(work));
+    match build_and_run(&mut work, opts) {
         Ok(code) => code,
         Err(e) => {
             tracing::error!("app loop failed: {e:#}");
-            // Fall back to running the worker without a UI so a headless environment still works.
-            0
+            // No window, webview or tray — a missing WebView2 runtime, no desktop to draw on,
+            // a session with no window station. Run the agent headless rather than exiting
+            // silently: an enrolled device stays reachable, which is the whole point of it.
+            match work.take() {
+                Some(work) => {
+                    tracing::warn!("continuing without a UI");
+                    work()
+                }
+                None => 0,
+            }
         }
     }
 }
 
-fn build_and_run(work: impl FnOnce() -> i32 + Send + 'static, opts: AppOptions) -> Result<i32> {
-    let event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
-    set_proxy(event_loop.create_proxy());
-    crate::platform::mark_main_loop_running();
+/// The agent worker, boxed so it can be handed back if the UI never starts.
+type Worker = Box<dyn FnOnce() -> i32 + Send + 'static>;
 
+fn build_and_run(work: &mut Option<Worker>, opts: AppOptions) -> Result<i32> {
+    let event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
     let product = branding::product_name();
     let window = WindowBuilder::new()
         .with_title(&product)
@@ -541,7 +552,9 @@ fn build_and_run(work: impl FnOnce() -> i32 + Send + 'static, opts: AppOptions) 
         .with_visible(opts.show_on_start)
         .build(&event_loop)
         .context("creating app window")?;
-    exclude_from_capture(&window);
+    if hide_app_window_from_capture() {
+        exclude_from_capture(&window);
+    }
     apply_app_icons(&window);
     #[cfg(target_os = "macos")]
     crate::platform::macos::apply_debug_appearance();
@@ -646,6 +659,12 @@ fn build_and_run(work: impl FnOnce() -> i32 + Send + 'static, opts: AppOptions) 
         .build()
         .context("creating tray icon")?;
 
+    // Everything fallible is up. Only now claim the UI loop: announcing it earlier would make
+    // `app::is_running()` (and with it `privacy::support()`) report a live loop that will never
+    // pump if construction above failed.
+    set_proxy(event_loop.create_proxy());
+    crate::platform::mark_main_loop_running();
+
     // Live re-branding: whenever the console branding changes, refresh the window.
     branding::on_change(|_| super::refresh_branding());
 
@@ -698,10 +717,11 @@ fn build_and_run(work: impl FnOnce() -> i32 + Send + 'static, opts: AppOptions) 
         tray,
     };
 
-    // Worker thread runs the agent; it exits the process when done.
+    // Worker thread runs the agent; it exits the process when done. Taken from the caller only
+    // here, once the loop is guaranteed to start — see `run`.
     let worker_started = Arc::new(AtomicBool::new(false));
     let ws = Arc::clone(&worker_started);
-    let mut work = Some(work);
+    let mut work = work.take();
 
     event_loop.run(move |event, target, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -931,6 +951,21 @@ fn console_host(url: &str) -> String {
     let s = url.trim();
     let s = s.split("://").nth(1).unwrap_or(s);
     s.split('/').next().unwrap_or("").to_string()
+}
+
+/// Whether to hide the *app window* from screen capture. Off unless asked for.
+///
+/// `WDA_EXCLUDEFROMCAPTURE` (and `sharingType = none`) hides a window from every capture path,
+/// not just the operator's stream. When the person at the device views their own machine
+/// through anything capture-based — Parsec, Sunshine, RDP, a Teams share — an excluded app
+/// window is invisible to *them*, and the agent appears to start with nothing but a tray icon.
+///
+/// The session bar, the annotation overlays and the privacy screen stay excluded
+/// unconditionally: there, not being captured is the guarantee rather than a nicety. For this
+/// window the trade is the other way round — the operator glimpsing the device user's own
+/// control panel costs little, being unable to reach it costs everything.
+fn hide_app_window_from_capture() -> bool {
+    std::env::var_os("REMOTE_AGENT_HIDE_APP_WINDOW").is_some()
 }
 
 /// Exclude our window from the screen capture the operator sees.

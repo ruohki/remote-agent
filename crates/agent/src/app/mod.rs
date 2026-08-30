@@ -10,8 +10,10 @@
 //!
 //! The chat presentation is wired through the [`crate::chat::ChatUi`] trait ([`AppChatUi`]),
 //! so the session code is unchanged. Closing the window hides it (the session keeps running);
-//! it is reopened from the tray. Every window we create is excluded from the screen capture
-//! and ignores remote-injected input.
+//! it is reopened from the tray. The session bar, the annotation overlays and the privacy
+//! screen are excluded from the screen capture and ignore remote-injected input; this window
+//! is captured like any other unless `REMOTE_AGENT_HIDE_APP_WINDOW` is set, because hiding it
+//! from capture also hides it from a device user who is on Parsec / RDP / a screen share.
 
 mod annotate;
 mod bar;

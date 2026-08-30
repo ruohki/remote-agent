@@ -1,8 +1,11 @@
 //! Windows hardware encoding via Media Foundation transforms (H.264 / HEVC encoder MFTs).
 //!
 //! * [`supports`] enumerates hardware encoder MFTs for the codec (cached).
-//! * [`create`] activates the first hardware MFT as an *asynchronous* transform, binds it to
-//!   the D3D11 device that produced the captured textures through an `IMFDXGIDeviceManager`,
+//! * [`create`] activates a hardware MFT as an *asynchronous* transform and binds it to the
+//!   D3D11 device that produced the captured textures through an `IMFDXGIDeviceManager`. An
+//!   MFT only accepts a device on its own adapter, and a machine with more than one GPU
+//!   enumerates one MFT per adapter in no useful order, so the candidates are tried in turn
+//!   until one takes the device;
 //!   configures low-latency CBR encoding through `ICodecAPI` and converts every BGRA capture
 //!   texture to NV12 on the GPU with `ID3D11VideoProcessor` before handing it to the MFT as a
 //!   DXGI surface buffer — nothing is copied to system memory.
@@ -44,20 +47,20 @@ use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonQualityVsSpeed,
     CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncCommonRealTime,
     CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMPVGOPSize,
-    CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI, IMFActivate,
-    IMFAttributes, IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFMediaType, IMFSample,
-    IMFTransform, METransformHaveOutput, METransformNeedInput, MFCreateDXGIDeviceManager,
-    MFCreateDXGISurfaceBuffer, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
-    MFMediaType_Video, MFNominalRange_16_235, MFSampleExtension_CleanPoint, MFStartup, MFTEnumEx,
-    MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
-    MFVideoTransferMatrix_BT709, MFSTARTUP_NOSOCKET, MFT_CATEGORY_VIDEO_ENCODER,
-    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_MESSAGE_COMMAND_FLUSH,
-    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
-    MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
-    MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
-    MFT_REGISTER_TYPE_INFO, MF_EVENT_FLAG_NO_WAIT, MF_E_NO_EVENTS_AVAILABLE,
-    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_AVG_BITRATE,
-    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
+    CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI, IMF2DBuffer,
+    IMFActivate, IMFAttributes, IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFMediaType,
+    IMFSample, IMFTransform, METransformHaveOutput, METransformNeedInput,
+    MFCreateDXGIDeviceManager, MFCreateDXGISurfaceBuffer, MFCreateMediaType, MFCreateMemoryBuffer,
+    MFCreateSample, MFMediaType_Video, MFNominalRange_16_235, MFSampleExtension_CleanPoint,
+    MFStartup, MFTEnumEx, MFT_FRIENDLY_NAME_Attribute, MFVideoFormat_H264, MFVideoFormat_HEVC,
+    MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFVideoTransferMatrix_BT709,
+    MFSTARTUP_NOSOCKET, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE,
+    MFT_ENUM_FLAG_SORTANDFILTER, MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
+    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
+    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MF_EVENT_FLAG_NO_WAIT,
+    MF_E_NO_EVENTS_AVAILABLE, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE,
+    MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
     MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_MT_VIDEO_NOMINAL_RANGE,
     MF_MT_YUV_MATRIX, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
 };
@@ -75,7 +78,11 @@ const NV12_POOL: usize = 3;
 
 // ─── Process-wide initialisation ────────────────────────────────────────────────────────
 
-fn init_thread() -> Result<()> {
+/// Join the MTA and take a Media Foundation reference for the calling thread.
+///
+/// Every thread that touches an `IMFTransform` needs this, not just the one that created it —
+/// see the call in the video pipeline thread. Idempotent and cheap on repeat calls.
+pub fn init_thread() -> Result<()> {
     // SAFETY: standard COM/MF start-up; RPC_E_CHANGED_MODE just means another apartment
     // model is already active on this thread, which is fine for MF.
     unsafe {
@@ -419,6 +426,12 @@ pub struct MfEncoder {
     codec_api: Option<ICodecAPI>,
     device_manager: IMFDXGIDeviceManager,
     reset_token: u32,
+    /// Hardware MFTs not tried yet. A machine with several GPUs (a laptop's iGPU plus a
+    /// discrete card, a virtual display adapter) exposes an encoder MFT per adapter, and one
+    /// bound to a different adapter than the capture device rejects `SET_D3D_MANAGER`. The
+    /// enumeration order does not tell us which is which, so [`Self::start`] works down the
+    /// list until one accepts the device.
+    remaining: Vec<IMFActivate>,
     converter: Option<Converter>,
     in_stream: u32,
     out_stream: u32,
@@ -437,14 +450,32 @@ pub struct MfEncoder {
 // free-threaded.
 unsafe impl Send for MfEncoder {}
 
-impl MfEncoder {
-    fn new(cfg: &EncoderConfig) -> Result<Self> {
-        init_thread()?;
-        let activates = enumerate_hardware(cfg.codec)?;
-        let activate = activates
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("no hardware {:?} encoder MFT", cfg.codec))?;
+/// Registered name of an encoder MFT, for logs ("NVIDIA H.264 Encoder MFT", …).
+fn friendly_name(activate: &IMFActivate) -> String {
+    let mut buf = [0u16; 128];
+    let mut len = 0u32;
+    // SAFETY: the buffer is sized as advertised; the attribute may be absent.
+    let ok = unsafe { activate.GetString(&MFT_FRIENDLY_NAME_Attribute, &mut buf, Some(&mut len)) };
+    match ok {
+        Ok(()) => String::from_utf16_lossy(&buf[..len as usize]),
+        Err(_) => "unnamed encoder MFT".to_string(),
+    }
+}
+
+/// One activated encoder MFT, before it has been bound to a D3D device.
+struct Activated {
+    activate: IMFActivate,
+    transform: IMFTransform,
+    events: IMFMediaEventGenerator,
+    codec_api: Option<ICodecAPI>,
+    device_manager: IMFDXGIDeviceManager,
+    reset_token: u32,
+    in_stream: u32,
+    out_stream: u32,
+}
+
+impl Activated {
+    fn open(activate: &IMFActivate) -> Result<Self> {
         // SAFETY: plain COM activation.
         let transform: IMFTransform =
             unsafe { activate.ActivateObject() }.context("activating encoder MFT")?;
@@ -474,18 +505,55 @@ impl MfEncoder {
             };
 
         Ok(Self {
-            codec: cfg.codec,
-            cfg: cfg.clone(),
-            output: cfg.target_size(),
-            activate,
+            activate: activate.clone(),
             transform,
             events,
             codec_api,
             device_manager,
             reset_token,
-            converter: None,
             in_stream,
             out_stream,
+        })
+    }
+}
+
+impl MfEncoder {
+    fn new(cfg: &EncoderConfig) -> Result<Self> {
+        init_thread()?;
+        let mut candidates = enumerate_hardware(cfg.codec)?;
+        if candidates.is_empty() {
+            bail!("no hardware {:?} encoder MFT", cfg.codec);
+        }
+        // Activate the first one that can be activated at all; the rest stay as fallbacks for
+        // `start`, which is where a wrong-adapter MFT actually reveals itself.
+        let mut activated = None;
+        while !candidates.is_empty() {
+            let activate = candidates.remove(0);
+            match Activated::open(&activate) {
+                Ok(a) => {
+                    activated = Some(a);
+                    break;
+                }
+                Err(e) => tracing::warn!("activating {}: {e:#}", friendly_name(&activate)),
+            }
+        }
+        let activated = activated
+            .ok_or_else(|| anyhow!("no hardware {:?} encoder MFT could be activated", cfg.codec))?;
+
+        Ok(Self {
+            codec: cfg.codec,
+            cfg: cfg.clone(),
+            output: cfg.target_size(),
+            activate: activated.activate,
+            transform: activated.transform,
+            events: activated.events,
+            codec_api: activated.codec_api,
+            device_manager: activated.device_manager,
+            reset_token: activated.reset_token,
+            remaining: candidates,
+            converter: None,
+            in_stream: activated.in_stream,
+            out_stream: activated.out_stream,
             provides_samples: false,
             out_buffer_size: 0,
             need_input: 0,
@@ -498,20 +566,82 @@ impl MfEncoder {
         })
     }
 
+    /// Hand the capture device to the MFT, moving on to the next enumerated encoder when this
+    /// one will not take it.
+    ///
+    /// An encoder MFT only accepts a device on its own adapter. With several GPUs present the
+    /// first MFT the enumeration returns is often the wrong one, and it answers
+    /// `SET_D3D_MANAGER` with a bare `E_FAIL` — so the only way to find the right one is to
+    /// try. Failing every candidate is a real error and drops the session to software encoding.
+    fn bind_device(&mut self, device: &Arc<D3dDevice>) -> Result<()> {
+        loop {
+            // SAFETY: plain COM calls; the device outlives the binding (the caller holds an Arc).
+            let bound = unsafe {
+                self.device_manager
+                    .ResetDevice(&device.device, self.reset_token)
+                    .context("IMFDXGIDeviceManager::ResetDevice")
+                    .and_then(|()| {
+                        let mgr_ptr: *mut std::ffi::c_void = self.device_manager.as_raw();
+                        self.transform
+                            .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, mgr_ptr as usize)
+                            .context("MFT_MESSAGE_SET_D3D_MANAGER (encoder is not D3D11 aware)")
+                    })
+            };
+            match bound {
+                Ok(()) => {
+                    tracing::info!(
+                        "encoding {:?} with {}",
+                        self.codec,
+                        friendly_name(&self.activate)
+                    );
+                    return Ok(());
+                }
+                Err(e) if self.remaining.is_empty() => {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "no hardware {:?} encoder accepted the capture device",
+                            self.codec
+                        )
+                    })
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "{} rejected the capture device ({e:#}); trying the next encoder",
+                        friendly_name(&self.activate)
+                    );
+                    let next = self.remaining.remove(0);
+                    match Activated::open(&next) {
+                        Ok(a) => self.replace_mft(a),
+                        Err(e) => {
+                            tracing::warn!("activating {}: {e:#}", friendly_name(&next));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Swap in a freshly activated MFT after the previous one refused the device.
+    fn replace_mft(&mut self, a: Activated) {
+        // SAFETY: releases the MFT we are abandoning; it was never started.
+        unsafe {
+            let _ = self.activate.ShutdownObject();
+        }
+        self.activate = a.activate;
+        self.transform = a.transform;
+        self.events = a.events;
+        self.codec_api = a.codec_api;
+        self.device_manager = a.device_manager;
+        self.reset_token = a.reset_token;
+        self.in_stream = a.in_stream;
+        self.out_stream = a.out_stream;
+    }
+
     /// Bind to `device`, negotiate media types and start streaming. Called on the first frame.
     fn start(&mut self, device: Arc<D3dDevice>) -> Result<()> {
         let (src_w, src_h, fps) = (self.cfg.width, self.cfg.height, self.cfg.fps.max(1));
         let (w, h) = self.output;
-        // SAFETY: plain COM calls; the device outlives the manager binding (we hold an Arc).
-        unsafe {
-            self.device_manager
-                .ResetDevice(&device.device, self.reset_token)
-                .context("IMFDXGIDeviceManager::ResetDevice")?;
-            let mgr_ptr: *mut std::ffi::c_void = self.device_manager.as_raw();
-            self.transform
-                .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, mgr_ptr as usize)
-                .context("MFT_MESSAGE_SET_D3D_MANAGER (encoder is not D3D11 aware)")?;
-        }
+        self.bind_device(&device)?;
         self.converter = Some(Converter::new(device, src_w, src_h, w, h, fps)?);
 
         // Codec settings that must precede type negotiation on most encoder MFTs.
@@ -525,7 +655,9 @@ impl MfEncoder {
             codec_set(
                 api,
                 &CODECAPI_AVEncCommonRealTime,
-                variant_u32(1),
+                // Documented as VT_BOOL: a VT_UI4 here is rejected on type and the setting is
+                // silently dropped.
+                variant_bool(true),
                 "AVEncCommonRealTime",
             );
             codec_set(
@@ -793,6 +925,21 @@ impl MfEncoder {
         let sample = unsafe {
             let buffer = MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, nv12, 0, false)
                 .context("MFCreateDXGISurfaceBuffer")?;
+            // The buffer comes back with a current length of 0. Vendor MFTs read it and see an
+            // empty sample: ProcessInput fails, or the encoder emits nothing / green frames.
+            let len = match buffer.cast::<IMF2DBuffer>() {
+                Ok(two_d) => two_d.GetContiguousLength().unwrap_or(0),
+                Err(_) => 0,
+            };
+            let len = if len > 0 {
+                len
+            } else {
+                // NV12: one full-size luma plane plus a half-height interleaved chroma plane.
+                // The texture is the converter's output, so it is the encoded size.
+                let (w, h) = self.cfg.target_size();
+                w * h * 3 / 2
+            };
+            buffer.SetCurrentLength(len)?;
             let sample = MFCreateSample()?;
             sample.AddBuffer(&buffer)?;
             sample.SetSampleTime((pts.as_nanos() / 100) as i64)?;

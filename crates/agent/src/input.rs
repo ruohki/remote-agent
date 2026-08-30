@@ -8,8 +8,12 @@
 //! * Every pressed key/button is tracked so [`InputHandler::release_all`] (sent by the
 //!   browser on blur, and called on session teardown) never leaves keys stuck.
 
+#[cfg(target_os = "windows")]
+use anyhow::bail;
 use anyhow::{anyhow, Context, Result};
-use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
+#[cfg(not(target_os = "windows"))]
+use enigo::Coordinate;
+use enigo::{Axis, Button, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use protocol::channel::{InputEvent, MouseButton};
 use protocol::common::DisplayInfo;
 use std::collections::{HashMap, HashSet};
