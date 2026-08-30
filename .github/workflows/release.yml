@@ -49,10 +49,10 @@ jobs:
       - name: Make universal binary
         run: |
           mkdir -p dist
-          lipo -create -output dist/remote-agent-macos-universal \
+          lipo -create -output dist/remote-agent-macos-universal-base \
             target/aarch64-apple-darwin/release/remote-agent \
             target/x86_64-apple-darwin/release/remote-agent
-          chmod +x dist/remote-agent-macos-universal
+          chmod +x dist/remote-agent-macos-universal-base
 
       # A double-clickable app next to the bare binary. The binary is what a console bakes
       # into a branded bundle (AGENT_DOWNLOAD_BASE serves it); this one is for installing by
@@ -66,7 +66,7 @@ jobs:
         run: |
           APP="dist/${PRODUCT}.app"
           mkdir -p "${APP}/Contents/MacOS" "${APP}/Contents/Resources"
-          cp dist/remote-agent-macos-universal "${APP}/Contents/MacOS/remote-agent"
+          cp dist/remote-agent-macos-universal-base "${APP}/Contents/MacOS/remote-agent"
           chmod 0755 "${APP}/Contents/MacOS/remote-agent"
           VERSION="${GITHUB_REF_NAME#v}"
           cat > "${APP}/Contents/Info.plist" <<PLIST
@@ -144,8 +144,8 @@ jobs:
         run: |
           codesign --force --options runtime --timestamp \
             --keychain "${KEYCHAIN_PATH}" \
-            --sign "${SIGN_IDENTITY}" dist/remote-agent-macos-universal
-          codesign --verify --strict --verbose=2 dist/remote-agent-macos-universal
+            --sign "${SIGN_IDENTITY}" dist/remote-agent-macos-universal-base
+          codesign --verify --strict --verbose=2 dist/remote-agent-macos-universal-base
           # --deep seals the nested executable as part of the bundle's signature.
           codesign --force --deep --options runtime --timestamp \
             --keychain "${KEYCHAIN_PATH}" \
@@ -168,7 +168,7 @@ jobs:
             xcrun notarytool submit "$1" \
               --key "${ASC_KEY_PATH}" --key-id "${ASC_KEY_ID}" --issuer "${ASC_ISSUER_ID}" --wait
           }
-          ditto -c -k dist/remote-agent-macos-universal "${RUNNER_TEMP}/notarize-bin.zip"
+          ditto -c -k dist/remote-agent-macos-universal-base "${RUNNER_TEMP}/notarize-bin.zip"
           notarize "${RUNNER_TEMP}/notarize-bin.zip"
           ditto -c -k --keepParent "dist/${PRODUCT}.app" "${RUNNER_TEMP}/notarize-app.zip"
           notarize "${RUNNER_TEMP}/notarize-app.zip"
@@ -187,14 +187,14 @@ jobs:
       - name: Zip the app
         env:
           PRODUCT: Remote Support
-        run: ditto -c -k --keepParent "dist/${PRODUCT}.app" "dist/remote-agent-macos-universal-app.zip"
+        run: ditto -c -k --keepParent "dist/${PRODUCT}.app" "dist/remote-agent-macos-universal.zip"
 
       - uses: actions/upload-artifact@v4
         with:
           name: macos
           path: |
-            dist/remote-agent-macos-universal
-            dist/remote-agent-macos-universal-app.zip
+            dist/remote-agent-macos-universal-base
+            dist/remote-agent-macos-universal.zip
 
   # ── Windows binaries ────────────────────────────────────────────────────────────────
   windows:
@@ -207,8 +207,10 @@ jobs:
         include:
           - target: x86_64-pc-windows-msvc
             name: remote-agent-windows-x86_64.exe
+            base: remote-agent-windows-x86_64-base.exe
           - target: aarch64-pc-windows-msvc
             name: remote-agent-windows-aarch64.exe
+            base: remote-agent-windows-aarch64-base.exe
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -236,12 +238,18 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
+          # The same binary twice: `-base` is what a console bakes into a branded agent, the
+          # plain name is the one to download and run as-is (it asks for a console URL and an
+          # enrolment token on first start).
           Copy-Item "target/${{ matrix.target }}/release/remote-agent.exe" "dist/${{ matrix.name }}"
+          Copy-Item "target/${{ matrix.target }}/release/remote-agent.exe" "dist/${{ matrix.base }}"
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: dist/${{ matrix.name }}
+          path: |
+            dist/${{ matrix.name }}
+            dist/${{ matrix.base }}
 
   # ── Assemble the release ────────────────────────────────────────────────────────────
   release:
