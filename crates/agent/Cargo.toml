@@ -21,6 +21,12 @@ winservice = []
 name = "remote_agent"
 path = "src/lib.rs"
 
+[build-dependencies]
+# Compiles assets/agent.rc into the executable: icon + version information. Kept out of any
+# cfg(windows) table because that would match the *host*, not the target — the resources must
+# be embedded when cross-compiling to Windows too; build.rs checks CARGO_CFG_TARGET_OS.
+embed-resource = "3"
+
 [dependencies]
 protocol.workspace = true
 serde.workspace = true

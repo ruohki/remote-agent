@@ -107,6 +107,49 @@ pub fn attach_parent_console() {
     }
 }
 
+/// Ask whether to fetch the WebView2 runtime. Returns true when the person said yes.
+///
+/// Deliberately a plain `MessageBoxW`: the reason we are here is that no webview can be
+/// created, so the branded window is not an option.
+pub fn webview2_missing_dialog(product: &str) -> bool {
+    let text = HSTRING::from(format!(
+        "{product} needs the Microsoft Edge WebView2 runtime, which is not installed on this \
+         computer. Windows 11 includes it; on Windows 10 it usually has to be added.\n\n\
+         Download it now? The agent keeps running in the background either way, and the \
+         window appears once the runtime is installed and the agent restarts."
+    ));
+    let caption = HSTRING::from(format!("{product}: component missing"));
+    // SAFETY: two NUL-terminated wide strings that outlive the call.
+    let answer = unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(text.as_ptr()),
+            PCWSTR(caption.as_ptr()),
+            MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST,
+        )
+    };
+    answer == IDYES
+}
+
+/// Open `url` in the default browser.
+pub fn open_url(url: &str) {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let verb = HSTRING::from("open");
+    let target = HSTRING::from(url);
+    // SAFETY: NUL-terminated wide strings; the returned HINSTANCE is a status code we ignore.
+    unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(verb.as_ptr()),
+            PCWSTR(target.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
 /// Whether Windows apps use the dark theme (`HKCU\\...\\Personalize\\AppsUseLightTheme == 0`).
 pub fn dark_theme() -> bool {
     use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};

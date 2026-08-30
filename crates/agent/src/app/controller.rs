@@ -518,6 +518,8 @@ fn push_js(from: ChatParty, text: &str, ts_ms: u64) -> String {
 /// Run the application: builds the window/webview/tray, spawns `work` on a worker thread and
 /// pumps the event loop on the calling (main) thread. Returns the worker's exit code.
 pub fn run(work: impl FnOnce() -> i32 + Send + 'static, opts: AppOptions) -> i32 {
+    #[cfg(target_os = "windows")]
+    warn_without_webview2();
     // Handed to `build_and_run` by reference: it only takes the worker once the loop is about
     // to start, so a setup failure leaves it here for us to run without a UI.
     let mut work: Option<Worker> = Some(Box::new(work));
@@ -537,6 +539,32 @@ pub fn run(work: impl FnOnce() -> i32 + Send + 'static, opts: AppOptions) -> i32
             }
         }
     }
+}
+
+/// Tell the person at the machine when the UI cannot possibly start, before it fails.
+///
+/// Every window here is a WebView2 surface. Windows 11 ships the runtime; Windows 10 usually
+/// does not, and without it the agent falls back to running headless — from the desktop that
+/// looks exactly like double-clicking the app and nothing happening. A dialog naming the
+/// missing piece, with an offer to fetch it, beats a log line nobody reads.
+#[cfg(target_os = "windows")]
+fn warn_without_webview2() {
+    if wry::webview_version().is_ok() {
+        return;
+    }
+    tracing::error!("the Microsoft Edge WebView2 runtime is missing; the agent has no UI");
+    // The service supervises a child in the user's session and would pop this dialog on every
+    // restart; only an interactive launch asks.
+    if std::env::var_os("REMOTE_AGENT_NO_UI_PROMPT").is_some() {
+        return;
+    }
+    std::thread::spawn(|| {
+        let product = branding::product_name();
+        if crate::platform::windows::webview2_missing_dialog(&product) {
+            // The Evergreen bootstrapper: a small downloader that installs the runtime.
+            crate::platform::windows::open_url("https://go.microsoft.com/fwlink/p/?LinkId=2124703");
+        }
+    });
 }
 
 /// The agent worker, boxed so it can be handed back if the UI never starts.
