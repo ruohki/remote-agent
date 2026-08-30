@@ -54,6 +54,57 @@ jobs:
             target/x86_64-apple-darwin/release/remote-agent
           chmod +x dist/remote-agent-macos-universal
 
+      # A double-clickable app next to the bare binary. The binary is what a console bakes
+      # into a branded bundle (AGENT_DOWNLOAD_BASE serves it); this one is for installing by
+      # hand, so it carries the default product name and no baked configuration — it asks for
+      # a console URL and enrollment token on first run. The layout matches the bakery's
+      # (server/src/agent_bakery/bundle.rs) so both produce the same shape of app.
+      - name: Make app bundle
+        env:
+          PRODUCT: Remote Support
+          BUNDLE_ID: com.remoteagent.remote-support
+        run: |
+          APP="dist/${PRODUCT}.app"
+          mkdir -p "${APP}/Contents/MacOS" "${APP}/Contents/Resources"
+          cp dist/remote-agent-macos-universal "${APP}/Contents/MacOS/remote-agent"
+          chmod 0755 "${APP}/Contents/MacOS/remote-agent"
+          VERSION="${GITHUB_REF_NAME#v}"
+          cat > "${APP}/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleDevelopmentRegion</key>
+              <string>en</string>
+              <key>CFBundleExecutable</key>
+              <string>remote-agent</string>
+              <key>CFBundleIdentifier</key>
+              <string>${BUNDLE_ID}</string>
+              <key>CFBundleInfoDictionaryVersion</key>
+              <string>6.0</string>
+              <key>CFBundleName</key>
+              <string>${PRODUCT}</string>
+              <key>CFBundleDisplayName</key>
+              <string>${PRODUCT}</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>CFBundleShortVersionString</key>
+              <string>${VERSION}</string>
+              <key>CFBundleVersion</key>
+              <string>${VERSION}</string>
+              <key>LSMinimumSystemVersion</key>
+              <string>12.3</string>
+              <key>LSUIElement</key>
+              <false/>
+              <key>NSHighResolutionCapable</key>
+              <true/>
+              <key>NSHumanReadableCopyright</key>
+              <string>${PRODUCT}</string>
+          </dict>
+          </plist>
+          PLIST
+          plutil -lint "${APP}/Contents/Info.plist"
+
       # Signing runs only when the certificate secret exists; an unsigned binary is still a
       # usable release asset (the console re-signs the bundle it bakes anyway).
       - name: Import signing certificate
@@ -88,11 +139,18 @@ jobs:
 
       - name: Codesign
         if: env.HAS_SIGNING == 'true'
+        env:
+          PRODUCT: Remote Support
         run: |
           codesign --force --options runtime --timestamp \
             --keychain "${KEYCHAIN_PATH}" \
             --sign "${SIGN_IDENTITY}" dist/remote-agent-macos-universal
           codesign --verify --strict --verbose=2 dist/remote-agent-macos-universal
+          # --deep seals the nested executable as part of the bundle's signature.
+          codesign --force --deep --options runtime --timestamp \
+            --keychain "${KEYCHAIN_PATH}" \
+            --sign "${SIGN_IDENTITY}" "dist/${PRODUCT}.app"
+          codesign --verify --strict --deep --verbose=2 "dist/${PRODUCT}.app"
 
       # A bare Mach-O cannot carry a stapled ticket, so this only records the notarization with
       # Apple; Gatekeeper checks it online. A rejected submission fails the release.
@@ -102,12 +160,21 @@ jobs:
           ASC_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_KEY_BASE64 }}
           ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          PRODUCT: Remote Support
         run: |
           ASC_KEY_PATH="${RUNNER_TEMP}/AuthKey.p8"
           echo "${ASC_KEY_BASE64}" | base64 --decode > "${ASC_KEY_PATH}"
-          ditto -c -k dist/remote-agent-macos-universal "${RUNNER_TEMP}/notarize.zip"
-          xcrun notarytool submit "${RUNNER_TEMP}/notarize.zip" \
-            --key "${ASC_KEY_PATH}" --key-id "${ASC_KEY_ID}" --issuer "${ASC_ISSUER_ID}" --wait
+          notarize() {
+            xcrun notarytool submit "$1" \
+              --key "${ASC_KEY_PATH}" --key-id "${ASC_KEY_ID}" --issuer "${ASC_ISSUER_ID}" --wait
+          }
+          ditto -c -k dist/remote-agent-macos-universal "${RUNNER_TEMP}/notarize-bin.zip"
+          notarize "${RUNNER_TEMP}/notarize-bin.zip"
+          ditto -c -k --keepParent "dist/${PRODUCT}.app" "${RUNNER_TEMP}/notarize-app.zip"
+          notarize "${RUNNER_TEMP}/notarize-app.zip"
+          # A bundle can carry the ticket, so Gatekeeper clears it without asking Apple.
+          xcrun stapler staple "dist/${PRODUCT}.app"
+          xcrun stapler validate "dist/${PRODUCT}.app"
           rm -f "${ASC_KEY_PATH}"
 
       - name: Clean up keychain
@@ -117,10 +184,17 @@ jobs:
             security delete-keychain "${KEYCHAIN_PATH}" || true
           fi
 
+      - name: Zip the app
+        env:
+          PRODUCT: Remote Support
+        run: ditto -c -k --keepParent "dist/${PRODUCT}.app" "dist/remote-agent-macos-universal-app.zip"
+
       - uses: actions/upload-artifact@v4
         with:
           name: macos
-          path: dist/remote-agent-macos-universal
+          path: |
+            dist/remote-agent-macos-universal
+            dist/remote-agent-macos-universal-app.zip
 
   # ── Windows binaries ────────────────────────────────────────────────────────────────
   windows:
