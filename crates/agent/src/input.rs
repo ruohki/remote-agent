@@ -240,6 +240,71 @@ pub fn to_global(display: &DisplayInfo, video_size: (u32, u32), x: i32, y: i32) 
     (lx.round() as i32, ly.round() as i32)
 }
 
+/// Normalise a virtual-desktop point to the 0..65535 space `SendInput` expects with
+/// `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK`. `rect` is the virtual desktop as
+/// `(left, top, width, height)`; points outside it are clamped to its edge.
+///
+/// This exists because `enigo`'s absolute move normalises against the *primary* monitor and
+/// omits `MOUSEEVENTF_VIRTUALDESK`, so a coordinate on any other monitor lands clamped to the
+/// primary — the pointer sticks to an edge instead of following the operator.
+pub fn virtual_desktop_absolute(x: i32, y: i32, rect: (i32, i32, i32, i32)) -> (i32, i32) {
+    let (left, top, width, height) = rect;
+    let axis = |v: i32, origin: i32, span: i32| -> i32 {
+        let span = (span - 1).max(1) as i64;
+        let offset = (v - origin) as i64;
+        let scaled = (offset * 65535 + span / 2) / span;
+        scaled.clamp(0, 65535) as i32
+    };
+    (axis(x, left, width), axis(y, top, height))
+}
+
+/// Move the pointer to a point in *virtual desktop* pixels. Windows only: every other platform
+/// is served correctly by `enigo`.
+#[cfg(target_os = "windows")]
+fn move_pointer_absolute(x: i32, y: i32) -> Result<()> {
+    use ::windows::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE,
+        MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT,
+    };
+    use ::windows::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+        SM_YVIRTUALSCREEN,
+    };
+    // SAFETY: plain Win32 metric queries.
+    let rect = unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    };
+    if rect.2 <= 0 || rect.3 <= 0 {
+        bail!("virtual desktop has no size");
+    }
+    let (nx, ny) = virtual_desktop_absolute(x, y, rect);
+    let input = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: nx,
+                dy: ny,
+                mouseData: 0,
+                dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                time: 0,
+                // The agent's own windows drop input carrying this marker.
+                dwExtraInfo: INJECTED_EVENT_MARKER as usize,
+            },
+        },
+    };
+    // SAFETY: one fully initialised INPUT record.
+    let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+    if sent == 0 {
+        bail!("SendInput moved no pointer");
+    }
+    Ok(())
+}
+
 fn map_button(b: MouseButton) -> Button {
     match b {
         MouseButton::Left => Button::Left,
@@ -320,6 +385,9 @@ impl InputHandler for Injector {
                     .as_ref()
                     .context("no display selected for input")?;
                 let (gx, gy) = to_global(display, self.video_size, x, y);
+                #[cfg(target_os = "windows")]
+                move_pointer_absolute(gx, gy)?;
+                #[cfg(not(target_os = "windows"))]
                 self.enigo
                     .move_mouse(gx, gy, Coordinate::Abs)
                     .map_err(|e| anyhow!("move_mouse: {e}"))?;
@@ -422,6 +490,27 @@ impl LatestMove {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn virtual_desktop_absolute_spans_every_monitor() {
+        // Two 1920x1080 monitors side by side, primary on the left.
+        let rect = (0, 0, 3840, 1080);
+        assert_eq!(virtual_desktop_absolute(0, 0, rect), (0, 0));
+        assert_eq!(virtual_desktop_absolute(3839, 1079, rect), (65535, 65535));
+        // A point on the *second* monitor lands in the upper half of the range. Normalising
+        // against the primary alone (what enigo does) would overflow past 65535 and clamp the
+        // pointer to the right edge of the primary instead.
+        // 2880 is three quarters across the desktop, i.e. the middle of the second monitor.
+        assert_eq!(virtual_desktop_absolute(2880, 540, rect), (49164, 32798));
+
+        // A monitor left of and above the primary gives the desktop a negative origin.
+        let rect = (-1920, -120, 3840, 1200);
+        assert_eq!(virtual_desktop_absolute(-1920, -120, rect), (0, 0));
+        assert_eq!(virtual_desktop_absolute(0, 0, rect), (32776, 6559));
+        // Anything outside the desktop is clamped rather than wrapping to the far side.
+        assert_eq!(virtual_desktop_absolute(-5000, -5000, rect), (0, 0));
+        assert_eq!(virtual_desktop_absolute(99_999, 99_999, rect), (65535, 65535));
+    }
 
     #[test]
     fn latest_move_keeps_only_the_newest_position() {
