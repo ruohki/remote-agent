@@ -12,6 +12,7 @@ use windows::Win32::Graphics::Direct3D::{
     D3D_FEATURE_LEVEL_11_1,
 };
 use windows::Win32::Graphics::Direct3D10::ID3D10Multithread;
+use windows::Win32::Graphics::Direct3D11::ID3D11Multithread;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BIND_FLAG,
     D3D11_CPU_ACCESS_FLAG, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
@@ -39,7 +40,8 @@ pub struct D3dDevice {
 }
 
 // SAFETY: COM interface pointers can be moved between threads; D3D11 devices are
-// free-threaded and the context is protected via ID3D10Multithread.
+// free-threaded and `create_device` enables multithread protection on the immediate context
+// (and fails rather than continuing without it), which is what makes sharing it sound.
 unsafe impl Send for D3dDevice {}
 unsafe impl Sync for D3dDevice {}
 
@@ -162,10 +164,26 @@ fn create_device(adapter: Option<&IDXGIAdapter1>) -> Result<Arc<D3dDevice>> {
             level.0
         ));
     }
-    // Serialise immediate-context access in case another thread ever touches it.
-    if let Ok(mt) = context.cast::<ID3D10Multithread>() {
-        // SAFETY: plain COM call.
-        let _ = unsafe { mt.SetMultithreadProtected(true) };
+    // Serialise immediate-context access. This is not optional: the device is cached per
+    // adapter and shared by every pipeline on that GPU, and it is handed to the Media
+    // Foundation encoder through IMFDXGIDeviceManager, so the MFT's own worker threads touch
+    // it while the pipeline thread is issuing VideoProcessorBlt and CopyResource. Without it
+    // the result is intermittent corruption and DXGI_ERROR_DEVICE_HUNG.
+    //
+    // The supported query pairs are context → ID3D11Multithread and device → ID3D10Multithread;
+    // asking the context for ID3D10Multithread returns E_NOINTERFACE.
+    let protected = unsafe {
+        match context.cast::<ID3D11Multithread>() {
+            // SAFETY: plain COM call on an interface we just obtained.
+            Ok(mt) => mt.SetMultithreadProtected(true).as_bool(),
+            Err(_) => match device.cast::<ID3D10Multithread>() {
+                Ok(mt) => mt.SetMultithreadProtected(true).as_bool(),
+                Err(e) => return Err(e).context("querying multithread protection"),
+            },
+        }
+    };
+    if !protected {
+        tracing::debug!("D3D11 multithread protection was already enabled");
     }
     let adapter_luid = match adapter {
         Some(a) => luid_of(a)?,

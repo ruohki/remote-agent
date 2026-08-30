@@ -16,6 +16,94 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MessageBoxW, IDYES, MB_ICONQUESTION, MB_SETFOREGROUND, MB_SYSTEMMODAL, MB_TOPMOST, MB_YESNO,
 };
 
+/// Re-attach the standard handles to the console that launched us, if there was one.
+///
+/// The binary is linked for the `windows` subsystem so double-clicking it does not flash a
+/// console (see `main.rs`), which also means a run from `cmd`/PowerShell starts with no
+/// stdout at all. `AttachConsole(ATTACH_PARENT_PROCESS)` joins the parent's console and
+/// `SetStdHandle` points std{out,err,in} at it, so `enroll` / `status` / `doctor` print the
+/// way they do on macOS. A no-op when there is no parent console (the GUI and service cases).
+///
+/// Must run before anything writes to stdout or stderr.
+pub fn attach_parent_console() {
+    use windows::Win32::Foundation::GENERIC_WRITE;
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        OPEN_EXISTING,
+    };
+    use windows::Win32::System::Console::{
+        AttachConsole, GetStdHandle, SetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE,
+        STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    // A handle the parent already gave us — a pipe or a file from `> out.txt` / `| more`.
+    // Redirection must win over the console, so these are left alone below.
+    let inherited = |which| {
+        // SAFETY: plain query; returns NULL when the process has no such handle.
+        let h = unsafe { GetStdHandle(which) };
+        matches!(h, Ok(h) if !h.is_invalid())
+    };
+    let (had_out, had_err, had_in) = (
+        inherited(STD_OUTPUT_HANDLE),
+        inherited(STD_ERROR_HANDLE),
+        inherited(STD_INPUT_HANDLE),
+    );
+    if had_out && had_err && had_in {
+        return;
+    }
+
+    // SAFETY: no arguments to get wrong; fails harmlessly when we have no parent console
+    // (double-click, service) or already own one.
+    if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) }.is_err() {
+        return;
+    }
+
+    // Attaching does not populate the std handles — open the console device explicitly.
+    let open = |name: &str, write: bool| {
+        let name = HSTRING::from(name);
+        // SAFETY: `name` is a NUL-terminated wide string naming a console device that
+        // outlives the call; the handle is owned by the process from here on.
+        unsafe {
+            CreateFileW(
+                PCWSTR(name.as_ptr()),
+                if write {
+                    GENERIC_WRITE.0
+                } else {
+                    FILE_GENERIC_READ.0
+                },
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+        }
+        .ok()
+    };
+
+    if !had_out || !had_err {
+        if let Some(out) = open("CONOUT$", true) {
+            // SAFETY: `out` is a valid console handle owned by this process.
+            unsafe {
+                if !had_out {
+                    let _ = SetStdHandle(STD_OUTPUT_HANDLE, out);
+                }
+                if !had_err {
+                    let _ = SetStdHandle(STD_ERROR_HANDLE, out);
+                }
+            }
+        }
+    }
+    if !had_in {
+        if let Some(input) = open("CONIN$", false) {
+            // SAFETY: as above.
+            unsafe {
+                let _ = SetStdHandle(STD_INPUT_HANDLE, input);
+            }
+        }
+    }
+}
+
 /// Whether Windows apps use the dark theme (`HKCU\\...\\Personalize\\AppsUseLightTheme == 0`).
 pub fn dark_theme() -> bool {
     use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
@@ -219,7 +307,23 @@ pub fn exclude_hwnd_from_capture(hwnd: isize) {
         return;
     }
     // SAFETY: `hwnd` is a valid top-level window handle owned by this process.
-    let _ = unsafe { SetWindowDisplayAffinity(HWND(hwnd as *mut _), WDA_EXCLUDEFROMCAPTURE) };
+    let r = unsafe { SetWindowDisplayAffinity(HWND(hwnd as *mut _), WDA_EXCLUDEFROMCAPTURE) };
+    // WDA_EXCLUDEFROMCAPTURE needs Windows 10 2004+; older builds fail here and the window
+    // stays visible to the operator. Never silent — this is a privacy guarantee.
+    if let Err(e) = r {
+        tracing::warn!("excluding window from capture failed: {e}");
+    }
+}
+
+/// Whether this process is running inside a remote session (RDP / Terminal Services).
+///
+/// Windows draws a `WDA_EXCLUDEFROMCAPTURE` window on the physical console only: a remote
+/// session *is* a capture path, so an excluded window is invisible to the very person sitting
+/// in front of it. See [`exclude_hwnd_from_capture`].
+pub fn is_remote_session() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_REMOTESESSION};
+    // SAFETY: GetSystemMetrics takes no pointers and is safe to call from any thread.
+    unsafe { GetSystemMetrics(SM_REMOTESESSION) != 0 }
 }
 
 /// Trigger the secure attention sequence (Ctrl+Alt+Del) via `SendSAS`.
@@ -259,7 +363,7 @@ pub fn spawn_in_active_session(command_line: &str) -> Result<ActiveProcess> {
     use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
     use windows::Win32::System::RemoteDesktop::WTSQueryUserToken;
     use windows::Win32::System::Threading::{
-        CreateProcessAsUserW, CREATE_UNICODE_ENVIRONMENT, NORMAL_PRIORITY_CLASS,
+        CreateProcessAsUserW, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, NORMAL_PRIORITY_CLASS,
         PROCESS_INFORMATION, STARTUPINFOW,
     };
 
@@ -307,7 +411,10 @@ pub fn spawn_in_active_session(command_line: &str) -> Result<ActiveProcess> {
             None,
             None,
             false,
-            CREATE_UNICODE_ENVIRONMENT | NORMAL_PRIORITY_CLASS,
+            // CREATE_NO_WINDOW: the service has no console, so without it Windows hands the
+            // child a fresh one on the user's desktop at every login and every respawn — and
+            // closing that window sends CTRL_CLOSE, shutting the agent down.
+            CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW | NORMAL_PRIORITY_CLASS,
             Some(env),
             PCWSTR::null(),
             &si,

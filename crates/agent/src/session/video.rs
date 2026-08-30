@@ -155,6 +155,13 @@ impl VideoPipeline {
             .name("video-pipeline".into())
             .spawn(move || {
                 raise_thread_priority();
+                // The capturer and encoder were built on a tokio blocking thread, but every
+                // ProcessInput/ProcessOutput from here on runs on *this* thread, which needs
+                // its own COM apartment and Media Foundation reference. Idempotent.
+                #[cfg(target_os = "windows")]
+                if let Err(e) = crate::encode::mediafoundation::init_thread() {
+                    tracing::warn!("Media Foundation init on the pipeline thread: {e:#}");
+                }
                 worker.run(cmd_rx, frame_tx, event_tx, kf, stats_tx)
             })
             .context("spawning video pipeline thread")?;
@@ -304,6 +311,10 @@ struct Worker {
     /// Unix epoch millisecond of the last frame's capture (for correlating with the rig).
     last_capture_epoch_ms: u64,
     consecutive_errors: u32,
+    /// Encode failures in a row. Separate from `consecutive_errors`, which counts capture
+    /// failures and is cleared by every successful capture — sharing one counter meant a
+    /// permanently broken encoder never reached the reopen threshold.
+    consecutive_encode_errors: u32,
     // stats window
     window_start: Instant,
     window_frames: u32,
@@ -371,6 +382,7 @@ impl Worker {
             target_bitrate_kbps: target,
             last_capture_epoch_ms: 0,
             consecutive_errors: 0,
+            consecutive_encode_errors: 0,
             window_start: now,
             window_frames: 0,
             window_bytes: 0,
@@ -454,6 +466,7 @@ impl Worker {
             .output_size()
             .unwrap_or((self.width, self.height));
         self.consecutive_errors = 0;
+        self.consecutive_encode_errors = 0;
         self.last_stats.width = self.width;
         self.last_stats.height = self.height;
         self.last_stats.encoded_width = self.encoded.0;
@@ -708,6 +721,24 @@ impl Worker {
             }
 
             self.encode_and_send(frame, force, false, &frame_tx, &keyframe);
+
+            // An encoder that keeps rejecting frames is as fatal as a dead capturer, and
+            // rebuilding it is the only recovery we have (a lost D3D device, an MFT wedged
+            // after a stream change). Without this the pipeline warns forever and the viewer
+            // sees a black screen with no session failure.
+            if self.consecutive_encode_errors >= MAX_CONSECUTIVE_ERRORS {
+                reopen_attempts += 1;
+                if reopen_attempts > MAX_REOPEN_ATTEMPTS {
+                    let _ =
+                        event_tx.send(PipelineEvent::Failed("encoder keeps failing".to_string()));
+                    return;
+                }
+                tracing::warn!("encoder keeps failing; reopening the pipeline");
+                std::thread::sleep(Duration::from_millis(250));
+                if let Err(e) = self.reopen(&event_tx) {
+                    tracing::warn!("reopening after encode failures: {e:#}");
+                }
+            }
             self.publish_stats_if_due(&stats_tx);
         }
     }
@@ -723,10 +754,16 @@ impl Worker {
         let captured_at = frame.captured_at;
         let encode_start = Instant::now();
         let encoded = match self.encoder.encode(&frame, force) {
-            Ok(v) => v,
+            Ok(v) => {
+                self.consecutive_encode_errors = 0;
+                v
+            }
             Err(e) => {
-                self.consecutive_errors += 1;
-                tracing::warn!("encode error: {e:#}");
+                self.consecutive_encode_errors += 1;
+                tracing::warn!(
+                    "encode error ({}/{MAX_CONSECUTIVE_ERRORS}): {e:#}",
+                    self.consecutive_encode_errors
+                );
                 if force {
                     keyframe.store(true, Ordering::Relaxed);
                 }
