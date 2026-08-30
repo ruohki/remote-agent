@@ -315,17 +315,6 @@ pub fn exclude_hwnd_from_capture(hwnd: isize) {
     }
 }
 
-/// Whether this process is running inside a remote session (RDP / Terminal Services).
-///
-/// Windows draws a `WDA_EXCLUDEFROMCAPTURE` window on the physical console only: a remote
-/// session *is* a capture path, so an excluded window is invisible to the very person sitting
-/// in front of it. See [`exclude_hwnd_from_capture`].
-pub fn is_remote_session() -> bool {
-    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_REMOTESESSION};
-    // SAFETY: GetSystemMetrics takes no pointers and is safe to call from any thread.
-    unsafe { GetSystemMetrics(SM_REMOTESESSION) != 0 }
-}
-
 /// Trigger the secure attention sequence (Ctrl+Alt+Del) via `SendSAS`.
 ///
 /// Requires the `SoftwareSASGeneration` policy to allow services, and that the agent runs as

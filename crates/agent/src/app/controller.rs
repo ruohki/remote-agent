@@ -552,14 +552,7 @@ fn build_and_run(work: &mut Option<Worker>, opts: AppOptions) -> Result<i32> {
         .with_visible(opts.show_on_start)
         .build(&event_loop)
         .context("creating app window")?;
-    // The overlays, the session bar and the privacy screen are always excluded — that is the
-    // privacy guarantee. This window is different: it is the *device user's* control panel, so
-    // being unable to see it is worse than the operator catching a glimpse of it. In a remote
-    // session an excluded window is invisible to the person using the machine, which leaves the
-    // app running with no reachable UI, so keep it capturable there.
-    if exclusion_hides_from_local_user() {
-        tracing::info!("remote session: leaving the app window visible to screen capture");
-    } else {
+    if hide_app_window_from_capture() {
         exclude_from_capture(&window);
     }
     apply_app_icons(&window);
@@ -960,20 +953,19 @@ fn console_host(url: &str) -> String {
     s.split('/').next().unwrap_or("").to_string()
 }
 
-/// Whether excluding a window from capture would also hide it from the person at the device.
+/// Whether to hide the *app window* from screen capture. Off unless asked for.
 ///
-/// True in a Windows remote session, where the "capture" being excluded is the very thing
-/// drawing the user's screen. Elsewhere (and on macOS, where `sharingType = none` only affects
-/// capture) exclusion is invisible to the local user.
-fn exclusion_hides_from_local_user() -> bool {
-    #[cfg(target_os = "windows")]
-    {
-        crate::platform::windows::is_remote_session()
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        false
-    }
+/// `WDA_EXCLUDEFROMCAPTURE` (and `sharingType = none`) hides a window from every capture path,
+/// not just the operator's stream. When the person at the device views their own machine
+/// through anything capture-based — Parsec, Sunshine, RDP, a Teams share — an excluded app
+/// window is invisible to *them*, and the agent appears to start with nothing but a tray icon.
+///
+/// The session bar, the annotation overlays and the privacy screen stay excluded
+/// unconditionally: there, not being captured is the guarantee rather than a nicety. For this
+/// window the trade is the other way round — the operator glimpsing the device user's own
+/// control panel costs little, being unable to reach it costs everything.
+fn hide_app_window_from_capture() -> bool {
+    std::env::var_os("REMOTE_AGENT_HIDE_APP_WINDOW").is_some()
 }
 
 /// Exclude our window from the screen capture the operator sees.
