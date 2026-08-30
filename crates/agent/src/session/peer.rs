@@ -285,13 +285,24 @@ impl Peer {
         let mut setting_engine = SettingEngine::default();
         setting_engine.set_multicast_dns_mode(MulticastDnsMode::QueryOnly);
         setting_engine.set_multicast_dns_timeout(Some(std::time::Duration::from_secs(5)));
+        // Test seam (debug builds only): gather ICE on loopback alone. A CI runner carries
+        // extra interfaces (Hyper-V switches, VPN adapters) whose host candidates pair with the
+        // loopback peer into combinations Windows refuses to write to (WSAEADDRNOTAVAIL), and
+        // the in-process loopback tests then never connect.
+        let udp_addr = if cfg!(debug_assertions)
+            && std::env::var_os("REMOTE_AGENT_TEST_LOOPBACK_ICE").is_some()
+        {
+            "127.0.0.1:0"
+        } else {
+            "0.0.0.0:0"
+        };
         let pc = PeerConnectionBuilder::new()
             .with_configuration(config)
             .with_media_engine(media_engine)
             .with_setting_engine(setting_engine)
             .with_interceptor_registry(registry)
             .with_handler(Arc::new(Handler { tx: events }))
-            .with_udp_addrs(vec!["0.0.0.0:0".to_string()])
+            .with_udp_addrs(vec![udp_addr.to_string()])
             // Bounded per-channel send buffer: `DataChannel::send` blocks when a file
             // transfer fills it, which is the back-pressure the sender task relies on.
             .with_data_channel_send_buffer_limit(protocol::files::BUFFERED_HIGH_WATER as usize)

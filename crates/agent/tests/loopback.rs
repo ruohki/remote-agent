@@ -185,6 +185,9 @@ struct Harness {
 impl Harness {
     async fn connect(opts: Options) -> Self {
         init_tracing();
+        // Both peers live in this process: keep ICE on loopback so the machine's other
+        // interfaces cannot produce candidate pairs that never connect.
+        std::env::set_var("REMOTE_AGENT_TEST_LOOPBACK_ICE", "1");
         let input_events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let releases = Arc::new(AtomicU64::new(0));
         let rec = RecordingInput {
