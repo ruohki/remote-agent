@@ -9,7 +9,11 @@
 //!   browser on blur, and called on session teardown) never leaves keys stuck.
 
 use anyhow::{anyhow, Context, Result};
-use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
+#[cfg(target_os = "windows")]
+use anyhow::bail;
+use enigo::{Axis, Button, Direction, Enigo, Key, Keyboard, Mouse, Settings};
+#[cfg(not(target_os = "windows"))]
+use enigo::Coordinate;
 use protocol::channel::{InputEvent, MouseButton};
 use protocol::common::DisplayInfo;
 use std::collections::{HashMap, HashSet};
