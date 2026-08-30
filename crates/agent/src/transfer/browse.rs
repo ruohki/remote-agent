@@ -156,9 +156,13 @@ mod tests {
 
     #[test]
     fn rejects_relative_and_parent_components() {
+        // An existing absolute directory on every platform: "/tmp" is not absolute on Windows,
+        // where an absolute path needs a drive letter or a UNC prefix.
+        let tmp = std::env::temp_dir();
+        let escape = tmp.join("..").join("etc");
         assert!(resolve("relative/path").is_err());
-        assert!(resolve("/tmp/../etc").is_err());
-        assert!(resolve("/tmp").is_ok());
+        assert!(resolve(&escape.to_string_lossy()).is_err());
+        assert!(resolve(&tmp.to_string_lossy()).is_ok());
     }
 
     #[test]
