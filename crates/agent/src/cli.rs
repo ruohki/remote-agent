@@ -165,10 +165,13 @@ pub fn run_agent_blocking(paths: &crate::config::Paths) -> Result<()> {
     rt.block_on(async move {
         crate::shutdown::install_handlers();
         let mut notice = None;
+        // Set once the person asked to enroll again, so the Connect screen is shown rather
+        // than a baked binary quietly re-enrolling itself with the console it came from.
+        let mut requested = false;
         loop {
             // The Connect screen can wait forever; a stop request must not.
             tokio::select! {
-                r = crate::startup::ensure_enrolled(paths, notice.take()) => r?,
+                r = crate::startup::ensure_enrolled(paths, notice.take(), requested) => r?,
                 _ = crate::shutdown::wait() => {
                     tracing::info!("shutting down before enrollment completed");
                     return Ok(());
@@ -179,6 +182,7 @@ pub fn run_agent_blocking(paths: &crate::config::Paths) -> Result<()> {
                     tracing::warn!("{e:#}; returning to the Connect screen");
                     crate::startup::forget_enrollment(paths)?;
                     notice = e.downcast_ref::<crate::hub::Reenroll>().map(|r| r.notice());
+                    requested = true;
                 }
                 other => return other,
             }

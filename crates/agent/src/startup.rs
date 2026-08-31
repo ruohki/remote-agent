@@ -40,6 +40,27 @@ pub fn start_state(local: Option<&LocalConfig>, baked: Option<&BakedConfig>) -> 
     }
 }
 
+/// The state a launch should act on. `requested` marks the person having asked to enroll again
+/// (Settings → *Enroll again*) rather than a normal start.
+///
+/// A baked binary carries an enrollment token, so the silent path would put it straight back
+/// into the console it came from — from the Settings screen, indistinguishable from the button
+/// being dead. When asked for by hand it therefore goes to the Connect screen instead, with
+/// the console it is tied to filled in and locked.
+pub fn start_state_for(
+    local: Option<&LocalConfig>,
+    baked: Option<&BakedConfig>,
+    requested: bool,
+) -> StartState {
+    match start_state(local, baked) {
+        StartState::AutoEnroll if requested => StartState::Connect {
+            server_url: baked.map(|b| b.server_url.clone()).unwrap_or_default(),
+            locked: baked.is_some(),
+        },
+        other => other,
+    }
+}
+
 /// Normalise and validate what was typed into the Console URL field. `Ok` carries the URL to
 /// use (`https://` assumed when no scheme was given, trailing slash removed); `Err` is the
 /// message to show under the field.
@@ -194,10 +215,16 @@ where
 /// unchanged: a baked token enrolls, anything else fails with the CLI hint. With the window,
 /// the Connect screen is shown and this only returns once an enrollment succeeded. `notice`
 /// is shown on the Connect screen (why we are here, e.g. the device was deleted).
-pub async fn ensure_enrolled(paths: &Paths, notice: Option<String>) -> Result<()> {
+/// Get the agent enrolled, showing the Connect screen when it cannot be done silently.
+///
+/// `requested` marks the person having asked for this (Settings → *Enroll again*) rather than
+/// a normal start. It suppresses the silent path: a baked binary would otherwise enroll itself
+/// straight back into the console it was built for with the token it carries, which from the
+/// Settings screen looks like the button doing nothing at all.
+pub async fn ensure_enrolled(paths: &Paths, notice: Option<String>, requested: bool) -> Result<()> {
     let local = LocalConfig::load(paths)?;
     let baked = crate::baked::get().map(|b| &b.config);
-    let (prefill, locked, error) = match start_state(local.as_ref(), baked) {
+    let (prefill, locked, error) = match start_state_for(local.as_ref(), baked, requested) {
         StartState::Enrolled => return Ok(()),
         StartState::AutoEnroll => match crate::enroll::auto_enroll_if_baked(paths).await {
             Ok(_) => return Ok(()),
@@ -219,6 +246,22 @@ pub async fn ensure_enrolled(paths: &Paths, notice: Option<String>) -> Result<()
                     "agent is not enrolled: run `remote-agent enroll --server <url> --token <token>`"
                 );
             }
+            let notice = match (locked, baked) {
+                (true, Some(b)) => {
+                    let host = url::Url::parse(&b.server_url)
+                        .ok()
+                        .and_then(|u| u.host_str().map(str::to_string))
+                        .unwrap_or_else(|| b.server_url.clone());
+                    let tied = format!(
+                        "This agent was built for {host} and can only enroll there. To use a different console, download an agent from it."
+                    );
+                    Some(match notice {
+                        Some(n) => format!("{n} {tied}"),
+                        None => tied,
+                    })
+                }
+                _ => notice,
+            };
             (server_url, locked, notice)
         }
     };
@@ -301,6 +344,35 @@ mod tests {
             issued_at: 0,
             console_tls_spki_sha256: None,
         }
+    }
+
+    #[test]
+    fn enrolling_again_by_hand_shows_the_screen_instead_of_re_enrolling_silently() {
+        let with_token = BakedConfig {
+            enroll_token: Some("tok".into()),
+            ..baked_for("https://console.example.com")
+        };
+        // A normal start still enrolls itself.
+        assert_eq!(
+            start_state_for(None, Some(&with_token), false),
+            StartState::AutoEnroll
+        );
+        // Asked for by hand it stops and shows where it is tied to.
+        assert_eq!(
+            start_state_for(None, Some(&with_token), true),
+            StartState::Connect {
+                server_url: "https://console.example.com".into(),
+                locked: true,
+            }
+        );
+        // An unbaked agent has nothing to re-enroll with, so nothing changes.
+        assert_eq!(
+            start_state_for(None, None, true),
+            StartState::Connect {
+                server_url: String::new(),
+                locked: false,
+            }
+        );
     }
 
     #[test]
