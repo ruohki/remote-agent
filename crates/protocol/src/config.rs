@@ -157,6 +157,12 @@ pub struct EnrollRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub display_name: Option<String>,
+    /// Stable hardware identity (Windows `MachineGuid`, macOS `IOPlatformUUID`). When a device
+    /// with the same machine id already exists, the console replaces it instead of adding a
+    /// duplicate (reinstall, re-image, installer re-run).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub machine_id: Option<String>,
 }
 
 /// Response of `POST /api/enroll`.

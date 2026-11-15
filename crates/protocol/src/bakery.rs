@@ -241,3 +241,40 @@ mod tests {
         assert_eq!(strip_trailer(&second), b"bin");
     }
 }
+
+/// Prefix of the version marker every agent binary carries in its data section
+/// (`<prefix><semver>\0`). The console reads it from base binaries it cannot execute (a
+/// Windows `.exe` on a Linux host) to know which agent version it hands out.
+pub const VERSION_MARKER_PREFIX: &[u8] = b"\0REMOTE-AGENT-VERSION:";
+
+/// Find the agent version in an agent binary's bytes (see [`VERSION_MARKER_PREFIX`]).
+pub fn find_agent_version(bytes: &[u8]) -> Option<String> {
+    let start = bytes
+        .windows(VERSION_MARKER_PREFIX.len())
+        .position(|w| w == VERSION_MARKER_PREFIX)?
+        + VERSION_MARKER_PREFIX.len();
+    let len = bytes[start..].iter().take(64).position(|&b| b == 0)?;
+    let version = std::str::from_utf8(&bytes[start..start + len]).ok()?;
+    let valid = !version.is_empty()
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'));
+    valid.then(|| version.to_string())
+}
+
+#[cfg(test)]
+mod version_marker_tests {
+    use super::*;
+
+    #[test]
+    fn finds_the_marker_version() {
+        let mut bin = b"MZ....random bytes".to_vec();
+        bin.extend_from_slice(VERSION_MARKER_PREFIX);
+        bin.extend_from_slice(b"0.2.0-beta.1\0trailing");
+        assert_eq!(find_agent_version(&bin).as_deref(), Some("0.2.0-beta.1"));
+        assert_eq!(find_agent_version(b"no marker here"), None);
+        let mut unterminated = VERSION_MARKER_PREFIX.to_vec();
+        unterminated.extend_from_slice(b"1.0.0");
+        assert_eq!(find_agent_version(&unterminated), None);
+    }
+}

@@ -34,4 +34,4 @@ notify_operator: boolean,
  * Whether this operator may engage the privacy screen (console decides from the
  * operator's device permission; policy and device support are checked by the agent).
  */
-privacy_screen_allowed: boolean, } | { "type": "ice_candidate", session_id: string, candidate: IceCandidate, } | { "type": "session_end", session_id: string, reason: EndReason, } | { "type": "ping", nonce: bigint, } | { "type": "update", version: string, url: string, sha256: string, } | { "type": "goodbye", reason: string, };
+privacy_screen_allowed: boolean, } | { "type": "ice_candidate", session_id: string, candidate: IceCandidate, } | { "type": "session_end", session_id: string, reason: EndReason, } | { "type": "ping", nonce: bigint, } | { "type": "update", version: string, url: string, sha256: string, } | { "type": "goodbye", reason: string, } | { "type": "retire", reason: string, };

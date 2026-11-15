@@ -21,8 +21,17 @@ pub mod config;
 pub mod files;
 pub mod ui;
 
-/// Bumped on incompatible wire changes. Sent in `hello` by both agent and console.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Bumped on wire changes. Sent in `hello` by both agent and console.
+///
+/// * 1 — initial protocol.
+/// * 2 — `machine_id` / `desktop` in `hello` and heartbeats, `ConsoleToAgent::Retire`.
+///   Additive: a version-2 console still talks to version-1 agents and only sends them
+///   messages they know.
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// Oldest protocol version a console accepts in `hello`. Keeping the previous version
+/// accepted lets a console be upgraded ahead of its fleet without stranding agents.
+pub const MIN_PROTOCOL_VERSION: u32 = 1;
 
 /// WebSocket path the agent connects to on the console.
 pub const AGENT_WS_PATH: &str = "/ws/agent";

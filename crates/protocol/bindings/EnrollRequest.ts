@@ -13,4 +13,10 @@ token: string, hostname: string, os: Os, arch: Arch, agent_version: string,
 /**
  * Optional operator-facing name (`remote-agent enroll --name`); defaults to the hostname.
  */
-display_name?: string, };
+display_name?: string, 
+/**
+ * Stable hardware identity (Windows `MachineGuid`, macOS `IOPlatformUUID`). When a device
+ * with the same machine id already exists, the console replaces it instead of adding a
+ * duplicate (reinstall, re-image, installer re-run).
+ */
+machine_id?: string, };

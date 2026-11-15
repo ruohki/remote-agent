@@ -184,6 +184,22 @@ pub enum SessionState {
     Ended,
 }
 
+/// What the device's own screen shows, as far as the agent can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS, Default)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum DesktopState {
+    /// Someone is signed in and their desktop is showing.
+    User,
+    /// Someone is signed in but the session is locked.
+    Locked,
+    /// Nobody is signed in: the sign-in screen is showing.
+    SignIn,
+    /// The agent cannot tell (older agents, or no capture process yet).
+    #[default]
+    Unknown,
+}
+
 /// Why a session ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
