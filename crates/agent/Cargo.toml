@@ -80,8 +80,6 @@ enigo = "0.6"
 # clipboard
 arboard = "3.6"
 
-# help-me approval dialog + session indicator
-rfd = { version = "0.17", default-features = false }
 
 # file transfer / clipboard images
 png = "0.18"

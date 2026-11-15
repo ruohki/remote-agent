@@ -171,7 +171,7 @@ fn protocol1_hello_and_heartbeat_still_parse() {
             ..
         }
     ));
-    assert!(protocol::MIN_PROTOCOL_VERSION <= 1 && protocol::PROTOCOL_VERSION >= 2);
+    const _: () = assert!(protocol::MIN_PROTOCOL_VERSION <= 1 && protocol::PROTOCOL_VERSION >= 2);
 }
 
 #[test]
