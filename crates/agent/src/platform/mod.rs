@@ -23,6 +23,8 @@ pub mod dpapi;
 pub mod macos;
 #[cfg(target_os = "windows")]
 pub mod windows;
+#[cfg(target_os = "windows")]
+pub mod windows_desktop;
 
 static MAIN_LOOP_RUNNING: AtomicBool = AtomicBool::new(false);
 
@@ -65,6 +67,77 @@ pub fn logged_in_user() -> Option<String> {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         std::env::var("USER").ok()
+    }
+}
+
+/// Stable hardware identity: Windows `MachineGuid`, macOS `IOPlatformUUID`. Lets the console
+/// recognise a reinstalled machine instead of adding a duplicate device. Cached.
+pub fn machine_id() -> Option<String> {
+    static ID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        #[cfg(target_os = "macos")]
+        let id = macos::platform_uuid();
+        #[cfg(target_os = "windows")]
+        let id = windows::machine_guid();
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let id = std::fs::read_to_string("/etc/machine-id")
+            .ok()
+            .map(|s| s.trim().to_string());
+        id.filter(|s| !s.is_empty())
+    })
+    .clone()
+}
+
+/// What the device's screen shows: a signed-in desktop, a locked session or the sign-in screen.
+pub fn desktop_state() -> protocol::common::DesktopState {
+    #[cfg(target_os = "macos")]
+    {
+        macos::desktop_state()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows::desktop_state()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        protocol::common::DesktopState::Unknown
+    }
+}
+
+/// OS session of this process: the Windows session id, the uid elsewhere (one GUI session
+/// per user on macOS).
+pub fn os_session_id() -> u32 {
+    #[cfg(target_os = "windows")]
+    {
+        use ::windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+        let mut session = 0u32;
+        // SAFETY: plain query with a valid out-parameter.
+        let _ = unsafe { ProcessIdToSessionId(std::process::id(), &mut session) };
+        session
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: getuid has no preconditions.
+        unsafe { libc_getuid() }
+    }
+}
+
+#[cfg(unix)]
+extern "C" {
+    #[link_name = "getuid"]
+    fn libc_getuid() -> u32;
+}
+
+/// Whether this process's GUI session is the one on the physical console (macOS fast user
+/// switching keeps other users' sessions alive in the background). Always true elsewhere.
+pub fn session_on_console() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        macos::session_on_console()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
     }
 }
 
@@ -198,8 +271,27 @@ pub fn set_clipboard_files(paths: &[PathBuf]) -> Result<()> {
     }
 }
 
+type SasHandler = std::sync::Arc<dyn Fn() + Send + Sync>;
+static SAS_HANDLER: parking_lot::Mutex<Option<SasHandler>> = parking_lot::Mutex::new(None);
+
+/// Route Ctrl+Alt+Del elsewhere: a session host asks the service, because Windows only
+/// generates the secure attention sequence for services (`SendSAS(FALSE)`).
+pub fn set_secure_attention_handler(handler: SasHandler) {
+    *SAS_HANDLER.lock() = Some(handler);
+}
+
 /// Send the secure attention sequence (Ctrl+Alt+Del) where the platform has one.
 pub fn secure_attention() {
+    let handler = SAS_HANDLER.lock().clone();
+    if let Some(h) = handler {
+        h();
+        return;
+    }
+    send_secure_attention_here();
+}
+
+/// `SendSAS` from this process (the service on Windows).
+pub fn send_secure_attention_here() {
     #[cfg(target_os = "windows")]
     {
         if let Err(e) = windows::send_sas() {

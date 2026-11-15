@@ -25,11 +25,20 @@ pub fn handle(paths: &Paths, action: ServiceAction) -> Result<()> {
     }
 }
 
-/// Whether the agent is already installed as a service / launch agent on this machine.
+/// Restart the installed service when it is running (after `enroll`). Best effort.
+pub fn restart_if_running() {
+    #[cfg(target_os = "macos")]
+    launchd::restart_if_running();
+    #[cfg(target_os = "windows")]
+    windows_service_impl::restart_if_running();
+}
+
+/// Whether the agent is installed as a service on this machine (the service then owns the
+/// device identity and the console connection).
 pub fn is_installed() -> bool {
     #[cfg(target_os = "macos")]
     {
-        std::path::Path::new("/Library/LaunchAgents/com.remoteagent.agent.plist").exists()
+        launchd::is_installed()
     }
     #[cfg(target_os = "windows")]
     {

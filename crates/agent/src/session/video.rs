@@ -323,6 +323,11 @@ struct Worker {
     window_capture_to_encoded_ms: f32,
     window_encode_ms: f32,
     window_keyframes: u32,
+    /// Windows: last desktop-switch epoch seen, and when to repeat the switch keyframe.
+    #[cfg(target_os = "windows")]
+    desktop_epoch: u64,
+    #[cfg(target_os = "windows")]
+    repeat_keyframe_at: Option<Instant>,
     window_idle_refreshes: u32,
     /// A change frame was sent and its follow-up frame has not been produced yet.
     follow_up_pending: bool,
@@ -390,6 +395,10 @@ impl Worker {
             window_capture_to_encoded_ms: 0.0,
             window_encode_ms: 0.0,
             window_keyframes: 0,
+            #[cfg(target_os = "windows")]
+            desktop_epoch: crate::platform::windows_desktop::switch_epoch(),
+            #[cfg(target_os = "windows")]
+            repeat_keyframe_at: None,
             window_idle_refreshes: 0,
             follow_up_pending: false,
             encoded_total: 0,
@@ -661,6 +670,21 @@ impl Worker {
                 }
             };
 
+            // A desktop switch replaces the whole picture: keyframe now and once more a second
+            // later, so a viewer that lost part of the first one does not freeze on the old
+            // desktop until it asks.
+            #[cfg(target_os = "windows")]
+            {
+                let epoch = crate::platform::windows_desktop::switch_epoch();
+                if epoch != self.desktop_epoch {
+                    self.desktop_epoch = epoch;
+                    keyframe.store(true, Ordering::Relaxed);
+                    self.repeat_keyframe_at = Some(Instant::now() + Duration::from_millis(1200));
+                } else if self.repeat_keyframe_at.is_some_and(|t| Instant::now() >= t) {
+                    self.repeat_keyframe_at = None;
+                    keyframe.store(true, Ordering::Relaxed);
+                }
+            }
             let force = keyframe.swap(false, Ordering::Relaxed);
             let frame = match frame {
                 Some(f) => {

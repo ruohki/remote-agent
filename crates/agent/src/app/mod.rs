@@ -19,6 +19,7 @@ mod annotate;
 mod bar;
 mod controller;
 mod privacy;
+pub mod remote;
 
 use crate::approval::{Indicator, IndicatorHandle};
 use crate::chat::{ChatHandle, ChatLine, ChatUi};
@@ -210,18 +211,28 @@ fn set_proxy(p: tao::event_loop::EventLoopProxy<AppEvent>) {
     *PROXY.get_or_init(|| parking_lot::Mutex::new(None)).lock() = Some(Proxy(p));
 }
 
-/// Post an event to the UI thread. No-op when the app loop is not running.
+/// Post an event to the UI thread. In a session host whose UI lives in a `ui` process the
+/// event is forwarded there ([`remote`]). No-op when there is no UI.
 pub fn post(ev: AppEvent) {
     if let Some(cell) = PROXY.get() {
         if let Some(p) = cell.lock().as_ref() {
             let _ = p.0.send_event(ev);
+            return;
         }
+    }
+    if remote::is_host() {
+        remote::forward(ev);
     }
 }
 
-/// Whether the app event loop is running (window/tray available).
-pub fn is_running() -> bool {
+/// Whether the app event loop runs in this process.
+fn local_loop() -> bool {
     PROXY.get().map(|c| c.lock().is_some()).unwrap_or(false)
+}
+
+/// Whether an app UI is available: the loop in this process, or a connected `ui` process.
+pub fn is_running() -> bool {
+    local_loop() || remote::ui_connected()
 }
 
 /// Set the process-wide "end the active session" action (used by the tray "End session").

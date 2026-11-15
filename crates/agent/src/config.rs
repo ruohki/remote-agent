@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 
 pub const CONFIG_FILE: &str = "agent.toml";
 
+/// Set when the config directory was chosen explicitly (`--config-dir`).
+static EXPLICIT_DIR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub dir: PathBuf,
@@ -22,6 +25,7 @@ impl Paths {
     /// Resolve the configuration directory: explicit override, else a system-wide location
     /// (the agent runs as a service, so per-user dirs are not appropriate).
     pub fn resolve(override_dir: Option<PathBuf>) -> Result<Self> {
+        EXPLICIT_DIR.store(override_dir.is_some(), std::sync::atomic::Ordering::SeqCst);
         let dir = match override_dir {
             Some(d) => d,
             None => {
@@ -43,6 +47,36 @@ impl Paths {
             }
         };
         Ok(Self { dir })
+    }
+
+    /// The machine-wide state directory the service owns, whether or not this process may
+    /// write it (session hosts and UI processes only read from it).
+    pub fn machine() -> Self {
+        Self { dir: default_dir() }
+    }
+
+    /// Whether this is the machine-wide directory (service install) rather than a per-user one.
+    pub fn is_machine(&self) -> bool {
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        canon(&self.dir) == canon(&default_dir())
+    }
+
+    /// A log directory this process can write: `<dir>/logs` when writable, else the per-user
+    /// state directory's `logs` (session hosts on macOS and UI processes run as the user).
+    pub fn writable_log_dir(paths: &Paths) -> PathBuf {
+        let preferred = paths.log_dir();
+        if dir_is_writable(&preferred) {
+            return preferred;
+        }
+        user_dir()
+            .map(|d| d.join("logs"))
+            .unwrap_or_else(std::env::temp_dir)
+    }
+
+    /// An explicitly chosen directory (`--config-dir`) other than the machine one: a
+    /// side-by-side agent (tests, development) that never conflicts with the service.
+    pub fn is_machine_override(&self) -> bool {
+        EXPLICIT_DIR.load(std::sync::atomic::Ordering::SeqCst) && !self.is_machine()
     }
 
     pub fn config_file(&self) -> PathBuf {
@@ -224,6 +258,11 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
         #[cfg(not(unix))]
         {
             std::fs::write(&tmp, bytes)?;
+            #[cfg(windows)]
+            if Paths::machine().dir == path.parent().map(Path::to_path_buf).unwrap_or_default() {
+                crate::platform::windows::restrict_to_admins(&tmp)
+                    .with_context(|| format!("restricting access to {}", tmp.display()))?;
+            }
         }
     }
     std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))?;

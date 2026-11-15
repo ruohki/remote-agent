@@ -382,6 +382,9 @@ impl InputHandler for Injector {
         if !self.enabled {
             return Ok(());
         }
+        // Injected input only reaches the desktop the calling thread is attached to.
+        #[cfg(target_os = "windows")]
+        crate::platform::windows_desktop::follow_input_desktop();
         match event {
             InputEvent::MouseMove { x, y } => {
                 let display = self

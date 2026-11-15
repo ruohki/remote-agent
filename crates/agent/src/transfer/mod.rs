@@ -81,8 +81,9 @@ pub struct TransferConfig {
 impl TransferConfig {
     /// Default transfer directory: `<home>/Downloads/RemoteAgent`.
     pub fn default_dir() -> PathBuf {
-        browse::home_dir()
-            .map(|h| h.join("Downloads").join("RemoteAgent"))
+        browse::user_folder("Downloads")
+            .or_else(|| browse::home_dir().map(|h| h.join("Downloads")))
+            .map(|d| d.join("RemoteAgent"))
             .unwrap_or_else(|| std::env::temp_dir().join("RemoteAgent"))
     }
 }

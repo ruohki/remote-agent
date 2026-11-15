@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 /// One annotation instruction, in the physical pixel space of `display`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum AnnotateEvent {
     /// Start or continue a stroke (`points` are appended in order).
     Stroke {

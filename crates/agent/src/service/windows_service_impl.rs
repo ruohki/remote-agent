@@ -1,17 +1,29 @@
 //! Windows service management and the SCM entry point.
 //!
-//! The service runs as **LocalSystem** and auto-starts at boot. Because a LocalSystem service
-//! lives in session 0 (no visible desktop), `service run` does not capture directly; instead
-//! it *supervises* a child `remote-agent run` launched in the active console session with the
-//! logged-in user's token (`CreateProcessAsUser` on `winsta0\default`). The child is restarted
-//! when it exits or when the active session changes (fast user switching, RDP).
+//! The service (`RemoteAgent`, LocalSystem, automatic start) is the agent on an installed
+//! machine:
+//!
+//! * the **daemon** ([`crate::daemon`]) runs on a tokio runtime inside the service process:
+//!   identity, console connection, policy, updates, Ctrl+Alt+Del;
+//! * the **supervisor** (this module, on the SCM thread) keeps two children alive in the
+//!   session attached to the physical console:
+//!   - the **session host** (`session-host`), started with the service's SYSTEM token moved
+//!     into that session — it follows the input desktop, so it works on the sign-in screen,
+//!     the lock screen, UAC prompts and the user's desktop alike, with nobody signed in;
+//!   - the **UI** (`ui --session N`), started with the signed-in user's token while someone
+//!     is signed in: tray, window, chat, session bar, approval prompts, privacy screen.
+//!
+//! Children are restarted with backoff when they exit and replaced when the console moves to
+//! another session (fast user switching, sign-out). Locking the screen changes nothing: the
+//! host simply follows the lock screen. Stopping asks the host over the link to end its
+//! session first; only stragglers are terminated. A kill-on-close job ties both children to the
+//! service process, so a crashed service leaves nothing behind.
 
 use crate::cli::ServiceAction;
 use crate::config::Paths;
 use anyhow::{bail, Context, Result};
 use std::ffi::OsString;
 use std::path::PathBuf;
-// Only the SCM dispatcher (below) uses a channel.
 #[cfg(feature = "winservice")]
 use std::sync::mpsc;
 use std::time::Duration;
@@ -22,10 +34,14 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 const SERVICE_NAME: &str = "RemoteAgent";
 const DISPLAY_NAME: &str = "Remote Agent";
+/// Service-specific exit code after an update: the recovery actions restart the service
+/// (with the new executable) because the exit counts as a failure.
+#[cfg(feature = "winservice")]
+const EXIT_RESTART_FOR_UPDATE: u32 = 0x5250;
 
 pub fn handle(paths: &Paths, action: ServiceAction) -> Result<()> {
     match action {
-        ServiceAction::Install => install(),
+        ServiceAction::Install => install(paths),
         ServiceAction::Uninstall => uninstall(),
         ServiceAction::Start => start(),
         ServiceAction::Stop => stop(),
@@ -37,11 +53,8 @@ fn exe_path() -> Result<PathBuf> {
     std::env::current_exe().context("locating current executable")
 }
 
-fn install() -> Result<()> {
-    let manager =
-        ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CREATE_SERVICE)
-            .context("opening service manager (run as administrator)")?;
-    let info = ServiceInfo {
+fn service_info() -> Result<ServiceInfo> {
+    Ok(ServiceInfo {
         name: OsString::from(SERVICE_NAME),
         display_name: OsString::from(DISPLAY_NAME),
         service_type: ServiceType::OWN_PROCESS,
@@ -53,31 +66,157 @@ fn install() -> Result<()> {
         dependencies: vec![],
         account_name: None, // LocalSystem
         account_password: None,
+    })
+}
+
+/// Install or update the service, configure recovery, prepare the machine, start it.
+/// Idempotent: re-running it (installer re-run, upgrade, RMM retry) updates in place.
+fn install(paths: &Paths) -> Result<()> {
+    use windows_service::service::{
+        ServiceAction as ScAction, ServiceActionType, ServiceFailureActions,
+        ServiceFailureResetPeriod,
     };
-    let service = manager
-        .create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)
-        .context("creating service")?;
+    let manager = ServiceManager::local_computer(
+        None::<&str>,
+        ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
+    )
+    .context("opening service manager (run as administrator)")?;
+    let info = service_info()?;
+    let access = ServiceAccess::CHANGE_CONFIG
+        | ServiceAccess::START
+        | ServiceAccess::STOP
+        | ServiceAccess::QUERY_STATUS;
+    let service = match manager.open_service(SERVICE_NAME, access) {
+        Ok(existing) => {
+            existing
+                .change_config(&info)
+                .context("updating the existing service")?;
+            println!("updated service {SERVICE_NAME}");
+            existing
+        }
+        Err(_) => {
+            let created = manager
+                .create_service(&info, access)
+                .context("creating service")?;
+            println!("installed service {SERVICE_NAME}");
+            created
+        }
+    };
     service
         .set_description("Remote support agent: screen sharing and remote control")
         .ok();
-    service.start(&[] as &[&str]).ok();
-    println!("installed and started service {SERVICE_NAME}");
+    // Restart after crashes and after an update (which exits with a failure code on purpose).
+    let actions = ServiceFailureActions {
+        reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(24 * 3600)),
+        reboot_msg: None,
+        command: None,
+        actions: Some(vec![
+            ScAction {
+                action_type: ServiceActionType::Restart,
+                delay: Duration::from_secs(2),
+            },
+            ScAction {
+                action_type: ServiceActionType::Restart,
+                delay: Duration::from_secs(10),
+            },
+            ScAction {
+                action_type: ServiceActionType::Restart,
+                delay: Duration::from_secs(30),
+            },
+        ]),
+    };
+    if let Err(e) = service.update_failure_actions(actions) {
+        eprintln!("warning: configuring service recovery failed: {e}");
+    }
+    if let Err(e) = service.set_failure_actions_on_non_crash_failures(true) {
+        eprintln!("warning: configuring service recovery failed: {e}");
+    }
+    match crate::platform::windows::allow_service_sas() {
+        Ok(true) => println!("allowed services to send Ctrl+Alt+Del (SoftwareSASGeneration)"),
+        Ok(false) => {}
+        Err(e) => eprintln!("warning: Ctrl+Alt+Del will not work: {e:#}"),
+    }
+    migrate_identity(paths);
+
+    // (Re)start so the running service is the binary just installed.
+    if let Ok(status) = service.query_status() {
+        if status.current_state != ServiceState::Stopped {
+            let _ = service.stop();
+            wait_for(&service, ServiceState::Stopped, Duration::from_secs(20));
+        }
+    }
+    service.start(&[] as &[&str]).context("starting service")?;
+    println!("started service {SERVICE_NAME}");
     Ok(())
+}
+
+/// Bring an identity enrolled under the old layout to where the service can use it: a
+/// per-user config (enrolled from the app) is copied to the machine directory, and a secret
+/// protected for one user is re-protected for the machine. Runs as the installing admin.
+fn migrate_identity(paths: &Paths) {
+    use crate::config::LocalConfig;
+    let machine = Paths::machine();
+    let machine_enrolled = LocalConfig::load(&machine)
+        .ok()
+        .flatten()
+        .map(|c| c.is_enrolled())
+        .unwrap_or(false);
+    if !machine_enrolled && !paths.is_machine() {
+        if let Ok(Some(user_cfg)) = LocalConfig::load(paths) {
+            if user_cfg.is_enrolled() {
+                match crate::secrets::load(paths, &user_cfg) {
+                    Ok((secret, _)) => {
+                        let mut cfg = user_cfg.clone();
+                        crate::secrets::store(&machine, &mut cfg, &secret);
+                        match cfg.save(&machine) {
+                            Ok(()) => println!(
+                                "moved the enrollment from {} to {}",
+                                paths.dir.display(),
+                                machine.dir.display()
+                            ),
+                            Err(e) => eprintln!("warning: moving the enrollment: {e:#}"),
+                        }
+                    }
+                    Err(e) => eprintln!("warning: reading the existing enrollment: {e:#}"),
+                }
+            }
+        }
+    }
+    match crate::secrets::reprotect_for_machine(&machine) {
+        Ok(true) => println!("device secret re-protected for the service"),
+        Ok(false) => {}
+        Err(e) => eprintln!("warning: {e:#}"),
+    }
+}
+
+fn wait_for(service: &windows_service::service::Service, state: ServiceState, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        match service.query_status() {
+            Ok(s) if s.current_state == state => return,
+            Ok(_) => std::thread::sleep(Duration::from_millis(250)),
+            Err(_) => return,
+        }
+    }
 }
 
 fn uninstall() -> Result<()> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .context("opening service manager (run as administrator)")?;
-    let service = manager
-        .open_service(
-            SERVICE_NAME,
-            ServiceAccess::STOP | ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS,
-        )
-        .context("opening service")?;
+    let service = match manager.open_service(
+        SERVICE_NAME,
+        ServiceAccess::STOP | ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS,
+    ) {
+        Ok(s) => s,
+        Err(_) => {
+            println!("service {SERVICE_NAME} is not installed");
+            return Ok(());
+        }
+    };
     if let Ok(status) = service.query_status() {
         if status.current_state != ServiceState::Stopped {
             let _ = service.stop();
-            std::thread::sleep(Duration::from_secs(1));
+            wait_for(&service, ServiceState::Stopped, Duration::from_secs(20));
         }
     }
     service.delete().context("deleting service")?;
@@ -95,10 +234,35 @@ fn start() -> Result<()> {
 
 fn stop() -> Result<()> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-    let service = manager.open_service(SERVICE_NAME, ServiceAccess::STOP)?;
+    let service = manager.open_service(
+        SERVICE_NAME,
+        ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
+    )?;
     service.stop().context("stopping service")?;
+    wait_for(&service, ServiceState::Stopped, Duration::from_secs(20));
     println!("stopped {SERVICE_NAME}");
     Ok(())
+}
+
+/// Restart the service when it runs (after `enroll`, so it picks the new identity up).
+pub fn restart_if_running() {
+    let Ok(manager) = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+    else {
+        return;
+    };
+    let Ok(service) = manager.open_service(
+        SERVICE_NAME,
+        ServiceAccess::STOP | ServiceAccess::START | ServiceAccess::QUERY_STATUS,
+    ) else {
+        return;
+    };
+    if matches!(service.query_status(), Ok(s) if s.current_state == ServiceState::Running) {
+        let _ = service.stop();
+        wait_for(&service, ServiceState::Stopped, Duration::from_secs(20));
+        if service.start(&[] as &[&str]).is_ok() {
+            println!("restarted service {SERVICE_NAME}");
+        }
+    }
 }
 
 // ─── SCM entry point ────────────────────────────────────────────────────────────────────
@@ -106,8 +270,14 @@ fn stop() -> Result<()> {
 #[cfg(feature = "winservice")]
 mod scm {
     use super::*;
+    use crate::daemon::HostRouter;
+    use crate::platform::windows::{
+        active_console_session, session_user, spawn_in_active_session, spawn_system_in_session,
+        ActiveProcess, KillOnCloseJob,
+    };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::time::Instant;
     use windows_service::service::{
         ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
         ServiceType,
@@ -130,20 +300,23 @@ mod scm {
 
     fn run() -> Result<()> {
         let stop = Arc::new(AtomicBool::new(false));
-        let (session_tx, session_rx) = mpsc::channel::<()>();
+        let (wake_tx, wake_rx) = mpsc::channel::<()>();
         let stop_handler = Arc::clone(&stop);
-        let session_tx2 = session_tx.clone();
+        let wake = wake_tx.clone();
 
         let status_handle = service_control_handler::register(SERVICE_NAME, move |control| {
             match control {
-                ServiceControl::Stop | ServiceControl::Shutdown => {
+                ServiceControl::Stop | ServiceControl::Shutdown | ServiceControl::Preshutdown => {
                     stop_handler.store(true, Ordering::SeqCst);
-                    let _ = session_tx2.send(());
+                    crate::shutdown::request("service stop");
+                    let _ = wake.send(());
                     ServiceControlHandlerResult::NoError
                 }
+                // Any session event: the supervisor re-checks which session is on the console.
+                // Lock / unlock need nothing (the host follows the lock screen), but waking
+                // early is harmless.
                 ServiceControl::SessionChange(_) => {
-                    // Active session changed: restart the child in the new session.
-                    let _ = session_tx2.send(());
+                    let _ = wake.send(());
                     ServiceControlHandlerResult::NoError
                 }
                 ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
@@ -165,17 +338,142 @@ mod scm {
         };
         status_handle.set_service_status(running.clone())?;
 
-        supervise(&stop, &session_rx);
+        // The daemon: its own thread and runtime.
+        let paths = Paths::machine();
+        let router = HostRouter::new();
+        let daemon_router = Arc::clone(&router);
+        let daemon_stop = Arc::clone(&stop);
+        let daemon_wake = wake_tx.clone();
+        let daemon = std::thread::Builder::new()
+            .name("daemon".into())
+            .spawn(move || {
+                let rt = match tokio::runtime::Runtime::new() {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        tracing::error!("service runtime: {e}");
+                        return;
+                    }
+                };
+                if let Err(e) = rt.block_on(crate::daemon::run(paths, daemon_router)) {
+                    tracing::error!("service: {e:#}");
+                }
+                // An update (or a fatal error) ends the daemon: stop the service too.
+                daemon_stop.store(true, Ordering::SeqCst);
+                let _ = daemon_wake.send(());
+            })
+            .context("starting the daemon thread")?;
+
+        supervise(&stop, &wake_rx, &router);
 
         status_handle.set_service_status(ServiceStatus {
+            current_state: ServiceState::StopPending,
+            wait_hint: Duration::from_secs(10),
+            ..running.clone()
+        })?;
+        crate::shutdown::request("service stop");
+        let _ = daemon.join();
+
+        let updated = crate::shutdown::reason().as_deref() == Some("update applied");
+        status_handle.set_service_status(ServiceStatus {
             current_state: ServiceState::Stopped,
+            exit_code: if updated {
+                ServiceExitCode::ServiceSpecific(EXIT_RESTART_FOR_UPDATE)
+            } else {
+                ServiceExitCode::Win32(0)
+            },
             ..running
         })?;
         Ok(())
     }
 
-    /// Keep one `remote-agent run` child alive in the active console session.
-    fn supervise(stop: &Arc<AtomicBool>, session_rx: &mpsc::Receiver<()>) {
+    /// One supervised child with restart backoff.
+    struct Child {
+        proc: Option<ActiveProcess>,
+        started: Instant,
+        backoff: Duration,
+        next_try: Instant,
+        what: &'static str,
+    }
+
+    impl Child {
+        fn new(what: &'static str) -> Self {
+            Self {
+                proc: None,
+                started: Instant::now(),
+                backoff: Duration::from_secs(1),
+                next_try: Instant::now(),
+                what,
+            }
+        }
+
+        /// Reap an exited child and schedule the restart (exponential while it keeps dying
+        /// young, reset after a minute of uptime).
+        fn reap(&mut self) {
+            let exited = self
+                .proc
+                .as_ref()
+                .map(|p| p.wait(Duration::ZERO))
+                .unwrap_or(false);
+            if !exited {
+                return;
+            }
+            let lived = self.started.elapsed();
+            self.proc = None;
+            if lived > Duration::from_secs(60) {
+                self.backoff = Duration::from_secs(1);
+            } else {
+                self.backoff = (self.backoff * 2).min(Duration::from_secs(60));
+            }
+            self.next_try = Instant::now() + self.backoff;
+            tracing::warn!(
+                child = self.what,
+                lived_s = lived.as_secs(),
+                retry_in_s = self.backoff.as_secs(),
+                "child exited"
+            );
+        }
+
+        fn session(&self) -> Option<u32> {
+            self.proc.as_ref().map(|p| p.session)
+        }
+
+        fn running(&self) -> bool {
+            self.proc.is_some()
+        }
+
+        fn started(&mut self, p: ActiveProcess, job: &Option<KillOnCloseJob>) {
+            if let Some(job) = job {
+                job.assign(&p);
+            }
+            tracing::info!(
+                child = self.what,
+                pid = p.pid,
+                session = p.session,
+                "started"
+            );
+            self.proc = Some(p);
+            self.started = Instant::now();
+        }
+
+        fn failed(&mut self, e: anyhow::Error) {
+            self.backoff = (self.backoff * 2).min(Duration::from_secs(60));
+            self.next_try = Instant::now() + self.backoff;
+            tracing::debug!(child = self.what, "cannot start: {e:#}");
+        }
+
+        /// Wait up to `grace` for a voluntary exit, then terminate.
+        fn stop(&mut self, grace: Duration) {
+            if let Some(p) = self.proc.take() {
+                if !p.wait(grace) {
+                    tracing::warn!(child = self.what, pid = p.pid, "did not exit; terminating");
+                    p.terminate();
+                }
+            }
+        }
+    }
+
+    /// Keep the session host and the UI alive in the console session.
+    fn supervise(stop: &Arc<AtomicBool>, wake: &mpsc::Receiver<()>, router: &Arc<HostRouter>) {
         let exe = match exe_path() {
             Ok(p) => p,
             Err(e) => {
@@ -183,41 +481,62 @@ mod scm {
                 return;
             }
         };
-        let command_line = format!("\"{}\" run", exe.display());
+        let job = KillOnCloseJob::new()
+            .map_err(|e| tracing::warn!("job object: {e:#}"))
+            .ok();
+        let mut host = Child::new("session host");
+        let mut ui = Child::new("ui");
 
         while !stop.load(Ordering::SeqCst) {
-            match crate::platform::windows::spawn_in_active_session(&command_line) {
-                Ok(child) => {
-                    tracing::info!(session = child.session, "started agent child");
-                    // Wait until the child exits, a session change / stop is signalled.
-                    loop {
-                        if stop.load(Ordering::SeqCst) {
-                            child.terminate();
-                            return;
-                        }
-                        if child.wait(Duration::from_millis(500)) {
-                            tracing::warn!("agent child exited; restarting");
-                            break;
-                        }
-                        // Session change → restart in the (possibly new) active session.
-                        if session_rx.try_recv().is_ok() {
-                            if stop.load(Ordering::SeqCst) {
-                                child.terminate();
-                                return;
-                            }
-                            tracing::info!("session changed; restarting agent child");
-                            child.terminate();
-                            break;
-                        }
+            host.reap();
+            ui.reap();
+            let console = active_console_session();
+
+            // The console moved to another session: replace both children.
+            if host.running() && host.session() != console {
+                tracing::info!(from = ?host.session(), to = ?console, "console session changed");
+                router.shutdown_hosts("console session changed");
+                host.stop(Duration::from_secs(4));
+                ui.stop(Duration::from_secs(1));
+                host.next_try = Instant::now();
+                ui.next_try = Instant::now();
+            }
+            if ui.running() && ui.session() != console {
+                ui.stop(Duration::from_secs(1));
+            }
+
+            if let Some(session) = console {
+                if !host.running() && Instant::now() >= host.next_try {
+                    let cmd = format!("\"{}\" session-host", exe.display());
+                    match spawn_system_in_session(&cmd, session) {
+                        Ok(p) => host.started(p, &job),
+                        Err(e) => host.failed(e),
                     }
                 }
-                Err(e) => {
-                    // No user logged in yet, or transient failure: wait and retry.
-                    tracing::debug!("cannot start agent child: {e:#}");
-                    let _ = session_rx.recv_timeout(Duration::from_secs(3));
+                // The UI needs someone signed in (it runs with their token).
+                let signed_in = session_user(session).is_some();
+                if host.running() && signed_in && !ui.running() && Instant::now() >= ui.next_try {
+                    let cmd = format!("\"{}\" ui --session {session}", exe.display());
+                    match spawn_in_active_session(&cmd) {
+                        Ok(p) if p.session == session => ui.started(p, &job),
+                        Ok(p) => {
+                            // The console moved between the two calls; try again.
+                            p.terminate();
+                        }
+                        Err(e) => ui.failed(e),
+                    }
                 }
             }
+            let _ = wake.recv_timeout(Duration::from_millis(500));
         }
+
+        // Stopping: the daemon tells the host to end its session; give it time to say so.
+        router.shutdown_hosts(
+            &crate::shutdown::reason().unwrap_or_else(|| "service stopping".into()),
+        );
+        host.stop(Duration::from_secs(6));
+        ui.stop(Duration::from_secs(1));
+        drop(job);
     }
 }
 

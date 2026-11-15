@@ -2,7 +2,8 @@
 use anyhow::{Context, Result};
 use windows::Win32::Foundation::{LocalFree, HLOCAL};
 use windows::Win32::Security::Cryptography::{
-    CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    CryptProtectData, CryptUnprotectData, CRYPTPROTECT_LOCAL_MACHINE, CRYPTPROTECT_UI_FORBIDDEN,
+    CRYPT_INTEGER_BLOB,
 };
 
 fn blob_of(bytes: &[u8]) -> CRYPT_INTEGER_BLOB {
@@ -21,21 +22,21 @@ fn take(out: CRYPT_INTEGER_BLOB) -> Vec<u8> {
     }
 }
 
-pub fn protect(secret: &[u8]) -> Result<Vec<u8>> {
+/// Protect `secret`. `machine` scope can be unprotected by any process on this machine (the
+/// file's ACL is then the protection: SYSTEM and Administrators only); user scope only by the
+/// account that protected it — useless for a service whose identity must survive every user.
+pub fn protect(secret: &[u8], machine: bool) -> Result<Vec<u8>> {
     let input = blob_of(secret);
     let mut out = CRYPT_INTEGER_BLOB::default();
+    let flags = if machine {
+        CRYPTPROTECT_UI_FORBIDDEN | CRYPTPROTECT_LOCAL_MACHINE
+    } else {
+        CRYPTPROTECT_UI_FORBIDDEN
+    };
     // SAFETY: valid input blob, output filled by the API.
     unsafe {
-        CryptProtectData(
-            &input,
-            None,
-            None,
-            None,
-            None,
-            CRYPTPROTECT_UI_FORBIDDEN,
-            &mut out,
-        )
-        .context("CryptProtectData")?;
+        CryptProtectData(&input, None, None, None, None, flags, &mut out)
+            .context("CryptProtectData")?;
     }
     Ok(take(out))
 }

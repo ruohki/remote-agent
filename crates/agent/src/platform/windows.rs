@@ -200,6 +200,92 @@ pub fn console_user() -> Option<String> {
     name.filter(|s| !s.is_empty())
 }
 
+/// `HKLM\\SOFTWARE\\Microsoft\\Cryptography\\MachineGuid` (64-bit view).
+pub fn machine_guid() -> Option<String> {
+    use windows::Win32::System::Registry::{
+        RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6464KEY,
+    };
+    let sub = HSTRING::from(r"SOFTWARE\Microsoft\Cryptography");
+    let name = HSTRING::from("MachineGuid");
+    let mut buf = vec![0u16; 128];
+    let mut size = (buf.len() * 2) as u32;
+    // SAFETY: the out-buffer is sized as advertised; the strings outlive the call.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(sub.as_ptr()),
+            PCWSTR(name.as_ptr()),
+            RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY,
+            None,
+            Some(buf.as_mut_ptr() as *mut _),
+            Some(&mut size),
+        )
+    };
+    if status.is_err() {
+        return None;
+    }
+    let chars = (size as usize / 2).saturating_sub(1).min(buf.len());
+    Some(String::from_utf16_lossy(&buf[..chars]).trim().to_string())
+}
+
+/// Lock state of the console session (`WTSSessionInfoEx`); `None` when it cannot be read.
+fn console_session_locked(session: u32) -> Option<bool> {
+    use windows::Win32::System::RemoteDesktop::{WTSSessionInfoEx, WTSINFOEXW};
+    // WTS_SESSIONSTATE_LOCK / _UNLOCK (Windows 8+; Windows 7 had them swapped).
+    const WTS_SESSIONSTATE_LOCK: i32 = 0;
+    const WTS_SESSIONSTATE_UNLOCK: i32 = 1;
+    let mut buffer: *mut WTSINFOEXW = std::ptr::null_mut();
+    let mut bytes: u32 = 0;
+    // SAFETY: the API allocates the buffer; freed with WTSFreeMemory below.
+    let ok = unsafe {
+        WTSQuerySessionInformationW(
+            Some(WTS_CURRENT_SERVER_HANDLE),
+            session,
+            WTSSessionInfoEx,
+            &mut buffer as *mut *mut WTSINFOEXW as *mut _,
+            &mut bytes,
+        )
+    };
+    if ok.is_err() || buffer.is_null() {
+        return None;
+    }
+    // SAFETY: level 1 is the only level the API returns; buffer is valid until freed.
+    let flags = unsafe {
+        let info = &*buffer;
+        let f = if info.Level == 1 {
+            Some(info.Data.WTSInfoExLevel1.SessionFlags)
+        } else {
+            None
+        };
+        WTSFreeMemory(buffer as *mut _);
+        f
+    };
+    match flags {
+        Some(WTS_SESSIONSTATE_LOCK) => Some(true),
+        Some(WTS_SESSIONSTATE_UNLOCK) => Some(false),
+        _ => None,
+    }
+}
+
+/// What the physical console shows.
+pub fn desktop_state() -> protocol::common::DesktopState {
+    use protocol::common::DesktopState;
+    // SAFETY: plain query.
+    let session = unsafe { WTSGetActiveConsoleSessionId() };
+    if session == 0xFFFF_FFFF {
+        // Between sessions (logoff in progress, session switch).
+        return DesktopState::Unknown;
+    }
+    if console_user().is_none() {
+        return DesktopState::SignIn;
+    }
+    match console_session_locked(session) {
+        Some(true) => DesktopState::Locked,
+        Some(false) => DesktopState::User,
+        None => DesktopState::Unknown,
+    }
+}
+
 /// `MessageBoxW` Yes/No, topmost, auto-denied after `timeout`.
 ///
 /// Runs on a dedicated thread; the timeout posts a click by simulating a close through
@@ -361,10 +447,119 @@ pub fn exclude_hwnd_from_capture(hwnd: isize) {
     }
 }
 
+/// Give `path` a protected DACL: full control for SYSTEM and Administrators, nobody else
+/// (the machine-wide `agent.toml` holds the device secret).
+pub fn restrict_to_admins(path: &std::path::Path) -> Result<()> {
+    use windows::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HLOCAL};
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
+        SDDL_REVISION_1, SE_FILE_OBJECT,
+    };
+    use windows::Win32::Security::{
+        GetSecurityDescriptorDacl, ACL, DACL_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    };
+    let sddl = HSTRING::from("D:P(A;;FA;;;SY)(A;;FA;;;BA)");
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: valid SDDL; `sd` is freed with LocalFree below.
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(&sddl, SDDL_REVISION_1, &mut sd, None)
+            .context("building the agent.toml ACL")?;
+    }
+    let result = (|| -> Result<()> {
+        let mut present = windows::core::BOOL(0);
+        let mut defaulted = windows::core::BOOL(0);
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        // SAFETY: `sd` is a valid descriptor; the DACL pointer aliases into it.
+        unsafe { GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted) }
+            .context("reading the DACL")?;
+        let wpath = HSTRING::from(path.as_os_str());
+        // SAFETY: valid path and DACL for the duration of the call.
+        let err = unsafe {
+            SetNamedSecurityInfoW(
+                &wpath,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(dacl),
+                None,
+            )
+        };
+        if err != ERROR_SUCCESS {
+            bail!("SetNamedSecurityInfoW failed ({})", err.0);
+        }
+        Ok(())
+    })();
+    // SAFETY: allocated by ConvertStringSecurityDescriptorToSecurityDescriptorW.
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(sd.0)));
+    }
+    result
+}
+
+/// Make sure services may generate the secure attention sequence (Ctrl+Alt+Del):
+/// `HKLM\\…\\Policies\\System\\SoftwareSASGeneration` = 1 (services) or 3 (services and
+/// ease-of-access apps). Leaves a value that already allows services alone; returns whether it
+/// changed anything. A domain GPO setting the same value wins at the next policy refresh.
+pub fn allow_service_sas() -> Result<bool> {
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegCreateKeyExW, RegGetValueW, RegSetValueExW, HKEY, HKEY_LOCAL_MACHINE,
+        KEY_SET_VALUE, KEY_WOW64_64KEY, REG_DWORD, REG_OPTION_NON_VOLATILE, RRF_RT_REG_DWORD,
+        RRF_SUBKEY_WOW6464KEY,
+    };
+    let sub = HSTRING::from(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System");
+    let name = HSTRING::from("SoftwareSASGeneration");
+    let mut value: u32 = 0;
+    let mut size = 4u32;
+    // SAFETY: DWORD out-buffer sized as advertised.
+    let read = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(sub.as_ptr()),
+            PCWSTR(name.as_ptr()),
+            RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY,
+            None,
+            Some(&mut value as *mut u32 as *mut _),
+            Some(&mut size),
+        )
+    };
+    if read.is_ok() && (value == 1 || value == 3) {
+        return Ok(false);
+    }
+    let new = if read.is_ok() && value == 2 {
+        3u32
+    } else {
+        1u32
+    };
+    let mut key = HKEY::default();
+    // SAFETY: standard create/open; the key is closed below.
+    unsafe {
+        RegCreateKeyExW(
+            HKEY_LOCAL_MACHINE,
+            &sub,
+            None,
+            None,
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE | KEY_WOW64_64KEY,
+            None,
+            &mut key,
+            None,
+        )
+        .ok()
+        .context("opening the System policies key")?;
+        let r = RegSetValueExW(key, &name, None, REG_DWORD, Some(&new.to_le_bytes()));
+        let _ = RegCloseKey(key);
+        r.ok().context("setting SoftwareSASGeneration")?;
+    }
+    Ok(true)
+}
+
 /// Trigger the secure attention sequence (Ctrl+Alt+Del) via `SendSAS`.
 ///
-/// Requires the `SoftwareSASGeneration` policy to allow services, and that the agent runs as
-/// SYSTEM. Loaded dynamically because `sas.dll` is not present on all SKUs.
+/// Requires the `SoftwareSASGeneration` policy to allow services ([`allow_service_sas`]) and a
+/// caller that *is* a service: the session host asks the service to do it. Loaded dynamically
+/// because `sas.dll` is not present on all SKUs.
 pub fn send_sas() -> Result<()> {
     use windows::core::s;
     use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
@@ -463,6 +658,7 @@ pub fn spawn_in_active_session(command_line: &str) -> Result<ActiveProcess> {
         Ok(ActiveProcess {
             process: pi.hProcess,
             session,
+            pid: pi.dwProcessId,
         })
     }
 }
@@ -482,11 +678,221 @@ impl Drop for HandleGuard {
     }
 }
 
+/// Spawn `command_line` with this (LocalSystem) process's token moved into Windows session
+/// `session`. Used for the session host: as SYSTEM it can follow the input desktop onto the
+/// sign-in screen, the lock screen and UAC prompts, and it does not need anyone signed in.
+#[cfg(feature = "winservice")]
+pub fn spawn_system_in_session(command_line: &str, session: u32) -> Result<ActiveProcess> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::HANDLE as WHANDLE;
+    use windows::Win32::Security::{
+        DuplicateTokenEx, SecurityIdentification, SetTokenInformation, TokenPrimary,
+        TokenSessionId, TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_SESSIONID, TOKEN_ALL_ACCESS,
+        TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
+    use windows::Win32::System::Threading::{
+        CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken, CREATE_NO_WINDOW,
+        CREATE_UNICODE_ENVIRONMENT, NORMAL_PRIORITY_CLASS, PROCESS_INFORMATION, STARTUPINFOW,
+    };
+
+    // SAFETY: sequence of Win32 calls each checked for failure; handles closed via guards.
+    unsafe {
+        let mut own = WHANDLE::default();
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_DUPLICATE
+                | TOKEN_QUERY
+                | TOKEN_ASSIGN_PRIMARY
+                | TOKEN_ADJUST_SESSIONID
+                | TOKEN_ADJUST_DEFAULT,
+            &mut own,
+        )
+        .context("OpenProcessToken")?;
+        let _own_guard = HandleGuard(own);
+        let mut primary = WHANDLE::default();
+        DuplicateTokenEx(
+            own,
+            TOKEN_ALL_ACCESS,
+            None,
+            SecurityIdentification,
+            TokenPrimary,
+            &mut primary,
+        )
+        .context("DuplicateTokenEx")?;
+        let _primary_guard = HandleGuard(primary);
+        SetTokenInformation(
+            primary,
+            TokenSessionId,
+            &session as *const u32 as *const _,
+            std::mem::size_of::<u32>() as u32,
+        )
+        .context("SetTokenInformation(TokenSessionId)")?;
+
+        let mut env: *mut core::ffi::c_void = std::ptr::null_mut();
+        CreateEnvironmentBlock(&mut env, Some(primary), false).context("CreateEnvironmentBlock")?;
+        let mut cmd: Vec<u16> = command_line
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        // The host re-attaches its working threads to whichever desktop has input.
+        let desktop: Vec<u16> = "winsta0\\default\0".encode_utf16().collect();
+        let si = STARTUPINFOW {
+            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+            lpDesktop: PWSTR(desktop.as_ptr() as *mut u16),
+            ..Default::default()
+        };
+        let mut pi = PROCESS_INFORMATION::default();
+        let result = CreateProcessAsUserW(
+            Some(primary),
+            PCWSTR::null(),
+            Some(PWSTR(cmd.as_mut_ptr())),
+            None,
+            None,
+            false,
+            CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW | NORMAL_PRIORITY_CLASS,
+            Some(env),
+            PCWSTR::null(),
+            &si,
+            &mut pi,
+        );
+        DestroyEnvironmentBlock(env).ok();
+        result.context("CreateProcessAsUserW")?;
+        let _ = CloseHandle(pi.hThread);
+        Ok(ActiveProcess {
+            process: pi.hProcess,
+            session,
+            pid: pi.dwProcessId,
+        })
+    }
+}
+
+/// A job object that kills every process in it when the last handle closes — the service's
+/// children die with the service, even when it crashes.
+#[cfg(feature = "winservice")]
+pub struct KillOnCloseJob(HANDLE);
+
+// SAFETY: a job handle may be used from any thread.
+#[cfg(feature = "winservice")]
+unsafe impl Send for KillOnCloseJob {}
+#[cfg(feature = "winservice")]
+unsafe impl Sync for KillOnCloseJob {}
+
+#[cfg(feature = "winservice")]
+impl KillOnCloseJob {
+    pub fn new() -> Result<Self> {
+        use windows::Win32::System::JobObjects::{
+            CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+        // SAFETY: anonymous job; the info struct is sized as advertised.
+        unsafe {
+            let job = CreateJobObjectW(None, PCWSTR::null()).context("CreateJobObjectW")?;
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const _,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+            .context("SetInformationJobObject")?;
+            Ok(Self(job))
+        }
+    }
+
+    pub fn assign(&self, p: &ActiveProcess) {
+        use windows::Win32::System::JobObjects::AssignProcessToJobObject;
+        // SAFETY: both handles are valid.
+        if let Err(e) = unsafe { AssignProcessToJobObject(self.0, p.process) } {
+            tracing::debug!("AssignProcessToJobObject: {e}");
+        }
+    }
+}
+
+#[cfg(feature = "winservice")]
+impl Drop for KillOnCloseJob {
+    fn drop(&mut self) {
+        // SAFETY: closing our own handle once.
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+/// Signed-in user of Windows session `session`, if any.
+pub fn session_user(session: u32) -> Option<String> {
+    let mut buffer: PCWSTR = PCWSTR::null();
+    let mut bytes: u32 = 0;
+    // SAFETY: WTSQuerySessionInformationW allocates the string; freed with WTSFreeMemory.
+    let ok = unsafe {
+        WTSQuerySessionInformationW(
+            Some(WTS_CURRENT_SERVER_HANDLE),
+            session,
+            WTSUserName,
+            &mut buffer as *mut PCWSTR as *mut _,
+            &mut bytes,
+        )
+    };
+    if ok.is_err() || buffer.is_null() {
+        return None;
+    }
+    // SAFETY: NUL-terminated wide string owned by us until freed.
+    let name = unsafe { buffer.to_string().ok() };
+    unsafe { WTSFreeMemory(buffer.as_ptr() as *mut _) };
+    name.filter(|s| !s.is_empty())
+}
+
+/// A known folder of the user signed in at the console, resolved with their token — what a
+/// SYSTEM session host must use instead of its own (system) profile. `None` when nobody is
+/// signed in or this process may not query user tokens (not SYSTEM).
+pub fn console_user_folder(folder: UserFolder) -> Option<std::path::PathBuf> {
+    use windows::Win32::System::RemoteDesktop::WTSQueryUserToken;
+    use windows::Win32::UI::Shell::{
+        FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Profile,
+        SHGetKnownFolderPath, KF_FLAG_DEFAULT,
+    };
+    let session = active_console_session()?;
+    let id = match folder {
+        UserFolder::Profile => FOLDERID_Profile,
+        UserFolder::Desktop => FOLDERID_Desktop,
+        UserFolder::Documents => FOLDERID_Documents,
+        UserFolder::Downloads => FOLDERID_Downloads,
+    };
+    // SAFETY: the token is closed below; the returned string is freed with CoTaskMemFree.
+    unsafe {
+        let mut token = HANDLE::default();
+        WTSQueryUserToken(session, &mut token).ok()?;
+        let path = SHGetKnownFolderPath(&id, KF_FLAG_DEFAULT, Some(token));
+        let _ = windows::Win32::Foundation::CloseHandle(token);
+        let p = path.ok()?;
+        let s = p.to_string().ok();
+        windows::Win32::System::Com::CoTaskMemFree(Some(p.0 as *const _));
+        s.map(std::path::PathBuf::from)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum UserFolder {
+    Profile,
+    Desktop,
+    Documents,
+    Downloads,
+}
+
+/// The session attached to the physical console, if any.
+pub fn active_console_session() -> Option<u32> {
+    // SAFETY: plain query.
+    let s = unsafe { WTSGetActiveConsoleSessionId() };
+    (s != 0xFFFF_FFFF).then_some(s)
+}
+
 /// A process running in the active session.
 #[cfg(feature = "winservice")]
 pub struct ActiveProcess {
     pub process: HANDLE,
     pub session: u32,
+    pub pid: u32,
 }
 
 #[cfg(feature = "winservice")]
@@ -943,7 +1349,7 @@ pub fn clipboard_sequence() -> Option<u64> {
 pub fn clipboard_files() -> Result<Vec<PathBuf>> {
     // SAFETY: standard clipboard access sequence.
     unsafe {
-        if !IsClipboardFormatAvailable(CF_HDROP.0 as u32).is_ok() {
+        if IsClipboardFormatAvailable(CF_HDROP.0 as u32).is_err() {
             return Ok(Vec::new());
         }
         OpenClipboard(None).context("OpenClipboard")?;

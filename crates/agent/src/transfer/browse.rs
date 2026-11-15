@@ -28,7 +28,7 @@ pub fn roots(transfer_dir: &Path) -> Vec<FileEntry> {
     if let Some(home) = home_dir() {
         push("Home", home.clone());
         for sub in ["Desktop", "Documents", "Downloads"] {
-            push(sub, home.join(sub));
+            push(sub, user_folder(sub).unwrap_or_else(|| home.join(sub)));
         }
     }
     push("Transfers", transfer_dir.to_path_buf());
@@ -57,8 +57,38 @@ pub fn roots(transfer_dir: &Path) -> Vec<FileEntry> {
     out
 }
 
+/// The signed-in user's home. On Windows the session host runs as SYSTEM, whose own profile
+/// is `…\\system32\\config\\systemprofile`: the console user's profile is what an operator
+/// means.
 pub fn home_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    if let Some(p) =
+        crate::platform::windows::console_user_folder(crate::platform::windows::UserFolder::Profile)
+    {
+        return Some(p);
+    }
     directories::UserDirs::new().map(|u| u.home_dir().to_path_buf())
+}
+
+/// Desktop / Documents / Downloads of the signed-in user, following folder redirection
+/// (OneDrive) on Windows. `None` → `<home>/<name>`.
+pub fn user_folder(name: &str) -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        use crate::platform::windows::{console_user_folder, UserFolder};
+        let folder = match name {
+            "Desktop" => UserFolder::Desktop,
+            "Documents" => UserFolder::Documents,
+            "Downloads" => UserFolder::Downloads,
+            _ => return None,
+        };
+        console_user_folder(folder)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = name;
+        None
+    }
 }
 
 /// Validate and normalise an operator-supplied path.
