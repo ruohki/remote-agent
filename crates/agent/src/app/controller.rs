@@ -219,11 +219,11 @@ impl Controller {
                 self.transcript.push((from, text.clone(), ts_ms));
                 self.eval(push_js(from, &text, ts_ms));
                 if matches!(from, ChatParty::Operator) {
-                    self.show(target, true);
+                    self.show(true);
                 }
             }
-            AppEvent::Show { chat } => self.show(target, chat),
-            AppEvent::Hide => self.hide(target),
+            AppEvent::Show { chat } => self.show(chat),
+            AppEvent::Hide => self.hide(),
             AppEvent::ConsoleStatus { connected } => {
                 self.console_connected = connected;
                 self.update_status_item();
@@ -260,12 +260,12 @@ impl Controller {
                 }
             }
             AppEvent::PermissionNeeded => {
-                self.show(target, false);
+                self.show(false);
                 let _ = self
                     .webview
                     .evaluate_script("window.__app&&window.__app.show('home');");
             }
-            AppEvent::Bar(msg) => self.on_bar(target, msg),
+            AppEvent::Bar(msg) => self.on_bar(msg),
             AppEvent::ControlPaused { paused } => {
                 self.control_paused = paused;
                 if let Some(bar) = self.bar.as_mut() {
@@ -344,7 +344,7 @@ impl Controller {
                         // The user has to act; in app mode bring the window up (service mode
                         // stays in the tray, whose status line says what to do).
                         if self.opts.show_on_start {
-                            self.show(target, false);
+                            self.show(false);
                         }
                     }
                     ConnectUi::Busy | ConnectUi::Failed { .. } => {
@@ -390,14 +390,14 @@ impl Controller {
         }
     }
 
-    fn on_bar(&mut self, target: &tao::event_loop::EventLoopWindowTarget<AppEvent>, msg: BarIpc) {
+    fn on_bar(&mut self, msg: BarIpc) {
         match msg {
             BarIpc::Ready => {
                 if let Some(bar) = self.bar.as_mut() {
                     bar.on_ready();
                 }
             }
-            BarIpc::Open => self.show(target, false),
+            BarIpc::Open => self.show(false),
             BarIpc::End => dispatch_disconnect(),
             BarIpc::Pause => super::dispatch_pause(true),
             BarIpc::Resume => super::dispatch_pause(false),
@@ -470,15 +470,9 @@ impl Controller {
         apply_app_icons(&self.window);
     }
 
-    fn show(&self, target: &tao::event_loop::EventLoopWindowTarget<AppEvent>, chat: bool) {
+    fn show(&self, chat: bool) {
         self.window.set_visible(true);
         self.window.set_focus();
-        set_dock_visible(target, true);
-        #[cfg(target_os = "windows")]
-        {
-            use tao::platform::windows::WindowExtWindows;
-            let _ = self.window.set_skip_taskbar(false);
-        }
         if chat {
             let _ = self
                 .webview
@@ -486,14 +480,8 @@ impl Controller {
         }
     }
 
-    fn hide(&self, target: &tao::event_loop::EventLoopWindowTarget<AppEvent>) {
+    fn hide(&self) {
         self.window.set_visible(false);
-        set_dock_visible(target, false);
-        #[cfg(target_os = "windows")]
-        {
-            use tao::platform::windows::WindowExtWindows;
-            let _ = self.window.set_skip_taskbar(true);
-        }
     }
 }
 
@@ -573,13 +561,20 @@ type Worker = Box<dyn FnOnce() -> i32 + Send + 'static>;
 fn build_and_run(work: &mut Option<Worker>, opts: AppOptions) -> Result<i32> {
     let event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
     let product = branding::product_name();
-    let window = WindowBuilder::new()
+    // Tray-only app: the window never gets a taskbar button or Dock icon. It cannot be minimized
+    // either (there would be nothing to restore it from); closing hides it to the tray.
+    let builder = WindowBuilder::new()
         .with_title(&product)
         .with_inner_size(tao::dpi::LogicalSize::new(720.0, 520.0))
         .with_min_inner_size(tao::dpi::LogicalSize::new(560.0, 420.0))
-        .with_visible(opts.show_on_start)
-        .build(&event_loop)
-        .context("creating app window")?;
+        .with_minimizable(false)
+        .with_visible(opts.show_on_start);
+    #[cfg(target_os = "windows")]
+    let builder = {
+        use tao::platform::windows::WindowBuilderExtWindows;
+        builder.with_skip_taskbar(true)
+    };
+    let window = builder.build(&event_loop).context("creating app window")?;
     if hide_app_window_from_capture() {
         exclude_from_capture(&window);
     }
@@ -708,9 +703,7 @@ fn build_and_run(work: &mut Option<Worker>, opts: AppOptions) -> Result<i32> {
             .ok();
     }
 
-    if !opts.show_on_start {
-        set_dock_visible(&event_loop, false);
-    }
+    hide_from_dock(&event_loop);
 
     // Route tray + menu events into the loop via the proxy.
     let menu_rx = MenuEvent::receiver();
@@ -771,8 +764,8 @@ fn build_and_run(work: &mut Option<Worker>, opts: AppOptions) -> Result<i32> {
         // Drain tray / menu events.
         while let Ok(ev) = menu_rx.try_recv() {
             match ev.id.as_ref() {
-                ID_OPEN => controller.show(target, false),
-                ID_CHAT => controller.show(target, true),
+                ID_OPEN => controller.show(false),
+                ID_CHAT => controller.show(true),
                 ID_END => dispatch_disconnect(),
                 // Clean shutdown: the worker ends the session and exits the process itself;
                 // a backstop forces the exit if that takes too long.
@@ -782,7 +775,7 @@ fn build_and_run(work: &mut Option<Worker>, opts: AppOptions) -> Result<i32> {
         }
         while let Ok(ev) = tray_rx.try_recv() {
             if let TrayIconEvent::DoubleClick { .. } = ev {
-                controller.show(target, false);
+                controller.show(false);
             }
         }
 
@@ -804,7 +797,7 @@ fn build_and_run(work: &mut Option<Worker>, opts: AppOptions) -> Result<i32> {
                     // The bar, the overlays and the privacy screen have no close control; ignore.
                 } else {
                     // Close hides the window; the session keeps running.
-                    controller.hide(target);
+                    controller.hide();
                 }
             }
             Event::WindowEvent {
@@ -1017,19 +1010,16 @@ pub(super) fn exclude_from_capture(window: &tao::window::Window) {
     }
 }
 
-/// Show / hide the macOS dock icon (Regular vs Accessory). No-op elsewhere.
-fn set_dock_visible(target: &tao::event_loop::EventLoopWindowTarget<AppEvent>, visible: bool) {
+/// macOS: a menu-bar (accessory) app, never a Dock icon — also for a bare binary without the
+/// bundle's `LSUIElement`. No-op elsewhere (Windows windows skip the taskbar when built).
+fn hide_from_dock(target: &tao::event_loop::EventLoopWindowTarget<AppEvent>) {
     #[cfg(target_os = "macos")]
     {
         use tao::platform::macos::{ActivationPolicy, EventLoopWindowTargetExtMacOS};
-        target.set_activation_policy_at_runtime(if visible {
-            ActivationPolicy::Regular
-        } else {
-            ActivationPolicy::Accessory
-        });
+        target.set_activation_policy_at_runtime(ActivationPolicy::Accessory);
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (target, visible);
+        let _ = target;
     }
 }
