@@ -28,7 +28,9 @@ pub fn start_state(local: Option<&LocalConfig>, baked: Option<&BakedConfig>) -> 
         return StartState::Enrolled;
     }
     match baked {
-        Some(b) if b.enroll_token.is_some() => StartState::AutoEnroll,
+        Some(b) if b.enroll_token.is_some() || crate::baked::enroll_token().is_some() => {
+            StartState::AutoEnroll
+        }
         Some(b) => StartState::Connect {
             server_url: b.server_url.clone(),
             locked: true,

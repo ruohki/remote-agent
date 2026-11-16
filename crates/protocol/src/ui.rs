@@ -74,6 +74,9 @@ pub struct DeviceSummary {
     /// Whether the agent can hide the device's displays (from its `hello` capabilities).
     #[serde(default)]
     pub privacy_screen: crate::common::PrivacyScreenSupport,
+    /// What the device's screen shows (signed in, locked, sign-in screen).
+    #[serde(default)]
+    pub desktop: crate::common::DesktopState,
 }
 
 /// Session row as shown in the console.

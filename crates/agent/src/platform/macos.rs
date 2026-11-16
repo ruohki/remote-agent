@@ -181,6 +181,69 @@ pub fn console_user() -> Option<(u32, String)> {
     Some((uid, name))
 }
 
+/// `IOPlatformUUID` of this Mac (`ioreg -rd1 -c IOPlatformExpertDevice`).
+pub fn platform_uuid() -> Option<String> {
+    let out = std::process::Command::new("/usr/sbin/ioreg")
+        .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines()
+        .find(|l| l.contains("\"IOPlatformUUID\""))
+        .and_then(|l| l.split('"').nth(3))
+        .map(str::to_string)
+}
+
+/// Facts about this process's GUI session from `CGSessionCopyCurrentDictionary`.
+struct GuiSession {
+    on_console: bool,
+    locked: bool,
+}
+
+fn gui_session() -> Option<GuiSession> {
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
+    use core_foundation::string::CFString;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGSessionCopyCurrentDictionary() -> CFDictionaryRef;
+    }
+    // SAFETY: returns a +1 dictionary or NULL (no GUI session: daemon / login window).
+    let raw = unsafe { CGSessionCopyCurrentDictionary() };
+    if raw.is_null() {
+        return None;
+    }
+    // SAFETY: we own the +1 reference returned above.
+    let dict: CFDictionary<CFString, CFType> = unsafe { CFDictionary::wrap_under_create_rule(raw) };
+    let flag = |key: &str| {
+        dict.find(CFString::new(key))
+            .and_then(|v| v.downcast::<CFBoolean>())
+            .map(bool::from)
+            .unwrap_or(false)
+    };
+    Some(GuiSession {
+        on_console: flag("kCGSSessionOnConsoleKey"),
+        locked: flag("CGSSessionScreenIsLocked"),
+    })
+}
+
+pub fn desktop_state() -> protocol::common::DesktopState {
+    use protocol::common::DesktopState;
+    match gui_session() {
+        Some(s) if s.locked => DesktopState::Locked,
+        Some(_) => DesktopState::User,
+        // No GUI session: the login window (nobody signed in) or a background daemon.
+        None if console_user().is_none() => DesktopState::SignIn,
+        None => DesktopState::Unknown,
+    }
+}
+
+pub fn session_on_console() -> bool {
+    gui_session().map(|s| s.on_console).unwrap_or(true)
+}
+
 pub fn screen_capture_allowed() -> bool {
     CGPreflightScreenCaptureAccess()
 }

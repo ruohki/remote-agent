@@ -1,0 +1,17 @@
+# Windows: link the C runtime statically. A clean Windows install has no VC++ redistributable,
+# and an agent importing VCRUNTIME140.dll does not even start there (STATUS_DLL_NOT_FOUND,
+# nothing on screen). cc/cmake-built dependencies follow the crt-static target feature.
+#
+# mfplat.dll is delay-loaded: Windows "N" editions have no Media Foundation without the Media
+# Feature Pack; `encode::mediafoundation::installed()` checks for it before any MF call and the
+# agent falls back to the software encoder.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/DELAYLOAD:mfplat.dll", "-C", "link-arg=delayimp.lib"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/DELAYLOAD:mfplat.dll", "-C", "link-arg=delayimp.lib"]
+
+# libopus is built with CMake, which chooses the MSVC runtime itself; see the toolchain file.
+[env]
+CMAKE_TOOLCHAIN_FILE_x86_64_pc_windows_msvc = { value = "build/msvc-static-crt.cmake", relative = true, force = true }
+CMAKE_TOOLCHAIN_FILE_aarch64_pc_windows_msvc = { value = "build/msvc-static-crt.cmake", relative = true, force = true }

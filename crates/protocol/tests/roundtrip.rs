@@ -1,5 +1,5 @@
 use protocol::agent::{AgentCapabilities, AgentToConsole, ConsoleToAgent};
-use protocol::channel::{ControlMessage, InputEvent, MouseButton};
+use protocol::channel::{AnnotationsUnavailable, ControlMessage, InputEvent, MouseButton};
 use protocol::common::*;
 use protocol::config::{AgentConfig, LocalOverrides};
 use protocol::ui::{ConsoleToUi, UiToConsole};
@@ -33,8 +33,11 @@ fn agent_hello_roundtrip() {
         },
         logged_in_user: None,
         local_overrides: LocalOverrides::default(),
+        machine_id: Some("4c4c4544-0042".into()),
+        desktop: Some(DesktopState::SignIn),
     };
     let json = serde_json::to_string(&msg).unwrap();
+    assert!(json.contains("\"desktop\":\"sign_in\""));
     assert!(json.contains("\"type\":\"hello\""));
     assert!(json.contains("\"mode\":\"help_me\""));
     assert!(!json.contains("logged_in_user"));
@@ -137,4 +140,65 @@ fn default_config_prefers_h265() {
     let cfg = AgentConfig::default();
     assert_eq!(cfg.preferred_codec, VideoCodec::H265);
     assert_eq!(cfg.mode, DeviceMode::Unattended);
+}
+
+/// A protocol-1 agent's hello (no machine id, no desktop state) still parses on a
+/// protocol-2 console.
+#[test]
+fn protocol1_hello_and_heartbeat_still_parse() {
+    let hello = r#"{"type":"hello","protocol_version":1,"device_id":"d","device_secret":"s",
+        "agent_version":"0.1.2","hostname":"h","os":"windows","arch":"x86_64","mode":"unattended",
+        "capabilities":{"codecs":["h264"],"displays":[],"input":true,"clipboard":true}}"#;
+    match serde_json::from_str::<AgentToConsole>(hello).unwrap() {
+        AgentToConsole::Hello {
+            machine_id,
+            desktop,
+            protocol_version,
+            ..
+        } => {
+            assert_eq!(protocol_version, 1);
+            assert_eq!(machine_id, None);
+            assert_eq!(desktop, None);
+        }
+        other => panic!("{other:?}"),
+    }
+    let hb = r#"{"type":"heartbeat","uptime_s":5}"#;
+    assert!(matches!(
+        serde_json::from_str::<AgentToConsole>(hb).unwrap(),
+        AgentToConsole::Heartbeat {
+            desktop: None,
+            capabilities: None,
+            ..
+        }
+    ));
+    const _: () = assert!(protocol::MIN_PROTOCOL_VERSION <= 1 && protocol::PROTOCOL_VERSION >= 2);
+}
+
+#[test]
+fn retire_roundtrip() {
+    let msg = ConsoleToAgent::Retire {
+        reason: "device deleted".into(),
+    };
+    let json = serde_json::to_string(&msg).unwrap();
+    assert_eq!(json, r#"{"type":"retire","reason":"device deleted"}"#);
+    assert_eq!(serde_json::from_str::<ConsoleToAgent>(&json).unwrap(), msg);
+}
+
+#[test]
+fn annotations_disabled_carries_a_reason_and_reads_old_agents_as_policy() {
+    let m = ControlMessage::AnnotationsDisabled {
+        reason: AnnotationsUnavailable::NoDesktop,
+    };
+    let j = serde_json::to_string(&m).unwrap();
+    assert_eq!(j, r#"{"t":"annotations_disabled","reason":"no_desktop"}"#);
+    // Agents before the reason field send a bare tag: that was always a policy refusal.
+    let old: ControlMessage = serde_json::from_str(r#"{"t":"annotations_disabled"}"#).unwrap();
+    assert_eq!(
+        old,
+        ControlMessage::AnnotationsDisabled {
+            reason: AnnotationsUnavailable::Policy
+        }
+    );
+    let back: ControlMessage = serde_json::from_str(r#"{"t":"annotations_available"}"#).unwrap();
+    assert_eq!(back, ControlMessage::AnnotationsAvailable);
 }

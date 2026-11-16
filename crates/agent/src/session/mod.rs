@@ -38,7 +38,9 @@ use media::{choose_codec, MediaFactory};
 use parking_lot::{Mutex, RwLock};
 use peer::{is_keyframe_request, Peer, PeerEvent};
 use protocol::agent::{AgentToConsole, SessionEvent};
-use protocol::channel::{ChatParty, ClipboardKind, ControlMessage, InputEvent};
+use protocol::channel::{
+    AnnotationsUnavailable, ChatParty, ClipboardKind, ControlMessage, InputEvent,
+};
 use protocol::common::{
     DeviceMode, DisplayInfo, EndReason, IceCandidate, IceServer, OperatorInfo, SessionDescription,
     SessionRole, SessionState,
@@ -322,8 +324,9 @@ struct Session {
     input_allowed: Arc<AtomicBool>,
     /// Device user pressed "Pause control" on the session bar.
     control_paused: bool,
-    /// `AnnotationsDisabled` was already sent to this operator (once per session).
-    annotations_disabled_sent: bool,
+    /// Why annotations were refused to this operator (`AnnotationsDisabled` is sent once per
+    /// reason; `AnnotationsAvailable` clears it when the reason goes away).
+    annotations_refused: Option<AnnotationsUnavailable>,
     /// An annotation was forwarded to the overlay (so teardown must remove overlays).
     annotations_used: bool,
     control: Option<Arc<dyn DataChannel>>,
@@ -495,7 +498,7 @@ async fn run_session(
         input: Arc::new(Mutex::new(None)),
         input_allowed: Arc::new(AtomicBool::new(cfg_allow_input)),
         control_paused: false,
-        annotations_disabled_sent: false,
+        annotations_refused: None,
         annotations_used: false,
         control: None,
         control_backlog: std::sync::Mutex::new(Vec::new()),
@@ -564,7 +567,10 @@ async fn run_session(
                 Some(SessionCommand::End(reason)) => break reason,
                 None => break EndReason::Error,
             },
-            _ = privacy_tick.tick() => session.privacy_tick(),
+            _ = privacy_tick.tick() => {
+                session.privacy_tick();
+                session.annotations_tick().await;
+            }
             reason = session.privacy_release_rx.recv() => {
                 if let Some(reason) = reason {
                     session.on_privacy_released(reason).await;
@@ -763,8 +769,12 @@ impl Session {
             tracing::info!(session = %self.id, "annotations disabled by the device user");
             self.deps.annotations.session_ended();
             self.annotations_used = false;
-            self.annotations_disabled_sent = false;
-            self.reject_annotation().await;
+            self.annotations_refused = None;
+            self.reject_annotation(AnnotationsUnavailable::Policy).await;
+        }
+        if !old.allow_annotations && new.allow_annotations {
+            self.annotations_ready_again(AnnotationsUnavailable::Policy)
+                .await;
         }
         if old.allow_privacy_screen && !new.allow_privacy_screen {
             tracing::info!(session = %self.id, "privacy screen disallowed by policy");
@@ -776,8 +786,15 @@ impl Session {
     /// Screen annotations are independent of the input permission and of the pause switch:
     /// they only need `allow_annotations` and a UI able to draw.
     async fn on_annotation(&mut self, ev: crate::annotate::AnnotateEvent) {
-        if !self.cfg.allow_annotations || !self.deps.annotations.available() {
-            self.reject_annotation().await;
+        if !self.cfg.allow_annotations {
+            self.reject_annotation(AnnotationsUnavailable::Policy).await;
+            return;
+        }
+        if !self.deps.annotations.available() {
+            // Nothing can draw: nobody is signed in (sign-in or lock screen), or the user's
+            // session has no UI process yet. Not a policy decision — it works once it can.
+            self.reject_annotation(AnnotationsUnavailable::NoDesktop)
+                .await;
             return;
         }
         self.annotations_used = true;
@@ -803,19 +820,43 @@ impl Session {
         self.deps.annotations.apply(ev);
     }
 
-    /// Tell the operator once that annotations cannot be shown here.
-    async fn reject_annotation(&mut self) {
-        if self.annotations_disabled_sent {
+    /// Tell the operator (once per reason) that annotations cannot be shown here.
+    async fn reject_annotation(&mut self, reason: AnnotationsUnavailable) {
+        if self.annotations_refused == Some(reason) {
             return;
         }
-        self.annotations_disabled_sent = true;
+        self.annotations_refused = Some(reason);
         tracing::info!(
             session = %self.id,
+            ?reason,
             allowed = self.cfg.allow_annotations,
             ui = self.deps.annotations.available(),
             "annotations not available; telling the operator"
         );
-        self.send_control(ControlMessage::AnnotationsDisabled).await;
+        self.send_control(ControlMessage::AnnotationsDisabled { reason })
+            .await;
+    }
+
+    /// The operator was told annotations are unavailable for `reason`, which no longer holds.
+    async fn annotations_ready_again(&mut self, reason: AnnotationsUnavailable) {
+        if self.annotations_refused != Some(reason) {
+            return;
+        }
+        self.annotations_refused = None;
+        tracing::info!(session = %self.id, ?reason, "annotations available again; telling the operator");
+        self.send_control(ControlMessage::AnnotationsAvailable)
+            .await;
+    }
+
+    /// Once a second: a refused operator learns when a user's desktop can show annotations.
+    async fn annotations_tick(&mut self) {
+        if self.annotations_refused == Some(AnnotationsUnavailable::NoDesktop)
+            && self.cfg.allow_annotations
+            && self.deps.annotations.available()
+        {
+            self.annotations_ready_again(AnnotationsUnavailable::NoDesktop)
+                .await;
+        }
     }
 
     /// Device-side emergency switch: pause / resume remote keyboard & mouse control. Screen

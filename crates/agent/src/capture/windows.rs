@@ -21,6 +21,8 @@
 pub mod cursor;
 #[path = "windows/d3d.rs"]
 pub mod d3d;
+#[path = "windows/gdi.rs"]
+pub mod gdi;
 
 use super::{CaptureConfig, Capturer, Frame, FrameData};
 use anyhow::{anyhow, bail, Context, Result};
@@ -53,8 +55,9 @@ const MONITORINFOF_PRIMARY: u32 = 1;
 /// Number of pooled frame textures. The encoder consumes a frame before the next one is
 /// captured, but two keep a still-referenced frame from being overwritten.
 const POOL_SIZE: usize = 2;
-/// How often to retry re-creating the duplication after `DXGI_ERROR_ACCESS_LOST`.
-const ACCESS_LOST_RETRIES: u32 = 3;
+/// How often to retry re-creating the duplication after `DXGI_ERROR_ACCESS_LOST`. A desktop
+/// switch (sign-in, lock, UAC) takes a few hundred milliseconds to settle.
+const ACCESS_LOST_RETRIES: u32 = 20;
 
 // ─── Texture handle ─────────────────────────────────────────────────────────────────────
 
@@ -295,6 +298,11 @@ impl DxgiCapturer {
     /// (Re)create the duplication and return the output size it reports.
     fn open_duplication(&mut self) -> Result<(u32, u32)> {
         self.duplication = None;
+        // The sign-in screen, lock screen and UAC prompts are other desktops; duplication only
+        // works from a thread attached to the one currently receiving input.
+        if let Some(desktop) = crate::platform::windows_desktop::follow_input_desktop() {
+            tracing::info!(%desktop, "capture follows the input desktop");
+        }
         // SAFETY: the device lives on the output's adapter (see d3d::for_monitor).
         let dup = unsafe { self.output.DuplicateOutput(&self.device.device) }
             .context("IDXGIOutput1::DuplicateOutput (is another duplication session active, or is the desktop not accessible from this session?)")?;
@@ -438,9 +446,20 @@ impl Capturer for DxgiCapturer {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if self.duplication.is_none() {
-                let (w, h) = self
-                    .open_duplication()
-                    .context("re-creating desktop duplication")?;
+                let (w, h) = match self.open_duplication() {
+                    Ok(size) => size,
+                    // Mid-switch the new desktop refuses duplication for a moment.
+                    Err(e) if access_lost > 0 && access_lost <= ACCESS_LOST_RETRIES => {
+                        tracing::debug!("re-creating desktop duplication: {e:#}");
+                        access_lost += 1;
+                        std::thread::sleep(Duration::from_millis(100));
+                        if Instant::now() >= deadline {
+                            return Ok(None);
+                        }
+                        continue;
+                    }
+                    Err(e) => return Err(e.context("re-creating desktop duplication")),
+                };
                 if (w, h) != (self.width, self.height) {
                     bail!(
                         "display mode changed ({}x{} → {w}x{h}); capturer must be re-created",
@@ -490,8 +509,19 @@ pub fn create(cfg: &CaptureConfig) -> Result<Box<dyn Capturer>> {
         .into_iter()
         .find(|e| e.info.index == cfg.display_index)
         .ok_or_else(|| anyhow!("display index {} does not exist", cfg.display_index))?;
-    let (dev, output) = d3d::for_monitor(entry.handle)?;
-    let capturer = DxgiCapturer::new(dev, output, cfg)?;
+    // Desktop duplication first; GDI when this display has no Direct3D 11 device (virtual
+    // machines without a 3D adapter, some remote sessions) or duplication is refused.
+    let dxgi = d3d::for_monitor(entry.handle)
+        .and_then(|(dev, output)| DxgiCapturer::new(dev, output, cfg));
+    let capturer = match dxgi {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("desktop duplication unavailable ({e:#}); falling back to GDI capture");
+            let mut display = entry.info.clone();
+            display.index = cfg.display_index;
+            return Ok(Box::new(gdi::GdiCapturer::new(&display, cfg)?));
+        }
+    };
     tracing::info!(
         display = cfg.display_index,
         width = capturer.width,

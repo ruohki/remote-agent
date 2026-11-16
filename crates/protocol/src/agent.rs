@@ -8,8 +8,8 @@ use ts_rs::TS;
 
 use crate::channel::ChatParty;
 use crate::common::{
-    Arch, DeviceMode, DisplayInfo, EndReason, IceCandidate, IceServer, OperatorInfo, Os,
-    SessionDescription, VideoCodec,
+    Arch, DesktopState, DeviceMode, DisplayInfo, EndReason, IceCandidate, IceServer, OperatorInfo,
+    Os, SessionDescription, VideoCodec,
 };
 use crate::config::{AgentConfig, LocalOverrides};
 use crate::files::{TransferDirection, TransferKind};
@@ -116,6 +116,15 @@ pub enum AgentToConsole {
         /// Restrictions set locally by the person at the device.
         #[serde(default, skip_serializing_if = "LocalOverrides::is_empty")]
         local_overrides: LocalOverrides,
+        /// Stable hardware identity (Windows `MachineGuid`, macOS `IOPlatformUUID`); lets the
+        /// console recognise a reinstalled machine. Protocol 2+.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        machine_id: Option<String>,
+        /// What the device's screen shows right now. Protocol 2+.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        desktop: Option<DesktopState>,
     },
     Heartbeat {
         uptime_s: u64,
@@ -136,6 +145,15 @@ pub enum AgentToConsole {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         local_overrides: Option<LocalOverrides>,
+        /// Present only when the desktop state changed since the last report. Protocol 2+.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        desktop: Option<DesktopState>,
+        /// Present only when the capabilities changed since `hello` (codecs, input, privacy
+        /// screen: they depend on which desktop the agent can reach). Protocol 2+.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        capabilities: Option<AgentCapabilities>,
     },
     /// Result of the help-me approval prompt (only sent in help-me mode).
     ApprovalResult { session_id: String, approved: bool },
@@ -229,6 +247,12 @@ pub enum ConsoleToAgent {
     },
     /// Console is shutting down / rejecting; agent should reconnect with backoff.
     Goodbye {
+        reason: String,
+    },
+    /// The device was removed or retired in the console: forget the enrollment and stop
+    /// reconnecting (an installed service stays installed but idle until enrolled again).
+    /// Only sent to agents that announced protocol 2+.
+    Retire {
         reason: String,
     },
 }

@@ -61,7 +61,7 @@ pub fn support() -> PrivacyScreenSupport {
 }
 
 /// Everything the device-side surface shows.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct PrivacyScreenInfo {
     pub operator: String,
     pub device: String,
@@ -75,7 +75,7 @@ pub struct PrivacyScreenInfo {
 /// (events must be `Clone`, senders are not).
 pub type Confirm<T> = Arc<parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<T>>>>;
 
-fn confirm_channel<T>() -> (Confirm<T>, tokio::sync::oneshot::Receiver<T>) {
+pub(crate) fn confirm_channel<T>() -> (Confirm<T>, tokio::sync::oneshot::Receiver<T>) {
     let (tx, rx) = tokio::sync::oneshot::channel();
     (Arc::new(parking_lot::Mutex::new(Some(tx))), rx)
 }

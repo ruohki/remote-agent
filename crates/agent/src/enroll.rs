@@ -73,13 +73,23 @@ pub async fn auto_enroll_if_baked(paths: &Paths) -> Result<bool> {
     let Some(baked) = crate::baked::get() else {
         return Ok(false);
     };
-    let Some(token) = baked.config.enroll_token.clone() else {
+    let Some(token) = crate::baked::enroll_token() else {
         return Ok(false);
     };
     crate::transport::check_console_url(&baked.config.server_url).context("baked console URL")?;
     tracing::info!(server = %baked.config.server_url, "auto-enrolling from baked configuration");
     enroll(paths, &baked.config.server_url, &token, None).await?;
     Ok(true)
+}
+
+/// Whether `paths` already holds an enrollment with the console at `server`.
+pub fn enrolled_with(paths: &Paths, server: &str) -> bool {
+    let norm = |s: &str| s.trim().trim_end_matches('/').to_ascii_lowercase();
+    LocalConfig::load(paths)
+        .ok()
+        .flatten()
+        .map(|c| c.is_enrolled() && norm(&c.server_url) == norm(server))
+        .unwrap_or(false)
 }
 
 /// `POST /api/enroll` only (nothing is saved). A console-side rejection is returned as a
@@ -98,6 +108,7 @@ pub async fn request(server: &str, token: &str, name: Option<&str>) -> Result<En
         arch: protocol::common::Arch::current(),
         agent_version: crate::AGENT_VERSION.to_string(),
         display_name: name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()),
+        machine_id: crate::platform::machine_id(),
     };
 
     // A baked TLS pin applies from the very first request.

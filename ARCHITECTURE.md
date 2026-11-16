@@ -50,23 +50,72 @@ Two repositories:
 
 ## Agent process model
 
-* **macOS**: a per-user LaunchAgent runs `remote-agent run` in the GUI session (screen
-  recording + accessibility permissions are per-user/TCC). Capture: ScreenCaptureKit.
-  Encode: VideoToolbox. Input: CGEvent via `enigo`.
-* **Windows**: a LocalSystem service (`remote-agent service run`) supervises one
-  `remote-agent run` child in the active console session (`CreateProcessAsUser`, `winsta0\default`),
-  so UAC prompts and the logon screen are reachable. Capture: DXGI desktop duplication.
-  Encode: Media Foundation hardware MFT (NV12 via `ID3D11VideoProcessor`). Input: `SendInput` via `enigo`.
-* One binary; `run` is the actual agent, everything else is CLI plumbing.
-* State lives in `/Library/Application Support/RemoteAgent/agent.toml` or
-  `%ProgramData%\RemoteAgent\agent.toml` (owner-only permissions; contains the device secret).
-* **Stopping**: `SIGTERM` / `SIGINT` / `SIGHUP` (`launchctl kill`, `bootout`, Ctrl-C), the Windows
-  console control events, the tray *Quit* item and a completed update all go through
-  `shutdown::request`. The hub ends the active session (keys released, overlays and session bar
-  removed, `session_state: ended` sent), flushes, closes the console socket with a reason and
-  returns; the process exits with code 0 and the service manager restarts it where configured.
-  Quit has a 6 s backstop. Windows `TerminateProcess` from the service supervisor bypasses all of
-  this (known gap). Release builds use `panic = "abort"`, so none of it relies on destructors.
+An installed agent is three roles. They are one binary; the subcommand picks the role.
+
+```
+                 ┌──────────────────────────────── one machine ─────────────────────────────────┐
+console ◄─WSS──► │ service (`service run`)              LocalSystem service / root LaunchDaemon │
+                 │  identity + secret, console link, policy, updates, Ctrl+Alt+Del               │
+                 │        ▲ local link: named pipe \\.\pipe\RemoteAgent.service             │
+                 │        │             or /var/run/remote-agent/service.sock                    │
+                 │        ▼                                                                      │
+                 │ session host (`session-host`)        one per desktop session                  │
+                 │  WebRTC, capture, encode, input, audio, clipboard, files                      │
+                 │        ▲ Windows only: UI link \\.\pipe\RemoteAgent.ui.<session>          │
+                 │        ▼                                                                      │
+                 │ UI (`ui --session N`)                the signed-in user                       │
+                 │  tray, window, chat, session bar, approval prompt, privacy screen             │
+                 └───────────────────────────────────────────────────────────────────────────────┘
+```
+
+* **Service** (`daemon.rs`, `hub.rs`): owns the device identity in the machine state directory
+  (`%ProgramData%\RemoteAgent`, `/Library/Application Support/RemoteAgent`) and the console
+  connection, so the device is **online whether or not anyone is signed in**. It keeps the
+  console's policy plus the local restrictions and hands the effective settings to the hosts.
+  Session signaling (`session_request`, `ice_candidate`, `session_end`) is relayed over the local
+  link to the host whose desktop is on the console (`HostRouter`); everything the session says
+  goes back the same way. A session request with no reachable desktop ends at once
+  (`connection_failed`). The service applies updates (it can write the install location) and is
+  the only process allowed to generate Ctrl+Alt+Del on Windows.
+* **Session host** (`session_host.rs`, `local_sessions.rs`): the session code that used to be
+  the whole agent. It reports its `HostStatus` (capabilities, desktop state, signed-in user,
+  whether its session is on the console) and the service forwards the active host's status in
+  `hello`/heartbeats (`desktop`, `capabilities`, protocol 2).
+  * **Windows**: the service starts it with its own **SYSTEM token moved into the console
+    session** (`spawn_system_in_session`). Its capture, pipeline, cursor and input threads follow
+    the **input desktop** (`platform/windows_desktop.rs`: `OpenInputDesktop` + `SetThreadDesktop`,
+    re-attached on every DXGI `ACCESS_LOST`), so one host covers the sign-in screen, the lock
+    screen, UAC prompts and the user's desktop, with nobody signed in. It is replaced when the
+    console moves to another session (sign-out, fast user switching); locking changes nothing.
+  * **macOS**: LaunchAgents — `com.remoteagent.agent` (`LimitLoadToSessionType = Aqua`, the app
+    loop in-process) in each signed-in user's GUI session and `com.remoteagent.loginwindow`
+    (`LoginWindow`, headless) at the login window. Only the host on the console gets sessions; a
+    host whose user is switched away gives its session up. Screen Recording and Accessibility are
+    TCC grants of the executable (cannot be pre-approved by MDM for Screen Recording).
+* **UI** (Windows only, `app/remote.rs`): a SYSTEM process must not show the user a WebView, so
+  the app (tray, window, chat, session bar, approval prompt, privacy screen, annotations) runs
+  with the signed-in user's token and the host forwards `crate::app` calls to it (`UiCommand` /
+  `UiEvent`). Without a UI process (nobody signed in) help-me requests are denied and the
+  privacy screen is unavailable. The UI removes any privacy screen by itself when the host link
+  drops or its heartbeats stop for 10 s.
+* **Links**: length-prefixed JSON (`link/frame.rs`). Only this executable may connect: every
+  peer's image path is checked (`GetNamedPipeClientProcessId` / `LOCAL_PEERPID` →
+  `proc_pidpath`); the service pipe additionally admits only SYSTEM and Administrators.
+* **Supervision**: the Windows service (`service/windows_service_impl.rs`) restarts host and UI
+  with exponential backoff (reset after a minute of uptime) and ties them to a kill-on-close job
+  object; SCM recovery actions restart the service after crashes and after an update (which exits
+  with a failure code on purpose). launchd `KeepAlive` does the same on macOS.
+* **Secrets**: the machine identity's secret is DPAPI **machine scope** in an `agent.toml` whose
+  DACL admits only SYSTEM and Administrators (Windows), or in the 0600 root-owned `agent.toml`
+  (macOS daemon). `service install` migrates identities enrolled under the old per-user layout.
+* **Standalone** (`run`, double-clicked app without the service): the hub and the sessions in one
+  user process, as before — used for quick support and development. With the service installed,
+  a double-click opens the UI on Windows and never starts a second agent with the same identity.
+* **Stopping**: `SIGTERM` / `SIGINT` / `SIGHUP`, the Windows service stop, the tray *Quit* item
+  and a completed update all go through `shutdown::request`. The service tells each host to end
+  its session (the operator's viewer gets `session_state: ended`) before it closes the console
+  socket; only hosts that do not exit in time are terminated. Release builds use
+  `panic = "abort"`, so none of it relies on destructors.
 * **Privacy screen** (`privacy.rs` + `app/privacy.rs`): on `set_privacy_screen` the device's
   displays show a branded "Screen hidden" page (one opaque, focused, capture-excluded window per
   display; a heavily downsampled snapshot of the desktop as backdrop) while the operator keeps
@@ -89,11 +138,12 @@ Two repositories:
 
 | Mode | Behaviour |
 |------|-----------|
-| `unattended` | Operators connect any time. |
-| `help_me` | The person at the device must click **Allow** on a native dialog for every session. |
+| `unattended` | Operators connect any time — including at the sign-in screen and the lock screen, so an operator can sign in to the machine (installed service; Windows covers UAC prompts and Ctrl+Alt+Del too). |
+| `help_me` | The person at the device must click **Allow** on a native dialog for every session. With nobody signed in there is nobody to ask, so the request is denied. |
 
 The mode is a per-device setting in the console (`AgentConfig.mode`) and can be changed live;
-the agent applies it on the next `SessionRequest`.
+the agent applies it on the next `SessionRequest`. The console sees what the screen shows in
+`DeviceSummary.desktop` (`user`, `locked`, `sign_in`).
 
 ## One-line install
 

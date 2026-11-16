@@ -19,6 +19,7 @@ mod annotate;
 mod bar;
 mod controller;
 mod privacy;
+pub mod remote;
 
 use crate::approval::{Indicator, IndicatorHandle};
 use crate::chat::{ChatHandle, ChatLine, ChatUi};
@@ -210,18 +211,28 @@ fn set_proxy(p: tao::event_loop::EventLoopProxy<AppEvent>) {
     *PROXY.get_or_init(|| parking_lot::Mutex::new(None)).lock() = Some(Proxy(p));
 }
 
-/// Post an event to the UI thread. No-op when the app loop is not running.
+/// Post an event to the UI thread. In a session host whose UI lives in a `ui` process the
+/// event is forwarded there ([`remote`]). No-op when there is no UI.
 pub fn post(ev: AppEvent) {
     if let Some(cell) = PROXY.get() {
         if let Some(p) = cell.lock().as_ref() {
             let _ = p.0.send_event(ev);
+            return;
         }
+    }
+    if remote::is_host() {
+        remote::forward(ev);
     }
 }
 
-/// Whether the app event loop is running (window/tray available).
-pub fn is_running() -> bool {
+/// Whether the app event loop runs in this process.
+fn local_loop() -> bool {
     PROXY.get().map(|c| c.lock().is_some()).unwrap_or(false)
+}
+
+/// Whether an app UI is available: the loop in this process, or a connected `ui` process.
+pub fn is_running() -> bool {
+    local_loop() || remote::ui_connected()
 }
 
 /// Set the process-wide "end the active session" action (used by the tray "End session").
@@ -403,8 +414,10 @@ fn dispatch_disconnect() {
 pub struct AppAnnotations;
 
 impl crate::annotate::AnnotationSink for AppAnnotations {
+    /// Something can draw (the UI is up) and the screen shows the user's desktop: on the
+    /// sign-in or lock screen the overlay would sit on a hidden desktop.
     fn available(&self) -> bool {
-        is_running()
+        is_running() && desktop_shows_user()
     }
 
     fn apply(&self, event: crate::annotate::AnnotateEvent) {
@@ -414,6 +427,27 @@ impl crate::annotate::AnnotationSink for AppAnnotations {
     fn session_ended(&self) {
         post(AppEvent::AnnotationsEnded);
     }
+}
+
+/// Whether the console shows a user's desktop. Re-checked at most twice a second: annotation
+/// events arrive at pointer rate and the query goes to the session manager.
+fn desktop_shows_user() -> bool {
+    use protocol::common::DesktopState;
+    use std::time::{Duration, Instant};
+    static LAST: parking_lot::Mutex<Option<(Instant, bool)>> = parking_lot::Mutex::new(None);
+    let mut last = LAST.lock();
+    if let Some((at, shows)) = *last {
+        if at.elapsed() < Duration::from_millis(500) {
+            return shows;
+        }
+    }
+    // Unknown (between sessions, other platforms): do not refuse on a guess.
+    let shows = !matches!(
+        crate::platform::desktop_state(),
+        DesktopState::SignIn | DesktopState::Locked
+    );
+    *last = Some((Instant::now(), shows));
+    shows
 }
 
 // ── Indicator implementation ──────────────────────────────────────────────────────────────

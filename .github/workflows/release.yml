@@ -13,7 +13,7 @@ env:
 jobs:
   # ── gate: never publish a tag that does not pass its own tests ──────────────────────
   test:
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -27,7 +27,7 @@ jobs:
   # ── macOS universal binary ──────────────────────────────────────────────────────────
   macos:
     needs: test
-    runs-on: macos-14
+    runs-on: macos-latest
     # Step-level `env` is not in scope for that step's own `if`, so the signing gate has to
     # live at job level.
     env:

@@ -36,16 +36,20 @@ pub mod clipboard;
 pub mod config;
 pub mod congestion;
 pub mod cursor;
+pub mod daemon;
 pub mod encode;
 pub mod enroll;
 pub mod hub;
 pub mod input;
+pub mod link;
+pub mod local_sessions;
 pub mod platform;
 pub mod privacy;
 pub mod probe;
 pub mod secrets;
 pub mod service;
 pub mod session;
+pub mod session_host;
 pub mod shutdown;
 pub mod startup;
 pub mod transfer;
@@ -54,3 +58,28 @@ pub mod updater;
 
 /// Version baked in at build time (`CARGO_PKG_VERSION`).
 pub const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// `protocol::bakery::VERSION_MARKER_PREFIX` + version + NUL, kept in the binary so the console
+/// can read the version of a base binary it cannot run. `#[used]` keeps it through LTO.
+#[used]
+pub static VERSION_MARKER: [u8; VERSION_MARKER_LEN] = version_marker();
+
+const VERSION_MARKER_LEN: usize =
+    protocol::bakery::VERSION_MARKER_PREFIX.len() + AGENT_VERSION.len() + 1;
+
+const fn version_marker() -> [u8; VERSION_MARKER_LEN] {
+    let prefix = protocol::bakery::VERSION_MARKER_PREFIX;
+    let version = AGENT_VERSION.as_bytes();
+    let mut out = [0u8; VERSION_MARKER_LEN];
+    let mut i = 0;
+    while i < prefix.len() {
+        out[i] = prefix[i];
+        i += 1;
+    }
+    let mut j = 0;
+    while j < version.len() {
+        out[prefix.len() + j] = version[j];
+        j += 1;
+    }
+    out
+}

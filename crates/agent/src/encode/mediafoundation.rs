@@ -83,6 +83,11 @@ const NV12_POOL: usize = 3;
 /// Every thread that touches an `IMFTransform` needs this, not just the one that created it —
 /// see the call in the video pipeline thread. Idempotent and cheap on repeat calls.
 pub fn init_thread() -> Result<()> {
+    if !installed() {
+        bail!(
+            "Media Foundation is not installed (Windows N edition without the Media Feature Pack)"
+        );
+    }
     // SAFETY: standard COM/MF start-up; RPC_E_CHANGED_MODE just means another apartment
     // model is already active on this thread, which is fine for MF.
     unsafe {
@@ -141,7 +146,27 @@ fn enumerate_hardware(codec: VideoCodec) -> Result<Vec<IMFActivate>> {
 }
 
 /// Whether a hardware encoder MFT exists for `codec` (cached per codec).
+/// Whether `mfplat.dll` exists. It is delay-loaded (see `.cargo/config.toml`): Windows "N"
+/// editions ship without Media Foundation, and a hard import would keep the whole agent from
+/// starting there. Every Media Foundation entry point checks this first, so the delay-load
+/// stub never faults; the agent falls back to the software encoder.
+pub fn installed() -> bool {
+    static PRESENT: OnceLock<bool> = OnceLock::new();
+    *PRESENT.get_or_init(|| {
+        use windows::Win32::System::LibraryLoader::LoadLibraryW;
+        // SAFETY: loading a system DLL by name; the module stays loaded for the process.
+        let ok = unsafe { LoadLibraryW(windows::core::w!("mfplat.dll")) }.is_ok();
+        if !ok {
+            tracing::warn!("mfplat.dll not found: no hardware encoding (Windows N edition?)");
+        }
+        ok
+    })
+}
+
 pub fn supports(codec: VideoCodec) -> bool {
+    if !installed() {
+        return false;
+    }
     static CACHE: OnceLock<(bool, bool)> = OnceLock::new();
     let (h265, h264) = *CACHE.get_or_init(|| {
         let has = |c: VideoCodec| match enumerate_hardware(c) {
@@ -1154,6 +1179,9 @@ fn has_idr(data: &[u8], codec: VideoCodec) -> bool {
 }
 
 pub fn create(cfg: &EncoderConfig) -> Result<Box<dyn Encoder>> {
+    if !installed() {
+        bail!("Media Foundation is not installed");
+    }
     if !supports(cfg.codec) {
         bail!("no hardware {:?} encoder available", cfg.codec);
     }

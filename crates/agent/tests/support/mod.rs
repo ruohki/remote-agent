@@ -313,7 +313,8 @@ impl Approver for RecordingApprover {
 /// UI could draw them (false = headless service mode).
 #[derive(Clone)]
 pub struct RecordingAnnotations {
-    pub available: bool,
+    /// Flip at runtime to mimic a user signing in (the UI process connecting).
+    pub available: Arc<std::sync::atomic::AtomicBool>,
     pub events: Arc<Mutex<Vec<remote_agent::annotate::AnnotateEvent>>>,
     pub ended: Arc<AtomicU64>,
 }
@@ -321,7 +322,7 @@ pub struct RecordingAnnotations {
 impl Default for RecordingAnnotations {
     fn default() -> Self {
         Self {
-            available: true,
+            available: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             events: Arc::new(Mutex::new(Vec::new())),
             ended: Arc::new(AtomicU64::new(0)),
         }
@@ -330,7 +331,7 @@ impl Default for RecordingAnnotations {
 
 impl remote_agent::annotate::AnnotationSink for RecordingAnnotations {
     fn available(&self) -> bool {
-        self.available
+        self.available.load(Ordering::SeqCst)
     }
 
     fn apply(&self, event: remote_agent::annotate::AnnotateEvent) {

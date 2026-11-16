@@ -54,6 +54,8 @@ type Hook = Box<dyn Fn(&Branding) + Send + Sync>;
 static STATE: OnceLock<RwLock<State>> = OnceLock::new();
 static HOOKS: Mutex<Vec<Hook>> = Mutex::new(Vec::new());
 static REFRESH: Notify = Notify::const_new();
+/// State directory `init` read the cache from (for [`reload`]).
+static CACHE_DIR: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 
 fn state() -> &'static RwLock<State> {
     STATE.get_or_init(|| {
@@ -101,6 +103,7 @@ fn decode_logo_b64(b64: &str) -> Result<Rgba> {
 /// Load the cached console branding (if any) so the UI is branded before the first fetch.
 /// Call once at startup with the resolved config dir.
 pub fn init(paths: &Paths) {
+    *CACHE_DIR.lock() = Some(paths.dir.clone());
     let cache = paths.dir.join(CACHE_FILE);
     let cached: Option<Branding> = std::fs::read(&cache)
         .ok()
@@ -236,6 +239,37 @@ fn persist(branding: &Branding, paths: &Paths) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Re-read the cached branding another process wrote (session hosts and UI processes: the
+/// service fetches branding and caches it in the machine state directory). Notifies hooks
+/// when it changed.
+pub fn reload() {
+    let Some(dir) = CACHE_DIR.lock().clone() else {
+        return;
+    };
+    let Some(branding) = std::fs::read(dir.join(CACHE_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Branding>(&bytes).ok())
+    else {
+        return;
+    };
+    {
+        let st = state().read();
+        if st.source == BrandingSource::Console && st.branding == branding {
+            return;
+        }
+    }
+    let logo = decode_logo(&branding);
+    {
+        let mut w = state().write();
+        w.branding = branding.clone();
+        w.source = BrandingSource::Console;
+        w.logo = logo;
+    }
+    for hook in HOOKS.lock().iter() {
+        hook(&branding);
+    }
 }
 
 /// Ask the refresh loop to fetch now (e.g. after `config_update` or a reconnect).

@@ -473,6 +473,7 @@ mod windows {
             if let Some(u) = self.queue.pop_front() {
                 return Some(u);
             }
+            crate::platform::windows_desktop::follow_input_desktop();
             let now = Instant::now();
             if self.next_tick > now {
                 let wait = (self.next_tick - now).min(timeout);

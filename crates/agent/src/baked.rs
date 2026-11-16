@@ -144,10 +144,40 @@ fn load_from_current_exe() -> anyhow::Result<Option<Baked>> {
 /// Should the agent auto-enroll now? True when a token is baked in and we are not enrolled yet.
 pub fn should_auto_enroll(local: Option<&crate::config::LocalConfig>) -> bool {
     let already = local.map(|c| c.is_enrolled()).unwrap_or(false);
-    !already
-        && get()
-            .map(|b| b.config.enroll_token.is_some())
-            .unwrap_or(false)
+    !already && enroll_token().is_some()
+}
+
+/// The enrollment token this binary carries: in the signed trailer (older bakeries) or in its
+/// own file name. Console downloads are signed once per version and branding and named
+/// `<Product> (<token>).exe` / `<Product> (<token>).app`, so the token never touches the
+/// signature. Only meaningful with a baked console URL (`None` without a trailer).
+pub fn enroll_token() -> Option<String> {
+    let baked = get()?;
+    if let Some(t) = baked.config.enroll_token.clone() {
+        return Some(t);
+    }
+    let exe = std::env::current_exe().ok()?;
+    token_from_path(&exe)
+}
+
+/// The token in `(…)` of the executable's name, or of the `.app` bundle it lives in.
+/// Browsers append ` (1)` to duplicate downloads, so the first group that looks like a console
+/// token (≥ 20 base62 characters) wins.
+pub fn token_from_path(exe: &std::path::Path) -> Option<String> {
+    let bundle = exe
+        .ancestors()
+        .find(|p| p.extension().map(|e| e == "app").unwrap_or(false));
+    let name = bundle
+        .unwrap_or(exe)
+        .file_stem()?
+        .to_string_lossy()
+        .into_owned();
+    name.split('(')
+        .skip(1)
+        .filter_map(|part| part.split(')').next())
+        .map(str::trim)
+        .find(|t| t.len() >= 20 && t.len() <= 128 && t.chars().all(|c| c.is_ascii_alphanumeric()))
+        .map(str::to_string)
 }
 
 /// `remote-agent bake-info`: print the trailer (or say there is none).
@@ -320,5 +350,47 @@ mod tests {
     fn token_is_masked() {
         assert_eq!(mask_token("short"), "*****");
         assert!(mask_token("abcdefghijkl").starts_with("abcdefgh… "));
+    }
+
+    #[test]
+    fn token_comes_from_the_file_or_bundle_name() {
+        use std::path::Path;
+        let tok = "Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4zAb7cDe0fGh2";
+        assert_eq!(
+            token_from_path(Path::new(&format!(
+                r"C:\Users\x\Downloads\Remote Support ({tok}).exe"
+            )))
+            .as_deref(),
+            Some(tok)
+        );
+        assert_eq!(
+            token_from_path(Path::new(&format!(
+                "/Users/x/Downloads/Remote Support ({tok}) (1).exe"
+            )))
+            .as_deref(),
+            Some(tok),
+            "browser duplicate suffix"
+        );
+        assert_eq!(
+            token_from_path(Path::new(&format!(
+                "/Applications/Remote Support ({tok}).app/Contents/MacOS/remote-agent"
+            )))
+            .as_deref(),
+            Some(tok)
+        );
+        assert_eq!(
+            token_from_path(Path::new(
+                "/Applications/Remote Support (1).app/Contents/MacOS/remote-agent"
+            )),
+            None
+        );
+        assert_eq!(
+            token_from_path(Path::new("/usr/local/bin/remote-agent")),
+            None
+        );
+        assert_eq!(
+            token_from_path(Path::new("/tmp/x (not-a-token-but-long-enough-x).exe")),
+            None
+        );
     }
 }

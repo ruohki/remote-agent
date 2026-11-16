@@ -49,8 +49,13 @@ fn account(paths: &Paths) -> String {
 /// Store `secret` for the config in the most protected backend available and update `cfg`
 /// (`device_secret` / `device_secret_dpapi` / `secret_backend`). The caller saves `cfg`.
 pub fn store(paths: &Paths, cfg: &mut LocalConfig, secret: &str) -> SecretBackend {
+    // The machine-wide identity of an installed service lives in the root-only (0600)
+    // agent.toml: the LaunchDaemon has no login keychain, and the System keychain protects
+    // nothing a root process could not read anyway.
     #[cfg(target_os = "macos")]
-    {
+    let use_keychain = !(paths.is_machine() && is_root());
+    #[cfg(target_os = "macos")]
+    if use_keychain {
         match security_framework::passwords::set_generic_password(
             KEYCHAIN_SERVICE,
             &account(paths),
@@ -71,7 +76,7 @@ pub fn store(paths: &Paths, cfg: &mut LocalConfig, secret: &str) -> SecretBacken
     }
     #[cfg(target_os = "windows")]
     {
-        match dpapi::protect(secret.as_bytes()) {
+        match dpapi::protect(secret.as_bytes(), paths.is_machine()) {
             Ok(blob) => {
                 cfg.device_secret.clear();
                 cfg.device_secret_dpapi = Some(base64_encode(&blob));
@@ -156,6 +161,54 @@ pub fn migrate_if_needed(paths: &Paths, cfg: &mut LocalConfig) -> Result<SecretB
         "device secret storage initialised"
     );
     Ok(backend)
+}
+
+#[cfg(target_os = "macos")]
+fn is_root() -> bool {
+    // SAFETY: geteuid has no preconditions.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// Re-store the secret of a machine-wide config with machine scope (Windows: an identity
+/// enrolled before the service owned it was protected for one user; the service runs as
+/// SYSTEM and could not read it). Must run as the user who enrolled — the installer does.
+/// Returns whether anything changed.
+pub fn reprotect_for_machine(paths: &Paths) -> Result<bool> {
+    let Some(mut cfg) = LocalConfig::load(paths)? else {
+        return Ok(false);
+    };
+    if !cfg.is_enrolled() || !paths.is_machine() {
+        return Ok(false);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if cfg.secret_backend.as_deref() == Some(SecretBackend::Dpapi.as_str()) {
+            let (secret, _) = load(paths, &cfg).context(
+                "the device secret was protected for another account; enroll this machine again",
+            )?;
+            store(paths, &mut cfg, &secret);
+            cfg.save(paths)?;
+            return Ok(true);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if cfg.secret_backend.as_deref() == Some(SecretBackend::Keychain.as_str()) && is_root() {
+            let (secret, _) = load(paths, &cfg)?;
+            store(paths, &mut cfg, &secret);
+            cfg.save(paths)?;
+            forget_keychain_item(paths);
+            return Ok(true);
+        }
+    }
+    let _ = &mut cfg;
+    Ok(false)
+}
+
+#[cfg(target_os = "macos")]
+fn forget_keychain_item(paths: &Paths) {
+    let _ =
+        security_framework::passwords::delete_generic_password(KEYCHAIN_SERVICE, &account(paths));
 }
 
 /// Remove the secret from the platform store (used by `reset`).

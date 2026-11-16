@@ -10,7 +10,9 @@ mod support;
 use bytes::Bytes;
 use parking_lot::RwLock;
 use protocol::agent::{AgentToConsole, SessionEvent};
-use protocol::channel::{ChatParty, ClipboardKind, ControlMessage, InputEvent, MouseButton};
+use protocol::channel::{
+    AnnotationsUnavailable, ChatParty, ClipboardKind, ControlMessage, InputEvent, MouseButton,
+};
 use protocol::common::{
     DeviceMode, EndReason, IceCandidate, OperatorInfo, SessionDescription, SessionRole,
     SessionState,
@@ -202,7 +204,9 @@ impl Harness {
         let chat = RecordingChat::default();
         let clipboard = FakeClipboard::default();
         let annotations = RecordingAnnotations {
-            available: opts.annotations_available,
+            available: Arc::new(std::sync::atomic::AtomicBool::new(
+                opts.annotations_available,
+            )),
             ..Default::default()
         };
         let deps = SessionDeps {
@@ -1672,7 +1676,7 @@ async fn annotations_reach_the_overlay_even_while_control_is_paused() {
     assert!(ended, "session teardown must remove the overlays");
 }
 
-/// Locally disabled (or no UI): the operator is told once, nothing reaches the sink.
+/// Locally disabled: the operator is told once (as a policy refusal), nothing reaches the sink.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn annotations_disabled_locally_reply_once() {
     let mut h = Harness::connect(Options::default()).await;
@@ -1702,7 +1706,12 @@ async fn annotations_disabled_locally_reply_once() {
         .await;
     }
     next_control(&mut h.control_rx, |m| {
-        matches!(m, ControlMessage::AnnotationsDisabled)
+        matches!(
+            m,
+            ControlMessage::AnnotationsDisabled {
+                reason: AnnotationsUnavailable::Policy
+            }
+        )
     })
     .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1713,7 +1722,7 @@ async fn annotations_disabled_locally_reply_once() {
     // Only one AnnotationsDisabled per session even for repeated attempts.
     let extra = tokio::time::timeout(Duration::from_millis(500), async {
         next_control(&mut h.control_rx, |m| {
-            matches!(m, ControlMessage::AnnotationsDisabled)
+            matches!(m, ControlMessage::AnnotationsDisabled { .. })
         })
         .await
     })
@@ -1724,9 +1733,10 @@ async fn annotations_disabled_locally_reply_once() {
     );
 }
 
-/// Headless service mode has no overlay: the operator is told.
+/// Nobody signed in (no UI process): the operator is told it is not a policy refusal, and
+/// learns when a user's desktop appears; strokes then reach the overlay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn annotations_without_ui_reply_disabled() {
+async fn annotations_without_ui_reply_no_desktop_until_a_user_signs_in() {
     let mut h = Harness::connect(Options {
         annotations_available: false,
         ..Default::default()
@@ -1746,10 +1756,41 @@ async fn annotations_without_ui_reply_disabled() {
     )
     .await;
     next_control(&mut h.control_rx, |m| {
-        matches!(m, ControlMessage::AnnotationsDisabled)
+        matches!(
+            m,
+            ControlMessage::AnnotationsDisabled {
+                reason: AnnotationsUnavailable::NoDesktop
+            }
+        )
     })
     .await;
     assert!(h.annotations.events.lock().unwrap().is_empty());
+
+    // A user signs in: the UI process connects and the operator hears about it.
+    h.annotations.available.store(true, Ordering::SeqCst);
+    next_control(&mut h.control_rx, |m| {
+        matches!(m, ControlMessage::AnnotationsAvailable)
+    })
+    .await;
+    send_json(
+        &h.control_dc,
+        &ControlMessage::AnnotatePointer {
+            display: 0,
+            point: Some((5.0, 5.0)),
+            color: "#ff0000".into(),
+        },
+    )
+    .await;
+    let reached = tokio::time::timeout(Duration::from_secs(3), async {
+        while h.annotations.events.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        reached.is_ok(),
+        "annotations must work once a desktop is available"
+    );
 }
 
 // ── performance pass ────────────────────────────────────────────────────────────

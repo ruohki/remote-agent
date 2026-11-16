@@ -131,7 +131,6 @@ fn create_device(adapter: Option<&IDXGIAdapter1>) -> Result<Arc<D3dDevice>> {
     let mut device = None;
     let mut context = None;
     let mut level = D3D_FEATURE_LEVEL::default();
-    let flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
     let base_adapter: Option<IDXGIAdapter> = match adapter {
         Some(a) => Some(a.cast::<IDXGIAdapter>().context("adapter cast")?),
         None => None,
@@ -141,21 +140,45 @@ fn create_device(adapter: Option<&IDXGIAdapter1>) -> Result<Arc<D3dDevice>> {
     } else {
         D3D_DRIVER_TYPE_HARDWARE
     };
-    // SAFETY: all out-pointers are valid for the duration of the call.
-    unsafe {
-        D3D11CreateDevice(
-            base_adapter.as_ref(),
-            driver_type,
-            HMODULE::default(),
-            flags,
-            Some(&levels),
-            D3D11_SDK_VERSION,
-            Some(&mut device),
-            Some(&mut level),
-            Some(&mut context),
-        )
+    // Video support lets the Media Foundation encoder share the device. Adapters without a
+    // video engine — the Microsoft Basic Display Adapter of a VM without a GPU above all —
+    // refuse it with DXGI_ERROR_UNSUPPORTED, yet duplicate the desktop fine: retry without it
+    // (the encoder then falls back to software), or the machine could not be captured at all,
+    // and on the sign-in screen GDI only sees black.
+    let attempts = [
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    ];
+    let mut last_err = None;
+    for (i, flags) in attempts.into_iter().enumerate() {
+        // SAFETY: all out-pointers are valid for the duration of the call.
+        let r = unsafe {
+            D3D11CreateDevice(
+                base_adapter.as_ref(),
+                driver_type,
+                HMODULE::default(),
+                flags,
+                Some(&levels),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                Some(&mut level),
+                Some(&mut context),
+            )
+        };
+        match r {
+            Ok(()) => {
+                if i > 0 {
+                    tracing::info!("Direct3D 11 device without video support (no hardware encoding on this adapter)");
+                }
+                last_err = None;
+                break;
+            }
+            Err(e) => last_err = Some(e),
+        }
     }
-    .context("D3D11CreateDevice")?;
+    if let Some(e) = last_err {
+        return Err(e).context("D3D11CreateDevice");
+    }
     let device = device.ok_or_else(|| anyhow!("D3D11CreateDevice returned no device"))?;
     let context = context.ok_or_else(|| anyhow!("D3D11CreateDevice returned no context"))?;
     if level.0 < D3D_FEATURE_LEVEL_11_0.0 {
