@@ -1,5 +1,5 @@
 use protocol::agent::{AgentCapabilities, AgentToConsole, ConsoleToAgent};
-use protocol::channel::{ControlMessage, InputEvent, MouseButton};
+use protocol::channel::{AnnotationsUnavailable, ControlMessage, InputEvent, MouseButton};
 use protocol::common::*;
 use protocol::config::{AgentConfig, LocalOverrides};
 use protocol::ui::{ConsoleToUi, UiToConsole};
@@ -182,4 +182,23 @@ fn retire_roundtrip() {
     let json = serde_json::to_string(&msg).unwrap();
     assert_eq!(json, r#"{"type":"retire","reason":"device deleted"}"#);
     assert_eq!(serde_json::from_str::<ConsoleToAgent>(&json).unwrap(), msg);
+}
+
+#[test]
+fn annotations_disabled_carries_a_reason_and_reads_old_agents_as_policy() {
+    let m = ControlMessage::AnnotationsDisabled {
+        reason: AnnotationsUnavailable::NoDesktop,
+    };
+    let j = serde_json::to_string(&m).unwrap();
+    assert_eq!(j, r#"{"t":"annotations_disabled","reason":"no_desktop"}"#);
+    // Agents before the reason field send a bare tag: that was always a policy refusal.
+    let old: ControlMessage = serde_json::from_str(r#"{"t":"annotations_disabled"}"#).unwrap();
+    assert_eq!(
+        old,
+        ControlMessage::AnnotationsDisabled {
+            reason: AnnotationsUnavailable::Policy
+        }
+    );
+    let back: ControlMessage = serde_json::from_str(r#"{"t":"annotations_available"}"#).unwrap();
+    assert_eq!(back, ControlMessage::AnnotationsAvailable);
 }

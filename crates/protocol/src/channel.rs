@@ -67,6 +67,18 @@ pub enum InputEvent {
     ReleaseAll,
 }
 
+/// Why annotations cannot be shown ([`ControlMessage::AnnotationsDisabled`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum AnnotationsUnavailable {
+    /// Not allowed on this device (console policy or a device-side restriction).
+    #[default]
+    Policy,
+    /// Nobody is signed in, or the session is locked: no desktop to draw on yet.
+    NoDesktop,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(tag = "t", rename_all = "snake_case")]
 #[ts(export)]
@@ -213,8 +225,17 @@ pub enum ControlMessage {
     },
     /// Remove all annotations (all displays).
     AnnotateClear,
-    /// Agent → browser: annotations are not allowed on this device (policy or local override).
-    AnnotationsDisabled,
+    /// Agent → browser: annotations cannot be shown. `policy`: not allowed on this device
+    /// (console policy or local restriction) for the whole session. `no_desktop`: nobody is
+    /// signed in or the session is locked, so nothing can draw on the screen yet — it works once
+    /// a user's desktop is showing. Older agents send no reason (read as `policy`).
+    AnnotationsDisabled {
+        #[serde(default)]
+        reason: AnnotationsUnavailable,
+    },
+    /// Agent → browser: annotations work again after an `AnnotationsDisabled` (a user's desktop
+    /// appeared, or the device allowed them again).
+    AnnotationsAvailable,
     /// Agent → browser: privacy screen state changed (the operator's button follows this echo,
     /// never its own optimistic state).
     PrivacyScreen {

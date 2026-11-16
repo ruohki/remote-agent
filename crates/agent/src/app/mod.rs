@@ -414,8 +414,10 @@ fn dispatch_disconnect() {
 pub struct AppAnnotations;
 
 impl crate::annotate::AnnotationSink for AppAnnotations {
+    /// Something can draw (the UI is up) and the screen shows the user's desktop: on the
+    /// sign-in or lock screen the overlay would sit on a hidden desktop.
     fn available(&self) -> bool {
-        is_running()
+        is_running() && desktop_shows_user()
     }
 
     fn apply(&self, event: crate::annotate::AnnotateEvent) {
@@ -425,6 +427,27 @@ impl crate::annotate::AnnotationSink for AppAnnotations {
     fn session_ended(&self) {
         post(AppEvent::AnnotationsEnded);
     }
+}
+
+/// Whether the console shows a user's desktop. Re-checked at most twice a second: annotation
+/// events arrive at pointer rate and the query goes to the session manager.
+fn desktop_shows_user() -> bool {
+    use protocol::common::DesktopState;
+    use std::time::{Duration, Instant};
+    static LAST: parking_lot::Mutex<Option<(Instant, bool)>> = parking_lot::Mutex::new(None);
+    let mut last = LAST.lock();
+    if let Some((at, shows)) = *last {
+        if at.elapsed() < Duration::from_millis(500) {
+            return shows;
+        }
+    }
+    // Unknown (between sessions, other platforms): do not refuse on a guess.
+    let shows = !matches!(
+        crate::platform::desktop_state(),
+        DesktopState::SignIn | DesktopState::Locked
+    );
+    *last = Some((Instant::now(), shows));
+    shows
 }
 
 // ── Indicator implementation ──────────────────────────────────────────────────────────────
